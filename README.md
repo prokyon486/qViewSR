@@ -1,3 +1,5 @@
+> **qViewSR fork:** [日本語の設計・開発状況](README-SR.ja.md) — NCS/NCS2による超解像とICC対応を設計・検証中です。
+
 <h1 align=center>qView</h1>
 
 <p align=center>qView is an image viewer designed with minimalism and usability in mind.</p>
