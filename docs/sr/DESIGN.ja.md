@@ -2,6 +2,17 @@
 
 状態: **GUI機能検証用の試作版を実装・ビルド済み**。2026-09-22。実機4本からGUI表示・保存まで確認。下記は目標設計を含み、全項目の完了を意味しない。
 
+### 追加要望への対応（2026-09-22）
+
+- 長文の状態表示は改行を空白に変換して1行・固定高さ。フルスクリーンでSRバーを非表示。ショートカットはメインウィンドウに残す。
+- Qt標準の日本語とqView翻訳を実行ファイルへ埋め込み、未訳の設定項目を補完。初回更新時は日本語へ移行し、その後の明示的な言語選択は保持。
+- decoderのQImageを共通入力とし、形式のJPEG/PNG限定を撤廃。WebPの元ICCも抽出。アニメーションは現在のフレームを静止してSR、再開時に結果を破棄。CMYKは既にRGB化されたdecoder出力をsRGBと仮定する旨を表示。
+- `--serve` workerはstdinのconfigure/run/cancel/shutdownを受け、SessionがCore・ExecutableNetwork・InferRequest・USB所有lockを保持。起動時に準備し、同じbackendなら再利用。画像ごとにタイル統計・PNGを新規生成。モデルhashとshapeの検査はSession初期化時、画像hash・寸法検査は各jobで実施する。
+- 入力読取スレッドがcancelを受け、推論スレッドは現在のタイル後に終了する。中止の正常応答ではpoolを保持。15秒応答なし／120秒進捗なし／全個体失敗ではworkerを破棄し、次回に初期化する。古いjob IDの通知は現在の表示に反映しない。
+- `denoise`（0..15、既定0）はjob設定。sRGBのLR画像全体にOpenCVの色付きNon-local Means（template 7/search 21、hとhColorは設定値）をかけてからタイル化する。halo境界で独立にフィルターをかけない。alphaはGUI側で別に保持する。
+- ウィンドウ間のpool共有は未実装。所有lockはウィンドウを閉じるまで保持するため、SRを利用するウィンドウは1つとする。古い設計段階の対象限定は本項で置き換える。
+- pushによるGitHub CIはユーザー指定で実行しない。コミットに`[skip ci]`を入れ、検証はローカルで行う。
+
 ### 現在の実装
 
 - `src/sr/sr_controller.*`: ツールバー、設定、非同期準備・worker起動、世代管理、中止、検証済み結果の表示、PNG/JPEG保存。Qt 6/C++17。
@@ -177,11 +188,12 @@ USB port pathとruntime ID、boot前後PIDを診断表示する。IDは再接続
 
 ## 9. GUIとworkerの契約
 
-初期は1 jobにつき`QProcess`でworkerを1回起動する。一意な`QTemporaryDir`（ユーザー専用）に`sRGB RGB input.png`と`job.json`を配置し、shellを介さず引数リストで起動する。共有`/tmp/input.png`のような固定名を使わない。
+`QProcess`から`ncs-sr-worker --serve`を起動して保持する。stdinは64KiB上限のJSON Lines。初回configureにはsession用job_id、model_xml、devices、lock_fileを渡す。`session_ready`後にrunを送る。各jobは一意な`QTemporaryDir`（ユーザー専用）にsRGB RGB input.pngを配置する。共有の固定名は使わない。モデル/デバイスの設定が変わるとshutdownし、正常終了を最大10秒待ってから、USB再列挙の猶予1秒をおいて新workerを起動する。この待機は非同期でGUIを止めない。
 
 ```json
 {
   "protocol_version": 1,
+  "command": "run",
   "job_id": "uuid",
   "source_key": "sha256",
   "input": "/private/job/input.png",
@@ -192,20 +204,20 @@ USB port pathとruntime ID、boot前後PIDを診断表示する。IDは再接続
   "height": 477,
   "halo": 16,
   "devices": "all",
-  "lock_file": "/run/user/1000/qviewsr-devices.lock",
+  "denoise": 6,
   "max_memory_bytes": 2147483648
 }
 ```
 
-workerは`ncs-sr-worker --job /private/job/job.json`として起動。stdoutはversion付きJSON Linesの`started/device_ready/progress/completed/error`、stderrはログ。**調査用ncs-probeのstdoutは旧ライブラリーの診断行が混ざる可能性があり、製品IPCとして流用しない。** 製品workerではライブラリstdoutをstderrへ隔離するか、制御用専用pipeへ切り替える。
+診断用には`ncs-sr-worker --job /private/job/job.json`も残す（この場合はjobにlock_fileを含める）。stdoutはversion付きJSON Linesの`session_ready/started/device_ready/progress/completed/cancelled/error`、stderrはログ。**調査用ncs-probeのstdoutは旧ライブラリーの診断行が混ざる可能性があり、製品IPCとして流用しない。** 製品workerではライブラリstdoutをstderrへ隔離するか、制御用専用pipeへ切り替える。
 
-completedはjob_id、source_key、出力寸法、色空間sRGB、出力hash、使用デバイス、timingを含む。結果は一時名に書き、close後に同じjob directory内でrenameして公開する。GUIは正常exit、completed、ファイル存在、寸法、hash、色空間を確認する。プロセスexitだけを成功の証拠にしない。
+completedはjob_id、source_key、出力寸法、色空間sRGB、出力hash、使用デバイス、timingを含む。結果は一時名に書き、close後に同じjob directory内でrenameして公開する。GUIはcompleted、job ID、ファイル存在、寸法、hash、色空間、ノイズ低減設定を確認する。常駐workerの正常exitは成功通知として使わない。
 
 入力サイズ・出力サイズ・倍率・halo・path・モデルhashを起動前に検証。stdout行は64KiB以下、GUIが保持するstderrは末尾64KiBに制限。現在の起動・タイル進捗停止timeoutはいずれも120秒。USB bootが長い場合は測定値に基づき調整する。
 
-GUI状態: `Idle → Preparing → Starting → Running → Ready`、任意の途中状態から`Cancelling → Idle`、失敗は`Error`。画像送りでgenerationを増やし、旧jobをcancelする。cancel後の遅延signalや完成通知はjob_id/generation不一致で捨てる。terminate後2秒でkill、終了を待って一時ファイルを除去する。
+GUI状態: `Idle → Preparing → Starting → Running → Ready`、任意の途中状態から`Cancelling → Idle`、失敗は`Error`。画像送りでgenerationを増やし、旧jobをcancelする。cancel後の遅延signalや完成通知はjob_id/generation不一致で捨てる。通常はcancelコマンドを送り、タイル終了後のcancelled/completedを受けて一時ファイルを除去する。15秒応答がなければworkerを終了し、次回に初期化する。
 
-初期は原画像先読みのみ継続し、隣画像のSR先読みはしない。全タイル完了前の部分画像表示も後続。性能が成立してモデルload/PNG往復が支配的なら、契約を保って常駐worker＋Unix socket/共有メモリーへ進める。
+初期は原画像先読みのみ継続し、隣画像のSR先読みはしない。全タイル完了前の部分画像表示も後続。モデルloadは常駐化で再利用する。PNG往復が支配的なら、契約を保ってUnix socket/共有メモリーを検討する。
 
 ## 10. キャッシュ、ズーム、保存
 

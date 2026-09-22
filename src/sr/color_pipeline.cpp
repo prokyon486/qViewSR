@@ -52,6 +52,21 @@ QByteArray extractJpeg(QFile& file, QString& error, bool& cmyk) {
     if(icc.size()>profileLimit) { error=QStringLiteral("ICCが大きすぎます"); return {}; }
     return icc;
 }
+QByteArray extractWebp(QFile& file, QString& error) {
+    file.seek(12);
+    while(!file.atEnd()) {
+        const auto header=file.read(8);
+        if(header.size()!=8) break;
+        const quint32 size=qFromLittleEndian<quint32>(header.constData()+4);
+        if(qint64(size)>file.size()-file.pos()) { error=QStringLiteral("WebPチャンクが破損しています"); return {}; }
+        if(header.left(4)=="ICCP") {
+            if(size>profileLimit) { error=QStringLiteral("WebP ICCが大きすぎます"); return {}; }
+            return file.read(size);
+        }
+        if(!file.seek(file.pos()+size+(size&1))) break;
+    }
+    return {};
+}
 QByteArray extractPng(QFile& file, QString& error) {
     file.seek(8);
     while(!file.atEnd() && file.pos()<64*1024*1024) {
@@ -85,14 +100,20 @@ Profile readProfile(const QString& path,const QImage& decoded) {
     Profile result;
     QFile file(path);
     if(!file.open(QIODevice::ReadOnly)) { result.error=QStringLiteral("画像のICCを読み込めません"); return result; }
-    const auto magic=file.peek(8);
+    const auto magic=file.peek(12);
     bool cmyk=false;
     if(magic.startsWith(QByteArray::fromHex("ffd8"))) result.icc=extractJpeg(file,result.error,cmyk);
-    else if(magic==QByteArray::fromHex("89504e470d0a1a0a")) result.icc=extractPng(file,result.error);
-    else { result.error=QStringLiteral("超解像は静止JPEG/PNGに対応しています"); return result; }
-    if(cmyk) { result.error=QStringLiteral("CMYK/YCCK JPEGの超解像は未対応です"); return result; }
+    else if(magic.startsWith(QByteArray::fromHex("89504e470d0a1a0a"))) result.icc=extractPng(file,result.error);
+    else if(magic.startsWith("RIFF") && magic.mid(8,4)=="WEBP") result.icc=extractWebp(file,result.error);
+    // Other formats use the decoder's RGB pixels and colour-space metadata.
+    // Qt has already converted CMYK JPEG pixels to RGB; the original CMYK ICC
+    // cannot be applied to those RGB values a second time.
+    if(cmyk) {
+        result.icc=srgbProfile(); result.error.clear(); result.assumedSrgb=true;
+        result.description=QStringLiteral("CMYK画像のデコーダーRGB出力 → sRGBと仮定");
+    }
     if(!result.error.isEmpty()) return result;
-    if(result.icc.isEmpty() && decoded.colorSpace().isValid()) result.icc=decoded.colorSpace().iccProfile();
+    if(result.icc.isEmpty() && !decoded.colorSpace().iccProfile().isEmpty()) result.icc=decoded.colorSpace().iccProfile();
     if(result.icc.isEmpty()) {
         result.icc=srgbProfile(); result.assumedSrgb=true;
         result.description=QStringLiteral("ICCなし → sRGBと仮定");

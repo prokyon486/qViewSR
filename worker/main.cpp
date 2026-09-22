@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Tensor preprocessing follows Open Model Zoo 2020.3 super_resolution_demo.
 #include "tile_plan.h"
+#include "denoise.h"
+#include <atomic>
 #include <inference_engine.hpp>
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
@@ -18,6 +20,7 @@
 #include <deque>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -98,6 +101,7 @@ struct Device {
     InferenceEngine::InferRequest request;
     int tiles = 0;
     double inferMs = 0;
+    bool healthy = true;
 };
 
 static void fillBlob(const cv::Mat& image, InferenceEngine::Blob::Ptr blob) {
@@ -141,74 +145,100 @@ static void processTile(Device& device, const cv::Mat& source, cv::Mat& result, 
     }
 }
 
-static void run(const Json& job, Events& events) {
+struct Session {
+    std::unique_ptr<DeviceLock> ownership;
+    InferenceEngine::Core core;
+    std::vector<std::unique_ptr<Device>> devices;
+    std::string model, selection, outputName;
+    bool ready = false;
+    void configure(const Json& job, Events& events) {
+        ready=false; devices.clear(); ownership.reset();
+        model=job.at("model_xml").get<std::string>();
+        if (model.size() < 4 || model.substr(model.size()-4) != ".xml") throw std::runtime_error("Expected an IR XML model.");
+        const auto bin = model.substr(0,model.size()-4) + ".bin";
+        // These hashes identify the verified OMZ 2020.3 model, not merely its file name.
+        if (hashFile(model) != "25be6418ee76c33169470ada73b924864fb439c5fc5a208b7fa4b0e64f6f84d1" ||
+            hashFile(bin) != "abae5907d40ef7e47d680435a99484b74076a985a6b8c3353b64fa77e6d3c149")
+            throw std::runtime_error("Model checksum differs from pinned OMZ 2020.3 1032 FP16.");
+        ownership.reset(new DeviceLock(job.at("lock_file")));
+        selection = job.value("devices",std::string("all"));
+        std::vector<std::string> selected;
+        if (selection == "CPU") selected.push_back("CPU");
+        else {
+            const auto available = core.GetMetric("MYRIAD",METRIC_KEY(AVAILABLE_DEVICES)).as<std::vector<std::string>>();
+            std::set<std::string> explicitIds;
+            if (selection != "all" && selection != "ncs2" && selection != "ncs") {
+                std::istringstream stream(selection); std::string id;
+                while (std::getline(stream,id,',')) explicitIds.insert(id);
+            }
+            for (const auto& id : available) {
+                if (selection == "all" || (selection == "ncs2" && id.find("ma2480") != std::string::npos) ||
+                    (selection == "ncs" && id.find("ma2450") != std::string::npos) || explicitIds.count(id)) selected.push_back(id);
+            }
+            for (const auto& id : explicitIds)
+                if (std::find(selected.begin(),selected.end(),id) == selected.end()) throw std::runtime_error("Selected device unavailable: " + id);
+        }
+        if (selected.empty()) throw std::runtime_error("No selected MYRIAD devices. Check the USB connection and permissions.");
+        if (selected.size() > 4) selected.resize(4);
+        auto network = core.ReadNetwork(model);
+        auto inputs = network.getInputsInfo(); auto outputs = network.getOutputsInfo();
+        const InferenceEngine::SizeVector lr{1,3,270,480}, hr{1,3,1080,1920};
+        if (inputs.size()!=2 || !inputs.count("0") || !inputs.count("1") || outputs.size()!=1 ||
+            inputs.at("0")->getTensorDesc().getDims()!=lr || inputs.at("1")->getTensorDesc().getDims()!=hr ||
+            outputs.begin()->second->getTensorDesc().getDims()!=hr) throw std::runtime_error("Unexpected model tensor contract.");
+        for (auto& input : inputs) input.second->setPrecision(InferenceEngine::Precision::FP32);
+        outputs.begin()->second->setPrecision(InferenceEngine::Precision::FP32);
+        outputName = outputs.begin()->first;
+        for (const auto& id : selected) {
+            try {
+                std::unique_ptr<Device> device(new Device);
+                device->id=id;
+                device->executable = id == "CPU" ? core.LoadNetwork(network,"CPU",{{"CPU_THREADS_NUM","8"}}) :
+                    core.LoadNetwork(network,"MYRIAD",{{CONFIG_KEY(DEVICE_ID),id}});
+                device->request=device->executable.CreateInferRequest();
+                devices.push_back(std::move(device));
+                events.send({{"event","device_ready"},{"device",id}});
+            } catch (const std::exception& e) { events.send({{"event","device_error"},{"device",id},{"message",e.what()}}); }
+        }
+        if (devices.empty()) throw std::runtime_error("No device could load the model. Original image is retained.");
+        ready=true;
+        Json ids=Json::array();
+        for(const auto& d:devices) ids.push_back(d->id);
+        events.send({{"event","session_ready"},{"devices",ids}});
+    }
+};
+
+static void run(const Json& job, Events& events, Session& session, std::atomic<bool>& cancelled) {
     if (job.at("protocol_version") != 1) throw std::runtime_error("Unsupported protocol version.");
     events.jobId = job.at("job_id").get<std::string>();
+    if(!session.ready || job.at("model_xml")!=session.model || job.at("devices")!=session.selection)
+        throw std::runtime_error("Worker session does not match the requested backend.");
     const auto started = Clock::now();
     const int width = job.at("width"), height = job.at("height"), halo = job.value("halo",16);
     const auto tiles = sr::plan(width, height, halo);
-    const std::string inputPath = job.at("input"), outputPath = job.at("output"), model = job.at("model_xml");
-    const std::string sourceKey = job.at("source_key");
+    const std::string inputPath = job.at("input"), outputPath = job.at("output"), sourceKey = job.at("source_key");
     const auto budget = job.value("max_memory_bytes", uint64_t(2147483648ULL));
-    if (uint64_t(width)*height*64 + 4*192ULL*1024*1024 > budget)
+    if (uint64_t(width)*height*80 + 4*192ULL*1024*1024 > budget)
         throw std::runtime_error("Image exceeds worker memory budget.");
     checkPng(inputPath, width, height);
     if (hashFile(inputPath) != job.at("input_sha256")) throw std::runtime_error("Input checksum mismatch.");
-    if (model.size() < 4 || model.substr(model.size()-4) != ".xml") throw std::runtime_error("Expected an IR XML model.");
-    const auto bin = model.substr(0,model.size()-4) + ".bin";
-    // These hashes identify the verified OMZ 2020.3 model, not merely its file name.
-    if (hashFile(model) != "25be6418ee76c33169470ada73b924864fb439c5fc5a208b7fa4b0e64f6f84d1" ||
-        hashFile(bin) != "abae5907d40ef7e47d680435a99484b74076a985a6b8c3353b64fa77e6d3c149")
-        throw std::runtime_error("Model checksum differs from pinned OMZ 2020.3 1032 FP16.");
     if (access(outputPath.c_str(), F_OK) == 0) throw std::runtime_error("Output file already exists.");
-    DeviceLock ownership(job.at("lock_file"));
-    events.send({{"event","started"},{"total",tiles.size()}});
-    cv::setNumThreads(1);
-    const cv::Mat source = cv::imread(inputPath, cv::IMREAD_COLOR);
+    const int noise=job.value("denoise",0);
+    if(noise<0 || noise>15) throw std::runtime_error("Invalid noise reduction strength (0..15).");
+    events.send({{"event","started"},{"total",tiles.size()},{"session_reused",true}});
+    const auto preprocessing=Clock::now();
+    cv::Mat source = cv::imread(inputPath, cv::IMREAD_COLOR);
     if (source.empty() || source.cols != width || source.rows != height) throw std::runtime_error("Input decode failed.");
+    if(noise && !cancelled) {
+        events.send({{"event","preprocessing"},{"denoise",noise}});
+        source=sr::denoise(source,noise);
+    }
+    const auto preprocessingMs=ms(preprocessing);
+    if(cancelled) { events.send({{"event","cancelled"}}); return; }
     cv::Mat output(height*4, width*4, CV_8UC3);
-    InferenceEngine::Core core;
-    const std::string selection = job.value("devices",std::string("all"));
-    std::vector<std::string> selected;
-    if (selection == "CPU") selected.push_back("CPU");
-    else {
-        const auto available = core.GetMetric("MYRIAD",METRIC_KEY(AVAILABLE_DEVICES)).as<std::vector<std::string>>();
-        std::set<std::string> explicitIds;
-        if (selection != "all" && selection != "ncs2" && selection != "ncs") {
-            std::istringstream stream(selection); std::string id;
-            while (std::getline(stream,id,',')) explicitIds.insert(id);
-        }
-        for (const auto& id : available) {
-            if (selection == "all" || (selection == "ncs2" && id.find("ma2480") != std::string::npos) ||
-                (selection == "ncs" && id.find("ma2450") != std::string::npos) || explicitIds.count(id)) selected.push_back(id);
-        }
-        for (const auto& id : explicitIds)
-            if (std::find(selected.begin(),selected.end(),id) == selected.end()) throw std::runtime_error("Selected device unavailable: " + id);
-    }
-    if (selected.empty()) throw std::runtime_error("No selected MYRIAD devices. Check the USB connection and permissions.");
-    if (selected.size() > 4) selected.resize(4);
-    auto network = core.ReadNetwork(model);
-    auto inputs = network.getInputsInfo(); auto outputs = network.getOutputsInfo();
-    const InferenceEngine::SizeVector lr{1,3,270,480}, hr{1,3,1080,1920};
-    if (inputs.size()!=2 || !inputs.count("0") || !inputs.count("1") || outputs.size()!=1 ||
-        inputs.at("0")->getTensorDesc().getDims()!=lr || inputs.at("1")->getTensorDesc().getDims()!=hr ||
-        outputs.begin()->second->getTensorDesc().getDims()!=hr) throw std::runtime_error("Unexpected model tensor contract.");
-    for (auto& input : inputs) input.second->setPrecision(InferenceEngine::Precision::FP32);
-    outputs.begin()->second->setPrecision(InferenceEngine::Precision::FP32);
-    const auto outputName = outputs.begin()->first;
-    std::vector<std::unique_ptr<Device>> devices;
-    for (const auto& id : selected) {
-        try {
-            std::unique_ptr<Device> device(new Device);
-            device->id=id;
-            device->executable = id == "CPU" ? core.LoadNetwork(network,"CPU",{{"CPU_THREADS_NUM","8"}}) :
-                core.LoadNetwork(network,"MYRIAD",{{CONFIG_KEY(DEVICE_ID),id}});
-            device->request=device->executable.CreateInferRequest();
-            devices.push_back(std::move(device));
-            events.send({{"event","device_ready"},{"device",id}});
-        } catch (const std::exception& e) { events.send({{"event","device_error"},{"device",id},{"message",e.what()}}); }
-    }
-    if (devices.empty()) throw std::runtime_error("No device could load the model. Original image is retained.");
+    auto& devices=session.devices;
+    const auto& outputName=session.outputName;
+    for(auto& device:devices) { device->tiles=0; device->inferMs=0; }
     struct Work { size_t index; int attempt; };
     std::deque<Work> queue;
     for (size_t i=0;i<tiles.size();++i) queue.push_back({i,0});
@@ -223,8 +253,8 @@ static void run(const Json& job, Events& events) {
             Work work;
             {
                 std::unique_lock<std::mutex> guard(mutex);
-                changed.wait(guard,[&]{return !failure.empty() || !queue.empty() || running==0;});
-                if (!failure.empty() || queue.empty()) return;
+                changed.wait(guard,[&]{return cancelled || !failure.empty() || !queue.empty() || running==0;});
+                if (cancelled || !failure.empty() || queue.empty()) return;
                 work=queue.front(); queue.pop_front(); ++running;
             }
             try {
@@ -235,6 +265,7 @@ static void run(const Json& job, Events& events) {
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> guard(mutex);
                 --running;
+                device.healthy=false;
                 if (work.attempt==0) queue.push_back({work.index,1});
                 else failure=e.what();
                 events.send({{"event","device_error"},{"device",device.id},{"message",e.what()}});
@@ -245,7 +276,7 @@ static void run(const Json& job, Events& events) {
         }
     };
     try {
-        for (auto& device : devices) threads.emplace_back(consume,std::ref(*device));
+        for (auto& device : devices) if(device->healthy) threads.emplace_back(consume,std::ref(*device));
     } catch (...) {
         { std::lock_guard<std::mutex> guard(mutex); failure="Cannot create device thread."; }
         changed.notify_all();
@@ -253,6 +284,7 @@ static void run(const Json& job, Events& events) {
         throw;
     }
     for (auto& thread : threads) thread.join();
+    if(cancelled) { events.send({{"event","cancelled"}}); return; }
     if (completed!=tiles.size()) throw std::runtime_error("Incomplete SR result: " + (failure.empty()?std::string("all devices failed"):failure));
     const auto temporary = outputPath + ".part.png";
     try {
@@ -262,22 +294,88 @@ static void run(const Json& job, Events& events) {
     Json stats=Json::array();
     for (const auto& device : devices) stats.push_back({{"id",device->id},{"tiles",device->tiles},{"infer_ms",device->inferMs}});
     events.send({{"event","completed"},{"source_key",sourceKey},{"width",output.cols},{"height",output.rows},
-        {"color_space","sRGB"},{"output_sha256",hashFile(outputPath)},{"wall_ms",ms(started)},{"devices",stats}});
+        {"color_space","sRGB"},{"output_sha256",hashFile(outputPath)},{"wall_ms",ms(started)},{"preprocessing_ms",preprocessingMs},{"denoise",noise},{"devices",stats}});
+}
+
+// stdin is read independently so cancellation can interrupt a tiled job without
+// destroying the loaded devices. Commands and results are always correlated by ID.
+static int serve(Events& events) {
+    Session session;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<Json> commands;
+    std::set<std::string> cancelledIds;
+    std::string activeId;
+    std::atomic<bool> cancelled{false};
+    bool eof=false;
+    std::thread reader([&] {
+        char line[65538];
+        while(std::cin.getline(line,sizeof line)) {
+            try {
+                auto command=Json::parse(line);
+                if(command.at("protocol_version")!=1) throw std::runtime_error("Unsupported protocol.");
+                const std::string id=command.at("job_id"), kind=command.at("command");
+                std::lock_guard<std::mutex> guard(mutex);
+                if(kind=="shutdown") break;
+                if(kind=="cancel") {
+                    if(activeId==id) cancelled=true;
+                    else if(std::any_of(commands.begin(),commands.end(),[&](const Json& queued) {
+                        return queued.at("job_id")==id;
+                    })) cancelledIds.insert(id);
+                } else {
+                    if(commands.size()>=4) throw std::runtime_error("Worker command queue is full.");
+                    commands.push_back(std::move(command));
+                }
+                changed.notify_all();
+            } catch(const std::exception&) { break; }
+        }
+        { std::lock_guard<std::mutex> guard(mutex); eof=true; cancelled=true; }
+        changed.notify_all();
+    });
+    for(;;) {
+        Json job;
+        {
+            std::unique_lock<std::mutex> guard(mutex);
+            changed.wait(guard,[&]{return eof || !commands.empty();});
+            if(eof) break;
+            job=std::move(commands.front()); commands.pop_front();
+            activeId=job.at("job_id").get<std::string>();
+            cancelled=cancelledIds.erase(activeId)>0;
+        }
+        events.jobId=activeId;
+        try {
+            if(job.at("command")=="configure") session.configure(job,events);
+            else if(job.at("command")=="run") run(job,events,session,cancelled);
+            else throw std::runtime_error("Unknown worker command.");
+        } catch(const std::exception& e) {
+            const bool reset=session.ready && std::none_of(session.devices.begin(),session.devices.end(),
+                [](const std::unique_ptr<Device>& device){return device->healthy;});
+            events.send({{"event","error"},{"message",e.what()},{"reset_session",reset}});
+        }
+        { std::lock_guard<std::mutex> guard(mutex); activeId.clear(); }
+    }
+    reader.join();
+    return 0;
 }
 
 int main(int argc,char** argv) {
     Events events;
+    cv::setNumThreads(1);
     try {
         if (argc==2 && std::string(argv[1])=="--list") {
             InferenceEngine::Core core;
             const auto ids=core.GetMetric("MYRIAD",METRIC_KEY(AVAILABLE_DEVICES)).as<std::vector<std::string>>();
             events.send({{"event","devices"},{"devices",ids}}); return 0;
         }
-        if (argc!=3 || std::string(argv[1])!="--job") throw std::runtime_error("Usage: ncs-sr-worker --job job.json | --list");
+        if (argc==2 && std::string(argv[1])=="--serve") return serve(events);
+        if (argc!=3 || std::string(argv[1])!="--job") throw std::runtime_error("Usage: ncs-sr-worker --serve | --job job.json | --list");
         struct stat st{};
         if (stat(argv[2],&st) || st.st_size>65536) throw std::runtime_error("Invalid job file.");
         std::ifstream file(argv[2]); Json job; file >> job;
-        run(job,events); return 0;
+        events.jobId=job.at("job_id").get<std::string>();
+        Session session; session.configure(job,events);
+        std::atomic<bool> cancelled{false};
+        run(job,events,session,cancelled); return 0;
     } catch (const std::exception& e) {
         events.send({{"event","error"},{"message",e.what()}}); return 1;
     }

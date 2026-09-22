@@ -1,8 +1,10 @@
 # qViewSR CI migration
 
+Current user instruction: do not run GitHub CI on push. Every new commit must include `[skip ci]`; do not apply this historical migration patch or dispatch workflows unless explicitly requested. Validate locally. See [GitHub skip instructions](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/skip-workflow-runs).
+
 `ubuntu-24.04-workflows.patch` replaces upstream Qt 5 packaging and duplicate checks with the supported Ubuntu 24.04 viewer/worker build and tests. It is kept as a patch because the GitHub OAuth credential used for this change lacks the `workflow` scope. The application, tests, and local build are pushed normally; GitHub Actions migration has not been applied or verified remotely.
 
-With a credential authorized to edit workflows, from the repository root:
+Only after a future explicit request to enable CI, and with a credential authorized to edit workflows, from the repository root:
 
 ```bash
 git apply tools/ci/ubuntu-24.04-workflows.patch

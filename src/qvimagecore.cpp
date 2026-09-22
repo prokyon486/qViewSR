@@ -214,6 +214,7 @@ void QVImageCore::loadPixmap(const ReadData &readData)
         return;
     }
 
+    animationFrozenForSr = false;
     sourceImage = readData.sourceImage;
     sourceProfile = readData.sourceProfile;
     loadedPixmap = QPixmap::fromImage(matchCurrentRotation(readData.image));
@@ -267,6 +268,7 @@ void QVImageCore::closeImage()
 
 void QVImageCore::loadEmptyPixmap()
 {
+    animationFrozenForSr = false;
     sourceImage = {};
     sourceProfile = {};
     loadedPixmap = QPixmap();
@@ -661,8 +663,26 @@ void QVImageCore::jumpToNextFrame()
         loadedMovie.jumpToNextFrame();
 }
 
+void QVImageCore::freezeAnimationForSr()
+{
+    if (!currentFileDetails.isMovieLoaded) return;
+    loadedMovie.setPaused(true);
+    const auto frame = loadedMovie.currentImage();
+    if (!frame.isNull()) sourceImage = frame;
+    currentFileDetails.isMovieLoaded = false;
+    animationFrozenForSr = true;
+}
+
 void QVImageCore::setPaused(bool desiredState)
 {
+    if (animationFrozenForSr && !desiredState) {
+        emit sourceChanging();
+        animationFrozenForSr = false;
+        currentFileDetails.isMovieLoaded = true;
+        loadedMovie.setPaused(false);
+        emit fileChanged();
+        return;
+    }
     if (currentFileDetails.isMovieLoaded)
         loadedMovie.setPaused(desiredState);
 }

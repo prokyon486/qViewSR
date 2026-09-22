@@ -310,6 +310,7 @@ void MainWindow::paintEvent(QPaintEvent *event)
 void MainWindow::fullscreenChanged()
 {
     const bool isFullscreen = windowState().testFlag(Qt::WindowFullScreen);
+    srController->setFullscreen(isFullscreen);
     const auto fullscreenActions =
             qvApp->getActionManager().getAllClonesOfAction("fullscreen", this);
     for (const auto &fullscreenAction : fullscreenActions) {
@@ -1082,7 +1083,7 @@ void MainWindow::saveFrameAs()
 
 void MainWindow::pause()
 {
-    if (!getCurrentFileDetails().isMovieLoaded)
+    if (!getCurrentFileDetails().isMovieLoaded && !graphicsView->getImageCore().isAnimationFrozenForSr())
         return;
 
     const auto pauseActions = qvApp->getActionManager().getAllClonesOfAction("pause", this);

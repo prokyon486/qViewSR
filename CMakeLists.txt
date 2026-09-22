@@ -31,7 +31,7 @@ set(CMAKE_AUTOUIC ON)
 find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Network Widgets Svg Concurrent)
 set(QT_VERSION_MAJOR 6)
 set(QT_VERSION ${Qt6_VERSION})
-find_package(Qt6 QUIET COMPONENTS LinguistTools)
+
 
 # Source files
 set(PROJECT_SOURCES
@@ -217,22 +217,26 @@ if(DEFINED NIGHTLY)
     target_compile_definitions(${PROJECT_NAME} PRIVATE "NIGHTLY=\"${NIGHTLY}\"")
 endif()
 
-# Handle translations
-if(Qt${QT_VERSION_MAJOR}_LinguistTools_FOUND)
-    message(STATUS "LinguistTools found, building translations.")
-    file(GLOB TRANSLATIONS "i18n/qview_*.ts")
-    if(QT_VERSION_MAJOR EQUAL 5)
-        # For Qt5, use qt5_add_translation (not qt5_add_translations)
-        qt5_add_translation(QM_FILES ${TRANSLATIONS})
-        # Add the generated .qm files as resources or install them
-        target_sources(${PROJECT_NAME} PRIVATE ${QM_FILES})
-    else()
-        # For Qt6, use qt_add_translations
-        qt_add_translations(${PROJECT_NAME} TS_FILES ${TRANSLATIONS})
-    endif()
-else()
-    message(STATUS "LinguistTools not found, skipping translations.")
-endif()
+# Bundle translations explicitly. Missing LinguistTools must not silently produce
+# an English-only app; lrelease is provided by qt6-l10n-tools on Ubuntu.
+find_program(QVIEWSR_LRELEASE NAMES lrelease lrelease-qt6 HINTS /usr/lib/qt6/bin REQUIRED)
+find_file(QVIEWSR_QTBASE_JA qtbase_ja.qm HINTS /usr/share/qt6/translations REQUIRED)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/i18n")
+file(GLOB TRANSLATIONS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/i18n/qview_*.ts")
+set(TRANSLATION_QRC "${CMAKE_CURRENT_BINARY_DIR}/qviewsr_i18n.qrc")
+file(WRITE "${TRANSLATION_QRC}" "<RCC><qresource prefix=\"/i18n\">\n")
+set(QM_FILES)
+foreach(ts IN LISTS TRANSLATIONS)
+    get_filename_component(name "${ts}" NAME_WE)
+    set(qm "${CMAKE_CURRENT_BINARY_DIR}/i18n/${name}.qm")
+    add_custom_command(OUTPUT "${qm}" COMMAND "${QVIEWSR_LRELEASE}" -silent "${ts}" -qm "${qm}" DEPENDS "${ts}" VERBATIM)
+    list(APPEND QM_FILES "${qm}")
+    file(APPEND "${TRANSLATION_QRC}" "<file alias=\"${name}.qm\">${qm}</file>\n")
+endforeach()
+file(APPEND "${TRANSLATION_QRC}" "<file alias=\"qtbase_ja.qm\">${QVIEWSR_QTBASE_JA}</file>\n</qresource></RCC>\n")
+add_library(qviewsr_i18n OBJECT "${TRANSLATION_QRC}" ${QM_FILES})
+target_link_libraries(qviewsr_i18n PRIVATE Qt6::Core)
+target_link_libraries(${PROJECT_NAME} PRIVATE qviewsr_i18n)
 
 # Installation rules
 include(GNUInstallDirs)

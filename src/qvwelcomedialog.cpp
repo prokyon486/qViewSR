@@ -47,7 +47,7 @@ QVWelcomeDialog::QVWelcomeDialog(QWidget *parent) : QDialog(parent), ui(new Ui::
     QFont font3 = QFont("Lato", 12 + modifier);
     font3.setStyleName("Regular");
     const QString updateText = QStringLiteral(
-        "<ul><li>JPEG/PNGをドラッグして開きます</li>"
+        "<ul><li>画像ファイルをドラッグして開きます</li>"
         "<li>「超解像 ×4」で処理を開始します（Ctrl+U）</li>"
         "<li>元画像とSRの切り替えはCtrl+Space</li>"
         "<li>「SRを保存」で現在の回転・sRGB ICC付きで保存します</li>"

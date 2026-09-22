@@ -125,6 +125,8 @@ public:
     const QImage &getSourceImage() const { return sourceImage; }
     const Sr::Profile &getSourceProfile() const { return sourceProfile; }
     void setDisplayImage(const QImage &image);
+    void freezeAnimationForSr();
+    bool isAnimationFrozenForSr() const { return animationFrozenForSr; }
 
 signals:
     void sourceChanging();
@@ -143,6 +145,7 @@ private:
     Sr::Profile sourceProfile;
     QPixmap loadedPixmap;
     QMovie loadedMovie;
+    bool animationFrozenForSr = false;
 
     FileDetails currentFileDetails;
     int currentRotation;

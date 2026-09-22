@@ -6,6 +6,7 @@
 #include <QProcessEnvironment>
 #include <QPointer>
 #include <QTimer>
+#include <QStringList>
 #include <memory>
 class MainWindow;
 class QVGraphicsView;
@@ -22,6 +23,7 @@ struct Configuration {
     QString displayProfile; // empty: auto; "sRGB": forced sRGB; otherwise ICC path
     int memoryMiB = 2048;
     int halo = 16;
+    int denoise = 0;
     static Configuration load();
     void save() const;
     QProcessEnvironment environment() const;
@@ -37,6 +39,8 @@ public:
     bool showingSr() const { return showingSr_; }
     QImage resultImage() const { return result_; }
     QString statusText() const;
+    bool backendReady() const { return backendReady_; }
+    qint64 backendPid() const;
     Configuration configuration() const { return configuration_; }
     void setConfiguration(const Configuration& configuration);
     bool saveResult(const QString& path, const QByteArray& format, QString* error);
@@ -46,19 +50,27 @@ public slots:
     void toggle();
     void saveAs();
     void showSettings();
+    void setFullscreen(bool fullscreen);
 signals:
     void stateChanged();
     void resultReady();
     void failed(const QString& message);
+    void backendInitialized();
 private:
     struct Job;
+    void setStatus(QString text);
     void invalidate();
     void sourceLoaded();
     void updateActions();
     void display();
     QByteArray displayIcc(QString* description = nullptr) const;
     void launch(const std::shared_ptr<Job>& job);
-    void readEvents(const std::shared_ptr<Job>& job);
+    void ensureWorker();
+    void stopWorker();
+    void restartWorker();
+    void readEvents();
+    void dispatch();
+    void acceptResult(const std::shared_ptr<Job>& job);
     void finish(std::shared_ptr<Job> job, const QString& error = {});
     MainWindow* window_;
     QVGraphicsView* view_;
@@ -73,5 +85,11 @@ private:
     quint64 generation_ = 0;
     QString resultSummary_;
     QTimer watchdog_;
+    QTimer backendWatchdog_;
+    QPointer<QProcess> worker_;
+    QByteArray workerBuffer_, workerLog_;
+    QString sessionId_;
+    bool backendReady_ = false, stoppingWorker_ = false;
+    QStringList backendWarnings_, backendDevices_;
 };
 }
