@@ -12,6 +12,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -29,6 +30,7 @@
 #include <QSaveFile>
 #include <QScreen>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -38,9 +40,20 @@
 #include <QWindow>
 #include <QtConcurrent/QtConcurrentRun>
 #include <atomic>
+#include <cmath>
 
 namespace Sr {
 namespace {
+QString scaleText(double scale) { return QString::number(scale,'g',6); }
+double validScale(double scale) { return std::isfinite(scale)?qBound(1.25,scale,4.0):4.0; }
+// Long text must not enlarge the toolbar's size hint or push the label into
+// its overflow menu. Expand into all space left after the controls instead.
+class StatusLabel : public QLabel {
+public:
+    using QLabel::QLabel;
+    QSize sizeHint() const override { return {150,height()}; }
+    QSize minimumSizeHint() const override { return {0,height()}; }
+};
 QString repositoryRoot() {
     QDir dir(QCoreApplication::applicationDirPath());
     for(int i=0;i<5;++i) {
@@ -101,13 +114,14 @@ Configuration Configuration::load() {
     result.memoryMiB=qBound(1024,settings.value("sr/memoryMiB",2048).toInt(),16384);
     result.halo=qBound(0,settings.value("sr/halo",16).toInt(),64);
     result.denoise=qBound(0,settings.value("sr/denoise",0).toInt(),15);
+    result.scale=validScale(settings.value("sr/scale",4.0).toDouble());
     return result;
 }
 void Configuration::save() const {
     QSettings s;
     s.setValue("sr/runtime",runtimeRoot); s.setValue("sr/worker",workerPath); s.setValue("sr/model",modelPath);
     s.setValue("sr/devices",devices); s.setValue("sr/displayProfile",displayProfile);
-    s.setValue("sr/memoryMiB",memoryMiB); s.setValue("sr/halo",halo); s.setValue("sr/denoise",denoise);
+    s.setValue("sr/memoryMiB",memoryMiB); s.setValue("sr/halo",halo); s.setValue("sr/denoise",denoise); s.setValue("sr/scale",scale);
 }
 QProcessEnvironment Configuration::environment() const {
     auto env=QProcessEnvironment::systemEnvironment();
@@ -121,6 +135,9 @@ struct Controller::Job {
     quint64 generation;
     Configuration configuration;
     QSize size;
+    double cumulativeScale=1.0;
+    QStringList steps;
+    QString inputDescription;
     QString inputHash, sourceKey, error;
     QImage alpha;
     QByteArray log;
@@ -141,7 +158,16 @@ Controller::Controller(MainWindow* window,QVGraphicsView* view)
         auto* a=toolbar_->addAction(text); a->setObjectName(name); a->setShortcut(shortcut);
         window->addAction(a); return a;
     };
-    run_=action(QStringLiteral("超解像 ×4"),"srRun",QKeySequence("Ctrl+U"));
+    scale_=new QDoubleSpinBox(toolbar_); scale_->setObjectName("srScale");
+    scale_->setRange(1.25,4.0); scale_->setDecimals(2); scale_->setSingleStep(0.25);
+    scale_->setPrefix(QStringLiteral("倍率 ")); scale_->setSuffix(QStringLiteral(" 倍"));
+    scale_->setValue(configuration_.scale);
+    scale_->setToolTip(QStringLiteral("今回の倍率（1.25〜4）。モデルは4倍で推論し、指定サイズへ縮小します。"));
+    toolbar_->addWidget(scale_);
+    run_=action(QStringLiteral("元画像を超解像"),"srRun",QKeySequence("Ctrl+U"));
+    repeat_=action(QStringLiteral("SRを重ねる"),"srRepeat",QKeySequence("Ctrl+Shift+U"));
+    run_->setToolTip(QStringLiteral("無加工の元画像から指定倍率で超解像します（Ctrl+U）"));
+    repeat_->setToolTip(QStringLiteral("前回のSR結果をさらに指定倍率で超解像します（Ctrl+Shift+U）。元画像は保持します。"));
     toggle_=action(QStringLiteral("SRを表示"),"srToggle",QKeySequence("Ctrl+Space"));
     save_=action(QStringLiteral("SRを保存…"),"srSave",QKeySequence("Ctrl+Shift+S"));
     cancel_=action(QStringLiteral("中止"),"srCancel",QKeySequence("Ctrl+."));
@@ -149,13 +175,17 @@ Controller::Controller(MainWindow* window,QVGraphicsView* view)
     toolbar_->addSeparator();
     progress_=new QProgressBar(toolbar_); progress_->setObjectName("srProgress"); progress_->setMaximumWidth(110); progress_->hide();
     toolbar_->addWidget(progress_);
-    status_=new QLabel(QStringLiteral("画像を開いてください"),toolbar_); status_->setObjectName("srStatus");
-    status_->setMargin(6); status_->setMinimumWidth(150);
-    status_->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);
+    status_=new StatusLabel(QStringLiteral("画像を開いてください"),toolbar_); status_->setObjectName("srStatus");
+    status_->setMargin(6); status_->setMinimumWidth(0);
+    status_->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Fixed);
     status_->setFixedHeight(status_->fontMetrics().height()+12);
     status_->setTextFormat(Qt::PlainText); status_->setWordWrap(false); status_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     toolbar_->addWidget(status_);
     connect(run_,&QAction::triggered,this,&Controller::start);
+    connect(repeat_,&QAction::triggered,this,&Controller::startAgain);
+    connect(scale_,qOverload<double>(&QDoubleSpinBox::valueChanged),this,[this](double value) {
+        configuration_.scale=value; configuration_.save();
+    });
     connect(cancel_,&QAction::triggered,this,&Controller::cancel);
     connect(toggle_,&QAction::triggered,this,&Controller::toggle);
     connect(save_,&QAction::triggered,this,&Controller::saveAs);
@@ -187,7 +217,8 @@ Controller::~Controller() {
 }
 void Controller::setStatus(QString text) {
     status_->setToolTip(text);
-    status_->setText(text.replace('\r',' ').replace('\n',' ').replace('\t',' '));
+    text.replace("\r\n","\n"); text.replace('\r','\n');
+    status_->setText(text.section('\n',0,0).replace('\t',' '));
 }
 void Controller::setFullscreen(bool fullscreen) { toolbar_->setVisible(!fullscreen); }
 QString Controller::statusText() const { return status_->text(); }
@@ -196,11 +227,14 @@ void Controller::setConfiguration(const Configuration& config) {
     if(job_) return;
     const bool changed=config.runtimeRoot!=configuration_.runtimeRoot || config.workerPath!=configuration_.workerPath ||
         config.modelPath!=configuration_.modelPath || config.devices!=configuration_.devices;
-    configuration_=config; configuration_.save(); display();
+    configuration_=config; configuration_.scale=validScale(config.scale);
+    { const QSignalBlocker blocker(scale_); scale_->setValue(configuration_.scale); }
+    configuration_.save(); display();
     if(changed) restartWorker(); else if(!worker_) ensureWorker();
 }
 void Controller::invalidate() {
     ++generation_; sourceReady_=false; result_={}; showingSr_=false; resultSummary_.clear();
+    resultScale_=1.0; resultSteps_.clear();
     cancel(); updateActions();
 }
 void Controller::sourceLoaded() {
@@ -215,7 +249,8 @@ void Controller::sourceLoaded() {
 }
 void Controller::updateActions() {
     const bool valid=sourceReady_ && view_->getImageCore().getSourceProfile().error.isEmpty();
-    run_->setEnabled(valid && !job_); settings_->setEnabled(!job_);
+    run_->setEnabled(valid && !job_); repeat_->setEnabled(valid && !result_.isNull() && !job_);
+    scale_->setEnabled(!job_); settings_->setEnabled(!job_);
     cancel_->setEnabled(bool(job_) && !job_->cancelled);
     toggle_->setEnabled(!result_.isNull()); save_->setEnabled(!result_.isNull() && !saving_);
     toggle_->setText(showingSr_?QStringLiteral("元画像を表示"):QStringLiteral("SRを表示"));
@@ -243,12 +278,15 @@ void Controller::display() {
     auto image=convert(source,profile,destination,&error);
     if(image.isNull()) { setStatus(readFailure(error)); return; }
     view_->setDisplayImagePreservingView(image);
-    if(!job_) setStatus(showingSr_?QStringLiteral("SR ×4 · %1×%2").arg(result_.width()).arg(result_.height()):
+    if(!job_) setStatus(showingSr_?QStringLiteral("SR ×%1（%2回） · %3×%4").arg(scaleText(resultScale_)).arg(resultSteps_.size()).arg(result_.width()).arg(result_.height()):
                               QStringLiteral("元画像 · ")+view_->getImageCore().getSourceProfile().description);
     status_->setToolTip(QStringLiteral("入力: %1\n表示: %2\nSR保存: sRGB\n%3")
         .arg(view_->getImageCore().getSourceProfile().description,description,resultSummary_));
 }
-void Controller::start() {
+void Controller::start() { startJob(false); }
+void Controller::startAgain() { startJob(true); }
+void Controller::startJob(bool fromResult) {
+    if(fromResult && result_.isNull()) return;
     if(job_ || !sourceReady_ || !view_->getImageCore().getSourceProfile().error.isEmpty()) return;
     const auto config=configuration_;
     if(!QFileInfo(config.workerPath).isExecutable() || !QFileInfo::exists(config.modelPath) ||
@@ -259,21 +297,25 @@ void Controller::start() {
     if(view_->getCurrentFileDetails().isMovieLoaded && view_->getLoadedMovie().state()==QMovie::Running) window_->pause();
     view_->getImageCore().freezeAnimationForSr();
     display();
-    const auto source=view_->getImageCore().getSourceImage();
+    const auto source=fromResult?result_:view_->getImageCore().getSourceImage();
     const quint64 pixels=quint64(source.width())*source.height();
-    if(pixels*240 + 4*192ULL*1024*1024 > quint64(config.memoryMiB)*1024*1024) {
-        setStatus(QStringLiteral("SR用メモリー上限を超えます。小さい画像またはSR設定の上限を選んでください。"));
+    const quint64 requiredBytes=pixels*320 + quint64(result_.sizeInBytes()) +
+        quint64(view_->getImageCore().getSourceImage().sizeInBytes()) + 4*192ULL*1024*1024;
+    if(requiredBytes > quint64(config.memoryMiB)*1024*1024) {
+        setStatus(QStringLiteral("SRメモリー不足 · 見積り %1 MiB / 上限 %2 MiB\nSR設定で上限を変更するか、小さい入力画像を選んでください。")
+            .arg((requiredBytes+1024*1024-1)/(1024*1024)).arg(config.memoryMiB));
         emit failed(status_->text()); return;
     }
-    if(showingSr_) { showingSr_=false; display(); }
-    result_={}; resultSummary_.clear();
     auto job=std::make_shared<Job>();
     job->generation=generation_; job->configuration=config; job->size=source.size();
+    job->cumulativeScale=(fromResult?resultScale_:1.0)*config.scale;
+    job->steps=fromResult?resultSteps_:QStringList{}; job->steps<<scaleText(config.scale);
+    job->inputDescription=fromResult?QStringLiteral("前回のSR（sRGB）"):QStringLiteral("元画像");
     if(!job->directory->isValid()) { setStatus(QStringLiteral("一時フォルダーを作成できません")); return; }
     job_=job; setStatus(QStringLiteral("sRGB入力を準備中…"));
     progress_->setRange(0,0); progress_->show(); updateActions();
     auto* watcher=new QFutureWatcher<QString>(this);
-    const auto profile=view_->getImageCore().getSourceProfile();
+    const auto profile=fromResult?Profile{srgbProfile(),QStringLiteral("sRGB"),{},false}:view_->getImageCore().getSourceProfile();
     connect(watcher,&QFutureWatcher<QString>::finished,this,[this,job,watcher] {
         const auto error=watcher->result(); watcher->deleteLater();
         if(job!=job_) return;
@@ -404,12 +446,13 @@ void Controller::acceptResult(const std::shared_ptr<Job>& job) {
         if(job!=job_) return;
         if(job->cancelled || job->generation!=generation_) { finish(job); return; }
         if(result.isNull()) { finish(job,job->error); return; }
-        result_=result; showingSr_=true;
+        result_=result; showingSr_=true; resultScale_=job->cumulativeScale; resultSteps_=job->steps;
         QStringList stats;
         for(const auto& value:job->completion.value("devices").toArray()) {
             auto device=value.toObject(); stats<<QStringLiteral("%1: %2タイル").arg(device.value("id").toString()).arg(device.value("tiles").toInt());
         }
-        resultSummary_=stats.join(" / ")+QStringLiteral("\nノイズ低減: %1 / 処理: %2秒（初期化除く）")
+        resultSummary_=QStringLiteral("倍率: %1（元画像比 ×%2） / 入力: %3\n").arg(job->steps.join(" × "),scaleText(job->cumulativeScale),job->inputDescription)
+            +stats.join(" / ")+QStringLiteral("\nノイズ低減: %1 / 処理: %2秒（初期化除く）")
             .arg(job->configuration.denoise).arg(job->completion.value("wall_ms").toDouble()/1000,0,'f',2);
         if(!job->warnings.isEmpty()) resultSummary_+="\n"+job->warnings.join("\n");
         finish(job); display(); emit resultReady();
@@ -428,6 +471,11 @@ void Controller::acceptResult(const std::shared_ptr<Job>& job) {
         auto image=reader.read();
         if(image.isNull()) return fail(reader.errorString());
         if(!job->alpha.isNull()) image.setAlphaChannel(job->alpha.scaled(expected,Qt::IgnoreAspectRatio,Qt::SmoothTransformation));
+        // The pinned network always predicts 4x. Resize that SR result (including
+        // alpha) in premultiplied form to avoid fringes along transparent edges.
+        const QSize target(qRound(job->size.width()*job->configuration.scale),qRound(job->size.height()*job->configuration.scale));
+        if(target!=expected) image=image.convertToFormat(QImage::Format_ARGB32_Premultiplied).scaled(target,Qt::IgnoreAspectRatio,Qt::SmoothTransformation);
+        if(image.isNull()) return fail(QStringLiteral("指定倍率の画像用メモリーを確保できません"));
         image.setColorSpace(QColorSpace::SRgb); return image;
     }));
 }
@@ -494,7 +542,7 @@ void Controller::finish(std::shared_ptr<Job> job,const QString& error) {
     const bool cancelled=job->cancelled;
     job_.reset(); watchdog_.stop(); progress_->hide();
     if(!error.isEmpty()) { setStatus(readFailure(error)); status_->setToolTip(error+"\n"+QString::fromUtf8(job->log)); emit failed(error); }
-    else if(cancelled) setStatus(sourceReady_?QStringLiteral("中止しました · 元画像"):QStringLiteral("画像を読み込み中…"));
+    else if(cancelled) setStatus(sourceReady_?QStringLiteral("中止しました · ")+(showingSr_?QStringLiteral("前回のSRを保持"):QStringLiteral("元画像")):QStringLiteral("画像を読み込み中…"));
     updateActions();
 }
 void Controller::cancel() {
@@ -524,7 +572,7 @@ void Controller::saveAs() {
     const auto original=view_->getCurrentFileDetails().fileInfo;
     QString selected;
     QString path=QFileDialog::getSaveFileName(window_,QStringLiteral("SR画像を保存（sRGB ICC付き）"),
-        original.absolutePath()+"/"+original.completeBaseName()+"_sr4x.png",QStringLiteral("PNG (*.png);;JPEG (*.jpg *.jpeg)"),&selected);
+        original.absolutePath()+"/"+original.completeBaseName()+"_sr"+scaleText(resultScale_).replace('.','p')+"x_"+QString::number(resultSteps_.size())+"pass.png",QStringLiteral("PNG (*.png);;JPEG (*.jpg *.jpeg)"),&selected);
     if(path.isEmpty()) return;
     QByteArray format=selected.startsWith("JPEG")?QByteArray("jpeg"):QByteArray("png");
     if(QFileInfo(path).suffix().isEmpty()) path+=format=="jpeg"?".jpg":".png";
@@ -603,7 +651,7 @@ void Controller::showSettings() {
     noise->setRange(0,15); noise->setSpecialValueText(QStringLiteral("なし")); noise->setValue(configuration_.denoise);
     noise->setToolTip(QStringLiteral("3: 弱 / 6: 標準 / 10: 強。JPEGのノイズをSR前に低減します。強くすると細部も滑らかになります。"));
     form->addRow(QStringLiteral("ノイズ低減（SR前）"),noise);
-    auto* note=new QLabel(QStringLiteral("SRは×4・sRGBで処理/保存します。画面ICCは保存画像に適用しません。\n個体を指定する場合はIDをカンマ区切りで入力できます。世代混在時の画質は比較検証中です。\nノイズ低減は0=なし、3=弱、6=標準、10=強。強くすると細部も滑らかになります。"),&dialog);
+    auto* note=new QLabel(QStringLiteral("モデルは4倍で推論し、指定倍率に縮小してsRGBで保存します。画面ICCは保存画像に適用しません。\n個体を指定する場合はIDをカンマ区切りで入力できます。世代混在時の画質は比較検証中です。\nノイズ低減は0=なし、3=弱、6=標準、10=強。強くすると細部も滑らかになります。"),&dialog);
     note->setWordWrap(true); layout->addWidget(note);
     auto* buttons=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel,&dialog); layout->addWidget(buttons);
     connect(buttons,&QDialogButtonBox::accepted,&dialog,&QDialog::accept); connect(buttons,&QDialogButtonBox::rejected,&dialog,&QDialog::reject);

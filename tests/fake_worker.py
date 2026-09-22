@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import queue
+import shutil
 import struct
 import sys
 import threading
@@ -34,6 +35,7 @@ def chunk(name, data):
 
 def run(job):
     mode = job['devices']
+    shutil.copyfile(job['input'], pathlib.Path(job['model_xml']).with_suffix('.last-input.png'))
     emit(job, 'started', total=1)
     if mode == 'delay':
         for _ in range(60):

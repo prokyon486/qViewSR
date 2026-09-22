@@ -6,6 +6,7 @@
 #include <QImageWriter>
 #include <QElapsedTimer>
 #include <QDialog>
+#include <QDoubleSpinBox>
 #include <QMenu>
 #include <QPushButton>
 #include <QSettings>
@@ -117,6 +118,103 @@ private slots:
         QVERIFY(controller->saveResult(files.filePath("rotated.png"),"png",&error));
         QCOMPARE(QImage(files.filePath("rotated.png")).size(),QSize(192,256));
     }
+    void selectableScale_data() {
+        QTest::addColumn<double>("scale");
+        QTest::newRow("2x")<<2.0; QTest::newRow("3x")<<3.0;
+        QTest::newRow("1.5x")<<1.5; QTest::newRow("2.25x")<<2.25;
+    }
+    void selectableScale() {
+        QFETCH(double,scale);
+        QImage source(63,47,QImage::Format_RGBA8888); source.fill(QColor(70,130,190,180));
+        source.setColorSpace(QColorSpace::AdobeRgb);
+        const auto path=files.filePath("odd-size.png"); QVERIFY(source.save(path));
+        window->openFile(path);
+        QTRY_COMPARE(view->getImageCore().getSourceImage().size(),source.size());
+        auto* scaleInput=window->findChild<QDoubleSpinBox*>("srScale"); QVERIFY(scaleInput);
+        scaleInput->setValue(scale); QCOMPARE(controller->configuration().scale,scale);
+        QCOMPARE(Sr::Configuration::load().scale,scale);
+        QSignalSpy ready(controller,&Sr::Controller::resultReady);
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        const QSize expected(qRound(63*scale),qRound(47*scale));
+        QCOMPARE(controller->resultImage().size(),expected);
+        QCOMPARE(controller->resultImage().colorSpace(),QColorSpace(QColorSpace::SRgb));
+        QVERIFY(qAbs(controller->resultImage().pixelColor(10,10).alpha()-180)<=1);
+        QCOMPARE(controller->resultScale(),scale); QCOMPARE(controller->resultPasses(),1);
+        QString error; const auto saved=files.filePath("scaled.png");
+        QVERIFY2(controller->saveResult(saved,"png",&error),qPrintable(error));
+        QCOMPARE(QImage(saved).size(),expected);
+    }
+    void repeatFromResultKeepsOriginal() {
+        QTRY_VERIFY_WITH_TIMEOUT(controller->backendReady(),5000);
+        const auto pid=controller->backendPid();
+        const auto original=view->getImageCore().getSourceImage();
+        auto* scale=window->findChild<QDoubleSpinBox*>("srScale");
+        scale->setValue(2);
+        QSignalSpy ready(controller,&Sr::Controller::resultReady);
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        const auto first=controller->resultImage();
+        QCOMPARE(first.size(),QSize(128,96));
+        QFile monitor(files.filePath("repeat-monitor.icc")); QVERIFY(monitor.open(QIODevice::WriteOnly));
+        monitor.write(QColorSpace(QColorSpace::AdobeRgb).iccProfile()); monitor.close();
+        auto next=controller->configuration(); next.displayProfile=monitor.fileName(); next.scale=3;
+        controller->setConfiguration(next);
+        // A repeat explicitly uses the prior sRGB result, even when the user is
+        // comparing the original or using a different monitor colour profile.
+        click("srToggle"); QVERIFY(!controller->showingSr());
+        click("srRepeat"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),2,8000);
+        QCOMPARE(controller->resultImage().size(),QSize(384,288));
+        QCOMPARE(controller->resultScale(),6.0); QCOMPARE(controller->resultPasses(),2);
+        const QImage input(files.filePath("model.last-input.png"));
+        QCOMPARE(input.size(),first.size());
+        const auto color=input.pixelColor(10,10),before=first.pixelColor(10,10);
+        QCOMPARE(color.red(),before.red()); QCOMPARE(color.green(),before.green()); QCOMPARE(color.blue(),before.blue());
+        QVERIFY(qAbs(controller->resultImage().pixelColor(10,10).alpha()-180)<=1);
+        QCOMPARE(view->getImageCore().getSourceImage(),original);
+        click("srToggle"); QCOMPARE(view->getLoadedPixmap().size(),original.size());
+        QString error; QVERIFY(controller->saveResult(files.filePath("repeat.png"),"png",&error));
+        QCOMPARE(QImage(files.filePath("repeat.png")).size(),QSize(384,288));
+        QCOMPARE(controller->backendPid(),pid);
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),3,8000);
+        QCOMPARE(controller->resultImage().size(),QSize(192,144));
+        QCOMPARE(controller->resultPasses(),1); QCOMPARE(controller->resultScale(),3.0);
+    }
+    void failedOrCancelledRepeatKeepsResult() {
+        QSignalSpy ready(controller,&Sr::Controller::resultReady);
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        const auto previous=controller->resultImage();
+        auto broken=controller->configuration(); broken.devices="bad-hash";
+        controller->setConfiguration(broken);
+        QSignalSpy failure(controller,&Sr::Controller::failed);
+        click("srRepeat"); QTRY_COMPARE_WITH_TIMEOUT(failure.count(),1,8000);
+        QCOMPARE(controller->resultImage(),previous); QVERIFY(controller->showingSr());
+        QCOMPARE(controller->resultScale(),4.0); QCOMPARE(controller->resultPasses(),1);
+        broken.devices="delay"; controller->setConfiguration(broken);
+        click("srRepeat");
+        QTRY_VERIFY_WITH_TIMEOUT(controller->statusText().contains(QStringLiteral("準備済み")),5000);
+        click("srCancel"); QTRY_VERIFY_WITH_TIMEOUT(!controller->isBusy(),3000);
+        QCOMPARE(controller->resultImage(),previous); QCOMPARE(controller->resultPasses(),1);
+        QVERIFY(controller->showingSr());
+        click("srRepeat");
+        QTRY_VERIFY_WITH_TIMEOUT(controller->statusText().contains(QStringLiteral("準備済み")),5000);
+        QImage second(80,60,QImage::Format_RGB32); second.fill(Qt::red);
+        const auto path=files.filePath("new-original.png"); QVERIFY(second.save(path));
+        window->openFile(path); QTRY_COMPARE(view->getImageCore().getSourceImage().size(),second.size());
+        QTRY_VERIFY_WITH_TIMEOUT(!controller->isBusy(),3000);
+        QVERIFY(!controller->hasResult()); QCOMPARE(controller->resultPasses(),0);
+        QVERIFY(!window->findChild<QAction*>("srRepeat")->isEnabled());
+    }
+    void oversizedRepeatKeepsResult() {
+        QImage image(400,400,QImage::Format_RGB32); image.fill(Qt::blue);
+        const auto path=files.filePath("memory-limit.png"); QVERIFY(image.save(path));
+        window->openFile(path); QTRY_COMPARE(view->getImageCore().getSourceImage().size(),image.size());
+        auto small=config; small.memoryMiB=1024; controller->setConfiguration(small);
+        QSignalSpy ready(controller,&Sr::Controller::resultReady),failure(controller,&Sr::Controller::failed);
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        const auto previous=controller->resultImage();
+        click("srRepeat"); QCOMPARE(failure.count(),1); QVERIFY(!controller->isBusy());
+        QCOMPARE(controller->resultImage(),previous); QCOMPARE(controller->resultPasses(),1);
+        QVERIFY(controller->statusText().contains(QStringLiteral("メモリー不足")));
+    }
     void cancelOnNavigation() {
         auto delayed=config; delayed.devices="delay"; controller->setConfiguration(delayed);
         click("srRun"); QVERIFY(controller->isBusy());
@@ -173,7 +271,17 @@ private slots:
         click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(failure.count(),1,8000);
         QVERIFY(!label->wordWrap()); QVERIFY(!label->text().contains('\n'));
         QCOMPARE(toolbar->height(),height);
-        const auto message=label->text(); QVERIFY(message.size()>1000);
+        const auto message=label->text();
+        QVERIFY(message.endsWith(QStringLiteral("とても長いエラー表示です")));
+        QVERIFY(!message.contains(QStringLiteral("詳細")));
+        QVERIFY(label->toolTip().size()>1000); QVERIFY(label->toolTip().contains('\n'));
+        window->resize(1500,650); QTest::qWait(100);
+        const auto labelRight=label->mapTo(toolbar,QPoint(label->width(),0)).x();
+        QVERIFY2(toolbar->width()-labelRight<16,"Status must extend to the right edge");
+        QVERIFY(label->width()>label->fontMetrics().horizontalAdvance(message)+2*label->margin());
+        const int wide=label->width();
+        window->resize(1200,650); QTest::qWait(100);
+        QVERIFY(label->width()<wide); QCOMPARE(toolbar->height(),height);
         window->toggleFullScreen(); QTRY_VERIFY(window->isFullScreen());
         QVERIFY(!toolbar->isVisible());
         QTest::keyClick(window,Qt::Key_U,Qt::ControlModifier);
@@ -279,6 +387,47 @@ private slots:
         QVERIFY(view->getImageCore().getSourceProfile().assumedSrgb);
         click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),2,8000);
         QCOMPARE(controller->resultImage().size(),QSize(128,96));
+    }
+    void realScaleAndRepeatGui() {
+        if(!qEnvironmentVariableIsSet("QVIEWSR_REAL_WORKER")) QSKIP("Opt-in real-device test.");
+        auto real=config; real.workerPath=qEnvironmentVariable("QVIEWSR_REAL_WORKER");
+        real.runtimeRoot=qEnvironmentVariable("QVIEWSR_REAL_RUNTIME"); real.modelPath=qEnvironmentVariable("QVIEWSR_REAL_MODEL");
+        real.devices="all"; real.scale=2.0;
+        QSignalSpy initialized(controller,&Sr::Controller::backendInitialized),failure(controller,&Sr::Controller::failed);
+        controller->setConfiguration(real);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->backendReady() || !failure.isEmpty(),120000);
+        QVERIFY2(failure.isEmpty(),qPrintable(controller->statusText()));
+        const auto pid=controller->backendPid(); QCOMPARE(initialized.count(),1);
+        const auto path=qEnvironmentVariable("QVIEWSR_REAL_IMAGE"); window->openFile(path);
+        QTRY_COMPARE_WITH_TIMEOUT(view->getCurrentFileDetails().fileInfo.absoluteFilePath(),QFileInfo(path).absoluteFilePath(),5000);
+        QTRY_VERIFY(window->findChild<QAction*>("srRun")->isEnabled());
+        const auto original=view->getImageCore().getSourceImage();
+        QSignalSpy ready(controller,&Sr::Controller::resultReady);
+        click("srRun"); QTRY_VERIFY_WITH_TIMEOUT(ready.count()==1 || !failure.isEmpty(),120000);
+        QVERIFY2(failure.isEmpty(),qPrintable(controller->statusText()));
+        QCOMPARE(controller->resultImage().size(),original.size()*2);
+        const auto firstSummary=window->findChild<QLabel*>("srStatus")->toolTip();
+        QCOMPARE(firstSummary.count(QStringLiteral("タイル")),4);
+        window->findChild<QDoubleSpinBox*>("srScale")->setValue(3);
+        click("srRepeat"); QTRY_VERIFY_WITH_TIMEOUT(ready.count()==2 || !failure.isEmpty(),120000);
+        QVERIFY2(failure.isEmpty(),qPrintable(controller->statusText()));
+        QCOMPARE(controller->resultImage().size(),original.size()*6);
+        QCOMPARE(controller->resultPasses(),2); QCOMPARE(controller->resultScale(),6.0);
+        QCOMPARE(controller->backendPid(),pid); QCOMPARE(initialized.count(),1);
+        QCOMPARE(view->getImageCore().getSourceImage(),original);
+        click("srToggle"); QVERIFY(!controller->showingSr()); QCOMPARE(view->getLoadedPixmap().size(),original.size());
+        click("srToggle");
+        const auto artifacts=qEnvironmentVariable("QVIEWSR_GUI_ARTIFACTS");
+        if(!artifacts.isEmpty()) {
+            QDir().mkpath(artifacts); QString error;
+            QVERIFY2(controller->saveResult(artifacts+"/sr-repeat-6x.png","png",&error),qPrintable(error));
+            QCOMPARE(QImage(artifacts+"/sr-repeat-6x.png").size(),original.size()*6);
+            window->resize(1400,850); QTest::qWait(200);
+            QVERIFY(window->grab().save(artifacts+"/gui-repeat-6x.png"));
+            QFile summary(artifacts+"/scale-summary.txt"); QVERIFY(summary.open(QIODevice::WriteOnly));
+            summary.write(QStringLiteral("初期化回数: %1 / worker PID: %2\n2倍:\n%3\n2倍→3倍（累計6倍）:\n%4\n")
+                .arg(initialized.count()).arg(pid).arg(firstSummary,window->findChild<QLabel*>("srStatus")->toolTip()).toUtf8());
+        }
     }
     void realHardwareGui() {
         if(!qEnvironmentVariableIsSet("QVIEWSR_REAL_WORKER")) QSKIP("Set QVIEWSR_REAL_WORKER/RUNTIME/MODEL/IMAGE for opt-in real-device GUI test.");

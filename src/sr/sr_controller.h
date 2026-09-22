@@ -15,6 +15,7 @@ class QLabel;
 class QProgressBar;
 class QToolBar;
 class QProcess;
+class QDoubleSpinBox;
 
 namespace Sr {
 struct Configuration {
@@ -24,6 +25,7 @@ struct Configuration {
     int memoryMiB = 2048;
     int halo = 16;
     int denoise = 0;
+    double scale = 4.0;
     static Configuration load();
     void save() const;
     QProcessEnvironment environment() const;
@@ -38,6 +40,8 @@ public:
     bool hasResult() const { return !result_.isNull(); }
     bool showingSr() const { return showingSr_; }
     QImage resultImage() const { return result_; }
+    double resultScale() const { return resultScale_; }
+    int resultPasses() const { return resultSteps_.size(); }
     QString statusText() const;
     bool backendReady() const { return backendReady_; }
     qint64 backendPid() const;
@@ -46,6 +50,7 @@ public:
     bool saveResult(const QString& path, const QByteArray& format, QString* error);
 public slots:
     void start();
+    void startAgain();
     void cancel();
     void toggle();
     void saveAs();
@@ -59,6 +64,7 @@ signals:
 private:
     struct Job;
     void setStatus(QString text);
+    void startJob(bool fromResult);
     void invalidate();
     void sourceLoaded();
     void updateActions();
@@ -75,7 +81,8 @@ private:
     MainWindow* window_;
     QVGraphicsView* view_;
     QToolBar* toolbar_;
-    QAction *run_, *cancel_, *toggle_, *save_, *settings_;
+    QAction *run_, *repeat_, *cancel_, *toggle_, *save_, *settings_;
+    QDoubleSpinBox* scale_;
     QLabel* status_;
     QProgressBar* progress_;
     Configuration configuration_;
@@ -84,6 +91,8 @@ private:
     bool showingSr_ = false, sourceReady_ = false, saving_ = false;
     quint64 generation_ = 0;
     QString resultSummary_;
+    double resultScale_ = 1.0;
+    QStringList resultSteps_;
     QTimer watchdog_;
     QTimer backendWatchdog_;
     QPointer<QProcess> worker_;
