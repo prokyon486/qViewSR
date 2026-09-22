@@ -46,10 +46,34 @@
     "scale": 4,
     "input_order": "BGR",
     "input_layout": "NCHW",
-    "input_range": [0, 255],
-    "output_nominal_range": [0, 1],
-    "inputs": {"0": [1, 3, 270, 480], "1": [1, 3, 1080, 1920]},
-    "output_shape": [1, 3, 1080, 1920],
+    "input_range": [
+      0,
+      255
+    ],
+    "output_nominal_range": [
+      0,
+      1
+    ],
+    "inputs": {
+      "0": [
+        1,
+        3,
+        270,
+        480
+      ],
+      "1": [
+        1,
+        3,
+        1080,
+        1920
+      ]
+    },
+    "output_shape": [
+      1,
+      3,
+      1080,
+      1920
+    ],
     "checksum_provenance": "Open Model Zoo 2020.3 models/intel/single-image-super-resolution-1032/model.yml; verified after download.",
     "files": [
       {
@@ -65,5 +89,12 @@
         "sha256": "abae5907d40ef7e47d680435a99484b74076a985a6b8c3353b64fa77e6d3c149"
       }
     ]
+  },
+  "preservation": {
+    "repository": "prokyon486/qViewSR-runtime-archive",
+    "visibility": "private",
+    "tag": "runtime-2020.3.355-20260922",
+    "asset_naming": "basename of each locked file",
+    "scope": "Owner-only preservation of original runtime with bundled libraries, firmware, licenses, model and Ubuntu dependencies. Not a public redistribution license."
   }
 }

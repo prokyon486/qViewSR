@@ -11,6 +11,16 @@ cd /home/janis/qViewSR/qView
 
 画像を引数に渡すか、ウィンドウへ画像ファイルをドラッグしてください。WebP、BMP、TIFF、SVGなど、qViewのデコーダーが読み込める形式を超解像できます。このPCはビルド・モデル取得・USB権限設定まで完了しています。
 
+Ubuntuのアプリランチャーと画像の「アプリケーションで開く」には、次のコマンドで登録できます（sudo不要）。このPCには登録済みです。既定の画像アプリは変更しません。
+
+```bash
+python3 tools/install_desktop.py
+# 登録を解除する場合
+python3 tools/install_desktop.py --uninstall
+```
+
+ランチャーで「qViewSR」を検索するか、画像を右クリックして「別のアプリケーションで開く」から選択してください。表示されない場合はアプリ一覧を展開します。登録は現在の作業フォルダーを参照するため、移動した場合や画像プラグインを追加した場合は再登録してください。
+
 | 操作 | ボタン／キー |
 |---|---|
 | 4倍超解像を開始 | 「超解像 ×4」／Ctrl+U |
@@ -49,6 +59,19 @@ Qt 6.4以上とLittleCMS2を使います。日本語メニューには`qt6-l10n-
 `QVIEWSR_ASSET_DIR`でアセット配置先、`QVIEWSR_BUILD_JOBS`でビルド並列数を変更できます。既存の`../.local`配置も自動検出します。配置を変更した場合はGUIのSR設定でパスを確認してください。旧runtimeのライブラリー検索パスはworkerだけに設定します。qView本家の設定とは別に保存します。
 
 このPCではOpenSSL開発ヘッダーをローカルSDKから参照しています。通常の新規セットアップでは`install_build_deps.sh`に含まれる`libssl-dev`を使います。
+
+## 動作版ランタイムの保存・復元
+
+所有者の非公開リポジトリ[qViewSR-runtime-archive](https://github.com/prokyon486/qViewSR-runtime-archive)に、現在のOpenVINOランタイム、同梱OpenCV/TBB等のライブラリ、NCSファームウェア、モデル、Ubuntu依存パッケージとライセンスを保存しています。公式配布元から取得できない場合、`fetch_assets.py`はこの保管先も試します（所有者のGitHub CLI認証が必要）。
+
+```bash
+# 保管先から明示的に復元。復元先は新しい空ディレクトリを推奨
+python3 tools/ncs/fetch_assets.py --source github --dest .local
+# Releaseのファイルを別途ダウンロード済みの場合。ネットワーク不使用
+python3 tools/ncs/fetch_assets.py --archive-dir /path/to/downloaded-assets --dest .local
+```
+
+どちらも固定済みSHA-256とサイズを検証します。詳細は[保存内容と復元手順](docs/sr/PRESERVATION.ja.md)を参照してください。
 
 ## 検証と現時点の範囲
 
