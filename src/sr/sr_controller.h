@@ -9,6 +9,7 @@
 #include <QVector>
 #include <QStringList>
 #include <memory>
+#include <atomic>
 class MainWindow;
 class QVGraphicsView;
 class QAction;
@@ -39,7 +40,7 @@ class Controller : public QObject {
 public:
     Controller(MainWindow* window, QVGraphicsView* view);
     ~Controller() override;
-    bool isBusy() const { return bool(job_); }
+    bool isBusy() const { return bool(job_) || saving_; }
     bool hasResult() const { return !result_.isNull(); }
     bool showingSr() const { return showingSr_; }
     QImage resultImage() const { return result_; }
@@ -60,6 +61,7 @@ public:
     qint64 backendPid() const;
     Configuration configuration() const { return configuration_; }
     void setConfiguration(const Configuration& configuration);
+    bool saveAnimation(const QString& path, QString* error);
     bool saveResult(const QString& path, const QByteArray& format, QString* error);
 public slots:
     void start();
@@ -76,10 +78,11 @@ signals:
     void failed(const QString& message);
     void backendInitialized();
     void animationFrameChanged(int frame);
+    void animationSaved(const QString& path);
 private:
     struct Job;
     void setStatus(QString text);
-    void saveFrameAs(bool originalFrame);
+    void saveFrameAs(bool originalFrame, bool offerAnimation = false);
     void startJob(bool fromResult);
     void prepareFrame(const std::shared_ptr<Job>& job);
     void publishResult(const std::shared_ptr<Job>& job);
@@ -109,6 +112,7 @@ private:
     Configuration configuration_;
     std::shared_ptr<Job> job_;
     QImage result_;
+    std::shared_ptr<std::atomic_bool> exportCancelled_;
     bool showingSr_ = false, sourceReady_ = false, saving_ = false;
     quint64 generation_ = 0;
     QString resultSummary_;

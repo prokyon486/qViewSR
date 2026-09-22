@@ -7,7 +7,7 @@ foreach(target IN ITEMS actionmanagertests srtests)
     target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/src")
     set_target_properties(${target} PROPERTIES AUTOUIC_SEARCH_PATHS "${PROJECT_SOURCE_DIR}/src")
     target_link_libraries(${target} PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Widgets Qt6::Svg
-        qviewsr_i18n Qt6::Concurrent Qt6::Test PkgConfig::LCMS2 ZLIB::ZLIB ${PLATFORM_SPECIFIC_LIBS})
+        qviewsr_i18n Qt6::Concurrent Qt6::Test PkgConfig::LCMS2 ZLIB::ZLIB GIF::GIF ${PLATFORM_SPECIFIC_LIBS})
     target_compile_definitions(${target} PRIVATE "VERSION=${PROJECT_VERSION}" QT_DEPRECATED_WARNINGS QT_NO_FOREACH
         "SR_SOURCE_DIR=\"${PROJECT_SOURCE_DIR}\"")
     if(QV_DISABLE_ONLINE_VERSION_CHECK)

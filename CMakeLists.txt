@@ -52,6 +52,7 @@ set(PROJECT_SOURCES
     src/shortcutmanager.cpp
     src/sr/color_pipeline.cpp
     src/sr/sr_controller.cpp
+    src/sr/gif_export.cpp
 )
 
 # Header files
@@ -72,6 +73,7 @@ set(PROJECT_HEADERS
     src/shortcutmanager.h
     src/sr/color_pipeline.h
     src/sr/sr_controller.h
+    src/sr/gif_export.h
 )
 
 # UI form files
@@ -134,7 +136,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE Qt${QT_VERSION_MAJOR}::Core Qt${QT
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LCMS2 REQUIRED IMPORTED_TARGET lcms2)
 find_package(ZLIB REQUIRED)
-target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Concurrent PkgConfig::LCMS2 ZLIB::ZLIB)
+find_package(GIF 5.1 REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Concurrent PkgConfig::LCMS2 ZLIB::ZLIB GIF::GIF)
 target_include_directories(${PROJECT_NAME} PRIVATE src)
 
 # Set the executable name to lowercase on Linux

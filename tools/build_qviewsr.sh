@@ -16,8 +16,14 @@ done
 python3 "$qviewsr_repo/tools/ncs/fetch_assets.py" --dest "$qviewsr_assets"
 qviewsr_assets=$(realpath "$qviewsr_assets")
 qviewsr_runtime="$qviewsr_assets/openvino-2020.3.355/l_openvino_toolkit_runtime_ubuntu18_p_2020.3.355"
+# Optional unpacked development SDK on the initial host (no system install).
+qviewsr_gui_args=()
+if [[ ! -f /usr/include/gif_lib.h && -f "$qviewsr_assets/sdk/usr/include/gif_lib.h" ]]; then
+    qviewsr_gui_args=(-DGIF_INCLUDE_DIR="$qviewsr_assets/sdk/usr/include"
+        -DGIF_LIBRARY="$(gcc -print-file-name=libgif.so.7)")
+fi
 cmake -S "$qviewsr_repo" -B "$qviewsr_repo/build/gui" -G Ninja \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTS=ON -DQV_DISABLE_ONLINE_VERSION_CHECK=ON
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTS=ON -DQV_DISABLE_ONLINE_VERSION_CHECK=ON "${qviewsr_gui_args[@]}"
 cmake --build "$qviewsr_repo/build/gui" --parallel "$qviewsr_jobs"
 qviewsr_ssl_args=()
 # Optional local SDK used on the initial host; normal installs use libssl-dev.

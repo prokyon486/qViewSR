@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "sr_controller.h"
 #include "color_pipeline.h"
+#include "gif_export.h"
 #include "mainwindow.h"
 #include "qvgraphicsview.h"
 #include <QAction>
@@ -29,6 +30,7 @@
 #include <QPainter>
 #include <QProcess>
 #include <QProgressBar>
+#include <QPromise>
 #include <QPushButton>
 #include <QSaveFile>
 #include <QScreen>
@@ -247,6 +249,7 @@ Controller::Controller(MainWindow* window,QVGraphicsView* view)
 Controller::~Controller() {
     animationTimer_.stop(); watchdog_.stop();
     if(job_) job_->cancelled=true;
+    if(exportCancelled_) *exportCancelled_=true;
     stopWorker();
 }
 void Controller::setStatus(QString text) {
@@ -258,7 +261,7 @@ void Controller::setFullscreen(bool fullscreen) { toolbar_->setVisible(!fullscre
 QString Controller::statusText() const { return status_->text(); }
 qint64 Controller::backendPid() const { return worker_?worker_->processId():0; }
 void Controller::setConfiguration(const Configuration& config) {
-    if(job_) return;
+    if(isBusy()) return;
     const bool changed=config.runtimeRoot!=configuration_.runtimeRoot || config.workerPath!=configuration_.workerPath ||
         config.modelPath!=configuration_.modelPath || config.devices!=configuration_.devices;
     configuration_=config; configuration_.scale=validScale(config.scale);
@@ -285,11 +288,12 @@ void Controller::sourceLoaded() {
 }
 void Controller::updateActions() {
     const bool valid=sourceReady_ && view_->getImageCore().getSourceProfile().error.isEmpty();
-    run_->setEnabled(valid && !job_); repeat_->setEnabled(valid && !result_.isNull() && !job_);
-    scale_->setEnabled(!job_); settings_->setEnabled(!job_);
-    cancel_->setEnabled(bool(job_) && !job_->cancelled);
-    toggle_->setEnabled(!result_.isNull()); save_->setEnabled(!result_.isNull() && !saving_);
-    save_->setText(hasAnimation()?QStringLiteral("SRフレームを保存…"):QStringLiteral("SRを保存…"));
+    run_->setEnabled(valid && !isBusy()); repeat_->setEnabled(valid && !result_.isNull() && !isBusy());
+    scale_->setEnabled(!isBusy()); settings_->setEnabled(!isBusy());
+    cancel_->setEnabled((job_ && !job_->cancelled) || (exportCancelled_ && !*exportCancelled_));
+    toggle_->setEnabled(!result_.isNull()); save_->setEnabled(!result_.isNull() && !isBusy());
+    save_->setText(QStringLiteral("SRを保存…"));
+    save_->setToolTip(hasAnimation()?QStringLiteral("GIF: 全フレームを保存。PNG/JPEG: 現在のフレームを保存。GIFは256色・透明/不透明に変換します。"):QStringLiteral("sRGB ICC付きでPNG/JPEGに保存します"));
     toggle_->setText(showingSr_?QStringLiteral("元画像を表示"):QStringLiteral("SRを表示"));
     emit stateChanged();
 }
@@ -326,7 +330,7 @@ void Controller::display(bool updateStatus) {
     } else image=convert(source,profile,destination,&error);
     if(image.isNull()) { animationTimer_.stop(); animationPlaying_=false; setStatus(readFailure(error)); return; }
     view_->setDisplayImagePreservingView(image);
-    if(updateStatus && !job_) {
+    if(updateStatus && !isBusy()) {
         QString summary=showingSr_?QStringLiteral("SR ×%1（%2回） · %3×%4").arg(scaleText(resultScale_)).arg(resultSteps_.size()).arg(result_.width()).arg(result_.height()):
                               QStringLiteral("元画像 · ")+view_->getImageCore().getSourceProfile().description;
         if(hasAnimation()) summary+=QStringLiteral(" · GIF %1フレーム · %2").arg(animationFrameCount()).arg(animationPlaying_?QStringLiteral("再生中"):QStringLiteral("一時停止"));
@@ -339,7 +343,7 @@ void Controller::start() { startJob(false); }
 void Controller::startAgain() { startJob(true); }
 void Controller::startJob(bool fromResult) {
     if(fromResult && result_.isNull()) return;
-    if(job_ || !sourceReady_ || !view_->getImageCore().getSourceProfile().error.isEmpty()) return;
+    if(isBusy() || !sourceReady_ || !view_->getImageCore().getSourceProfile().error.isEmpty()) return;
     const auto config=configuration_;
     if(!QFileInfo(config.workerPath).isExecutable() || !QFileInfo::exists(config.modelPath) ||
        !QFileInfo::exists(config.runtimeRoot+"/deployment_tools/inference_engine/lib/intel64/libmyriadPlugin.so")) {
@@ -601,7 +605,7 @@ void Controller::publishResult(const std::shared_ptr<Job>& job) {
         originalAnimation_=job->originals; resultAnimation_=job->outputs;
         animationIndex_=0; animationLoopsDone_=0; animationPlaying_=true; animationEnded_=false;
         animationDisplayProfile_.clear(); originalDisplayFrames_.clear(); resultDisplayFrames_.clear();
-        resultSummary_+=QStringLiteral("\nGIF: %1フレーム / 再生: %2 / PNG・JPEG保存は現在のSRフレーム").arg(animationFrameCount())
+        resultSummary_+=QStringLiteral("\nGIF: %1フレーム / 再生: %2 / GIF保存は全フレーム、PNG・JPEGは現在のフレーム").arg(animationFrameCount())
             .arg(animationLoopCount()<0?QStringLiteral("無限ループ"):QStringLiteral("%1回").arg(animationLoopCount()+1));
     }
     if(!job->warnings.isEmpty()) resultSummary_+="\n"+job->warnings.join("\n");
@@ -723,6 +727,7 @@ void Controller::finish(std::shared_ptr<Job> job,const QString& error) {
     updateActions();
 }
 void Controller::cancel() {
+    if(exportCancelled_) { *exportCancelled_=true; setStatus(QStringLiteral("GIF保存を中止中…")); updateActions(); }
     if(!job_) return;
     const auto job=job_;
     job->cancelled=true; watchdog_.stop(); setStatus(QStringLiteral("中止中…")); updateActions();
@@ -744,10 +749,53 @@ bool Controller::saveResult(const QString& path,const QByteArray& format,QString
     }
     return writeImage(view_->getImageCore().matchCurrentRotation(result_),path,format,Qt::white,error);
 }
-void Controller::saveAs() { saveFrameAs(false); }
+bool Controller::saveAnimation(const QString& path,QString* error) {
+    auto fail=[error](const QString& message) { if(error) *error=message; return false; };
+    if(!hasAnimation() || isBusy()) return fail(QStringLiteral("保存できる超解像GIFがありません、または処理中です"));
+    const auto original=view_->getCurrentFileDetails().fileInfo;
+    const QFileInfo destination(path);
+    if(destination.absoluteFilePath()==original.absoluteFilePath() ||
+       (!destination.canonicalFilePath().isEmpty() && destination.canonicalFilePath()==original.canonicalFilePath()))
+        return fail(QStringLiteral("元画像への上書きはできません"));
+    // Capture immutable frames and rotation. The exporter must never read widgets
+    // or the changing playback index from its background thread.
+    const auto animation=resultAnimation_;
+    const auto rotation=view_->getImageCore().getCurrentRotation();
+    const auto generation=generation_;
+    auto cancelled=std::make_shared<std::atomic_bool>(false); exportCancelled_=cancelled;
+    auto* watcher=new QFutureWatcher<QString>(this);
+    saving_=true; progress_->setRange(0,animation->frames.size()*2); progress_->setValue(0); progress_->show();
+    updateActions(); setStatus(QStringLiteral("GIF保存用の色を調整中…"));
+    connect(watcher,&QFutureWatcher<QString>::progressValueChanged,this,[this,generation,animation](int value) {
+        if(generation!=generation_ || !exportCancelled_ || *exportCancelled_) return;
+        progress_->setValue(value);
+        const int count=animation->frames.size();
+        setStatus(value<=count?QStringLiteral("GIF減色準備 %1/%2フレーム").arg(value).arg(count):
+                              QStringLiteral("GIF保存中 %1/%2フレーム").arg(value-count).arg(count));
+    });
+    connect(watcher,&QFutureWatcher<QString>::finished,this,[this,watcher,cancelled,generation,path] {
+        const auto error=watcher->result(); watcher->deleteLater();
+        saving_=false; exportCancelled_.reset(); progress_->hide(); updateActions();
+        if(error.isEmpty()) {
+            if(generation==generation_) setStatus(QStringLiteral("GIFを保存しました: ")+QFileInfo(path).fileName());
+            emit animationSaved(path);
+        } else if(generation==generation_) {
+            setStatus(error);
+            if(!*cancelled) emit failed(error);
+        }
+    });
+    watcher->setFuture(QtConcurrent::run([animation,rotation,path,cancelled](QPromise<QString>& promise) {
+        promise.setProgressRange(0,animation->frames.size()*2);
+        promise.addResult(writeGif(path,animation->frames,animation->delays,animation->loops,rotation,*cancelled,
+            [&promise](int value) { promise.setProgressValue(value); }));
+    }));
+    return true;
+}
+void Controller::saveAs() { saveFrameAs(false,true); }
 void Controller::saveDisplayedFrameAs() { saveFrameAs(hasAnimation() && !showingSr_); }
-void Controller::saveFrameAs(bool originalFrame) {
-    if(result_.isNull() || saving_) return;
+void Controller::saveFrameAs(bool originalFrame,bool offerAnimation) {
+    if(result_.isNull() || isBusy()) return;
+    offerAnimation=offerAnimation && hasAnimation();
     const auto original=view_->getCurrentFileDetails().fileInfo;
     if(hasAnimation()) setAnimationPaused(true);
     QString error;
@@ -755,12 +803,23 @@ void Controller::saveFrameAs(bool originalFrame) {
     if(frame.isNull()) { setStatus(error); return; }
     const auto image=view_->getImageCore().matchCurrentRotation(frame);
     const auto suffix=originalFrame?QStringLiteral("_original"):"_sr"+scaleText(resultScale_).replace('.','p')+"x_"+QString::number(resultSteps_.size())+"pass";
-    QString selected;
-    QString path=QFileDialog::getSaveFileName(window_,originalFrame?QStringLiteral("現在の元画像フレームを保存（sRGB ICC付き）"):hasAnimation()?QStringLiteral("現在のSRフレームを保存（sRGB ICC付き）"):QStringLiteral("SR画像を保存（sRGB ICC付き）"),
-        original.absolutePath()+"/"+original.completeBaseName()+suffix+(hasAnimation()?QStringLiteral("_frame%1").arg(animationIndex_+1,5,10,QLatin1Char('0')):QString())+".png",QStringLiteral("PNG (*.png);;JPEG (*.jpg *.jpeg)"),&selected);
-    if(path.isEmpty()) return;
-    QByteArray format=selected.startsWith("JPEG")?QByteArray("jpeg"):QByteArray("png");
-    if(QFileInfo(path).suffix().isEmpty()) path+=format=="jpeg"?".jpg":".png";
+    const auto title=offerAnimation?QStringLiteral("超解像GIFを保存（全フレーム・元の再生間隔）"):
+        originalFrame?QStringLiteral("現在の元画像フレームを保存（sRGB ICC付き）"):QStringLiteral("SR画像を保存（sRGB ICC付き）");
+    const auto filters=offerAnimation?QStringLiteral("GIFアニメーション（全フレーム） (*.gif);;PNG（現在のフレーム） (*.png);;JPEG（現在のフレーム） (*.jpg *.jpeg)"):QStringLiteral("PNG (*.png);;JPEG (*.jpg *.jpeg)");
+    QFileDialog dialog(window_,title,original.absolutePath(),filters);
+    dialog.setAcceptMode(QFileDialog::AcceptSave); dialog.setDefaultSuffix(offerAnimation?"gif":"png");
+    dialog.selectFile(original.completeBaseName()+suffix+(hasAnimation() && !offerAnimation?QStringLiteral("_frame%1").arg(animationIndex_+1,5,10,QLatin1Char('0')):QString()));
+    connect(&dialog,&QFileDialog::filterSelected,&dialog,[&dialog](const QString& filter) {
+        dialog.setDefaultSuffix(filter.startsWith("GIF")?"gif":filter.startsWith("JPEG")?"jpg":"png");
+    });
+    if(dialog.exec()!=QDialog::Accepted || dialog.selectedFiles().isEmpty()) return;
+    const auto path=dialog.selectedFiles().first();
+    const auto selected=dialog.selectedNameFilter();
+    const QByteArray format=selected.startsWith("GIF")?"gif":selected.startsWith("JPEG")?"jpeg":"png";
+    if(format=="gif") {
+        if(!saveAnimation(path,&error)) setStatus(error);
+        return;
+    }
     if(QFileInfo(path).absoluteFilePath()==original.absoluteFilePath() ||
        (!QFileInfo(path).canonicalFilePath().isEmpty() && QFileInfo(path).canonicalFilePath()==original.canonicalFilePath())) {
         setStatus(QStringLiteral("元画像への上書きはできません")); return;
@@ -782,7 +841,7 @@ void Controller::saveFrameAs(bool originalFrame) {
     }));
 }
 void Controller::showSettings() {
-    if(job_) return;
+    if(isBusy()) return;
     QDialog dialog(window_); dialog.setWindowTitle(QStringLiteral("qViewSR 設定")); dialog.setMinimumWidth(700);
     auto* layout=new QVBoxLayout(&dialog); auto* form=new QFormLayout; layout->addLayout(form);
     auto field=[&](const QString& label,const QString& value,bool directory) {

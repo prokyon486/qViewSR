@@ -15,6 +15,9 @@
 #include <QToolBar>
 #include <QToolButton>
 #include <QLabel>
+#include <QScrollBar>
+#include <QFileDialog>
+#include "sr/gif_export.h"
 #include "qvapplication.h"
 #include "sr/color_pipeline.h"
 #include "sr/sr_controller.h"
@@ -69,6 +72,8 @@ private slots:
         config.displayProfile="sRGB"; config.devices="normal";
     }
     void init() {
+        QSettings().setValue("options/scalingenabled",true);
+        qvApp->getSettingsManager().loadSettings();
         window=new MainWindow; window->resize(1000,650); window->show();
         view=window->findChild<QVGraphicsView*>(); QVERIFY(view);
         controller=window->findChild<Sr::Controller*>(); QVERIFY(controller);
@@ -448,6 +453,169 @@ private slots:
         QTRY_VERIFY(!controller->hasAnimation()); const int events=changed.count();
         QTest::qWait(300); QCOMPARE(changed.count(),events); QVERIFY(!controller->hasResult());
     }
+    void animationPanStaysFixed_data() {
+        QTest::addColumn<bool>("sr"); QTest::addColumn<bool>("smooth"); QTest::addColumn<int>("rotation");
+        for(bool sr:{false,true}) for(bool smooth:{false,true}) for(int rotation:{0,90})
+            QTest::newRow(qPrintable(QString("%1-smooth%2-rot%3").arg(sr?"sr":"original").arg(smooth).arg(rotation)))<<sr<<smooth<<rotation;
+    }
+    void animationPanStaysFixed() {
+        QFETCH(bool,sr); QFETCH(bool,smooth); QFETCH(int,rotation);
+        QSettings().setValue("options/scalingenabled",smooth);
+        qvApp->getSettingsManager().loadSettings();
+        loadAnimation(gifFixture());
+        if(sr) { QSignalSpy ready(controller,&Sr::Controller::resultReady); click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000); controller->setAnimationPaused(true); }
+        else view->setPaused(true);
+        if(rotation) view->rotateImage(rotation);
+        view->resetScale(); view->zoom(2.35); QTest::qWait(80);
+        // Test the raw and resampled display paths after dragging away from centre.
+        if(smooth) view->scaleExpensively(); else view->makeUnscaled();
+        view->horizontalScrollBar()->setValue(view->horizontalScrollBar()->value()+57);
+        view->verticalScrollBar()->setValue(view->verticalScrollBar()->value()+39);
+        const auto transform=view->transform();
+        const QPoint before(view->horizontalScrollBar()->value(),view->verticalScrollBar()->value());
+        QSignalSpy srFrames(controller,&Sr::Controller::animationFrameChanged);
+        QSignalSpy originalFrames(&view->getLoadedMovie(),&QMovie::frameChanged);
+        for(int i=0;i<120;++i) {
+            if(sr) controller->stepAnimation();
+            else view->jumpToNextFrame();
+        }
+        QCOMPARE(sr?srFrames.count():originalFrames.count(),120);
+        const QPoint after(view->horizontalScrollBar()->value(),view->verticalScrollBar()->value());
+        qInfo()<<"Pan before/after"<<before<<after;
+        QCOMPARE(view->transform(),transform); QCOMPARE(after,before);
+        if(sr) {
+            for(int i=0;i<20;++i) { controller->toggle(); controller->toggle(); }
+            QVERIFY(qAbs(view->horizontalScrollBar()->value()-before.x())<=1);
+            QVERIFY(qAbs(view->verticalScrollBar()->value()-before.y())<=1);
+        }
+    }
+    void gifExportRoundTrip_data() {
+        QTest::addColumn<int>("loops"); QTest::addColumn<int>("rotation");
+        for(int loops:{-1,0,2}) for(int rotation:{0,90})
+            QTest::newRow(qPrintable(QString("loops%1-rot%2").arg(loops).arg(rotation)))<<loops<<rotation;
+    }
+    void gifExportRoundTrip() {
+        QFETCH(int,loops); QFETCH(int,rotation);
+        QVector<QImage> frames;
+        for(int i=0;i<3;++i) {
+            QImage image(32,24,QImage::Format_RGBA8888); image.fill(Qt::transparent); image.setColorSpace(QColorSpace::SRgb);
+            for(int y=4;y<20;++y) for(int x=i*10;x<i*10+8;++x) image.setPixelColor(x,y,QColor(i==0?255:0,i==1?255:0,i==2?255:0));
+            image.setPixelColor(30,23,QColor(120,80,40,127)); image.setPixelColor(31,23,QColor(120,80,40,128));
+            frames<<image;
+        }
+        const QVector<int> delays{80,160,240}; std::atomic_bool cancelled{false};
+        const auto path=files.filePath("保存 % GIF.gif");
+        QString error=Sr::writeGif(path,frames,delays,loops,rotation,cancelled);
+        QVERIFY2(error.isEmpty(),qPrintable(error));
+        QImageReader reader(path); QCOMPARE(reader.imageCount(),3); QCOMPARE(reader.loopCount(),loops);
+        QTransform transform; transform.rotate(rotation);
+        for(int i=0;i<3;++i) {
+            const auto actual=reader.read(); const auto expected=frames[i].transformed(transform);
+            QCOMPARE(actual.size(),expected.size()); QCOMPARE(reader.nextImageDelay(),delays[i]);
+            for(int y=0;y<actual.height();++y) for(int x=0;x<actual.width();++x) {
+                auto color=expected.pixelColor(x,y); const bool visible=color.alpha()>=128;
+                QCOMPARE(actual.pixelColor(x,y).alpha(),visible?255:0);
+                if(visible) { color.setAlpha(255); QCOMPARE(actual.pixelColor(x,y),color); }
+            }
+        }
+        QVERIFY(!reader.canRead());
+        QFile file(path); QVERIFY(file.open(QIODevice::ReadOnly)); const auto bytes=file.readAll();
+        int offset=bytes.indexOf("ICCRGBG1012"); QVERIFY(offset>0); offset+=11;
+        QByteArray icc;
+        while(offset<bytes.size() && uchar(bytes[offset])) {
+            const int count=uchar(bytes[offset++]); icc+=bytes.mid(offset,count); offset+=count;
+        }
+        QCOMPARE(icc,Sr::srgbProfile());
+    }
+    void gifExportQuantizationAndCancel_data() {
+        QTest::addColumn<bool>("alpha"); QTest::newRow("opaque")<<false; QTest::newRow("transparent")<<true;
+    }
+    void gifExportQuantizationAndCancel() {
+        QFETCH(bool,alpha);
+        QImage gradient(256,128,QImage::Format_RGBA8888); gradient.setColorSpace(QColorSpace::SRgb);
+        for(int y=0;y<128;++y) for(int x=0;x<256;++x) gradient.setPixelColor(x,y,QColor(x,y*2,(x+y)%256));
+        if(alpha) for(int x=0;x<256;++x) gradient.setPixelColor(x,0,Qt::transparent);
+        const QVector<QImage> frames{gradient,gradient,gradient}; const QVector<int> delays{100,200,300};
+        std::atomic_bool cancelled{false}; const auto path=files.filePath("quantized.gif");
+        auto error=Sr::writeGif(path,frames,delays,-1,0,cancelled);
+        QVERIFY2(error.isEmpty(),qPrintable(error));
+        QImageReader reader(path); const auto first=reader.read();
+        double squaredError=0;
+        for(int y=0;y<128;++y) for(int x=0;x<256;++x) {
+            const auto a=first.pixelColor(x,y),b=gradient.pixelColor(x,y);
+            QCOMPARE(a.alpha(),b.alpha());
+            if(!b.alpha()) continue;
+            squaredError+=qPow(a.red()-b.red(),2)+qPow(a.green()-b.green(),2)+qPow(a.blue()-b.blue(),2);
+        }
+        const auto rmse=qSqrt(squaredError/(256*128*3)); qInfo()<<"GIF RGB RMSE"<<rmse; QVERIFY(rmse<18);
+        for(int frame=1;frame<3;++frame) {
+            const auto next=reader.read();
+            // Qt may change hidden RGB values under alpha=0 after disposal.
+            // Compare displayed pixels and alpha, including palette/dither stability.
+            QCOMPARE(next.convertToFormat(QImage::Format_ARGB32_Premultiplied),
+                     first.convertToFormat(QImage::Format_ARGB32_Premultiplied));
+        }
+        QFile file(path); QVERIFY(file.open(QIODevice::ReadOnly)); const auto previous=file.readAll(); file.close();
+        error=Sr::writeGif(path,frames,delays,-1,0,cancelled,[&](int progress) { if(progress==4) cancelled=true; });
+        QVERIFY(!error.isEmpty()); QVERIFY(file.open(QIODevice::ReadOnly)); QCOMPARE(file.readAll(),previous); file.close();
+        cancelled=false;
+        auto invalid=frames; invalid[2]=QImage(10,10,QImage::Format_RGB32);
+        QVERIFY(!Sr::writeGif(path,invalid,delays,-1,0,cancelled).isEmpty());
+        QVERIFY(file.open(QIODevice::ReadOnly)); QCOMPARE(file.readAll(),previous);
+        QVERIFY(!Sr::writeGif(files.filePath("no-directory/file.gif"),frames,delays,-1,0,cancelled).isEmpty());
+    }
+    void animationExportController() {
+        const auto original=gifFixture(); loadAnimation(original);
+        QSignalSpy ready(controller,&Sr::Controller::resultReady),saved(controller,&Sr::Controller::animationSaved);
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000); controller->setAnimationPaused(true);
+        QString error; QVERIFY(!controller->saveAnimation(original,&error));
+        const auto path=files.filePath("animation-export.gif");
+        QVERIFY2(controller->saveAnimation(path,&error),qPrintable(error));
+        QVERIFY(controller->isBusy()); QVERIFY(!window->findChild<QAction*>("srRun")->isEnabled());
+        QTRY_COMPARE_WITH_TIMEOUT(saved.count(),1,8000); QVERIFY(!controller->isBusy());
+        QImageReader reader(path); QCOMPARE(reader.imageCount(),3); QCOMPARE(reader.size(),QSize(64,48)); QCOMPARE(reader.loopCount(),-1);
+        QFile before(path); QVERIFY(before.open(QIODevice::ReadOnly)); const auto bytes=before.readAll(); before.close();
+        QFile profile(files.filePath("gif-display.icc")); QVERIFY(profile.open(QIODevice::WriteOnly)); profile.write(QColorSpace(QColorSpace::AdobeRgb).iccProfile()); profile.close();
+        auto alternate=controller->configuration(); alternate.displayProfile=profile.fileName(); controller->setConfiguration(alternate);
+        QVERIFY(controller->saveAnimation(path,&error)); QTRY_COMPARE_WITH_TIMEOUT(saved.count(),2,8000);
+        QVERIFY(before.open(QIODevice::ReadOnly)); QCOMPARE(before.readAll(),bytes); before.close();
+        view->rotateImage(90); QVERIFY(controller->saveAnimation(path,&error)); QTRY_COMPARE_WITH_TIMEOUT(saved.count(),3,8000);
+        QImageReader rotated(path); QCOMPARE(rotated.size(),QSize(48,64));
+        // Cancel immediately, including on source navigation, before publishing a replacement.
+        QVERIFY(before.open(QIODevice::ReadOnly)); const auto rotatedBytes=before.readAll(); before.close();
+        QVERIFY(controller->saveAnimation(path,&error)); controller->cancel();
+        QTRY_VERIFY_WITH_TIMEOUT(!controller->isBusy(),8000); QCOMPARE(saved.count(),3);
+        QVERIFY(before.open(QIODevice::ReadOnly)); QCOMPARE(before.readAll(),rotatedBytes); before.close();
+        QVERIFY(controller->saveAnimation(path,&error)); window->openFile(sourcePath);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller->isBusy(),8000); QCOMPARE(saved.count(),3); QVERIFY(!controller->hasAnimation());
+        QVERIFY(before.open(QIODevice::ReadOnly)); QCOMPARE(before.readAll(),rotatedBytes);
+    }
+    void animationSaveDialog_data() {
+        QTest::addColumn<bool>("gif"); QTest::newRow("whole-gif")<<true; QTest::newRow("png-frame")<<false;
+    }
+    void animationSaveDialog() {
+        QFETCH(bool,gif); loadAnimation(gifFixture());
+        QSignalSpy ready(controller,&Sr::Controller::resultReady),saved(controller,&Sr::Controller::animationSaved);
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        QApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
+        const auto path=files.filePath(gif?"dialog-save-gif":"dialog-save-png"); bool sawDialog=false;
+        QTimer::singleShot(0,window,[&,this] {
+            auto* dialog=window->findChild<QFileDialog*>();
+            if(!dialog) return;
+            sawDialog=dialog->selectedNameFilter().startsWith("GIF");
+            if(!gif) {
+                const auto filter=dialog->nameFilters()[1]; dialog->selectNameFilter(filter);
+                QMetaObject::invokeMethod(dialog,"filterSelected",Qt::DirectConnection,Q_ARG(QString,filter));
+            }
+            dialog->selectFile(path); QMetaObject::invokeMethod(dialog,"accept",Qt::DirectConnection);
+        });
+        controller->saveAs(); QVERIFY(sawDialog);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller->isBusy(),8000);
+        QImageReader reader(path+(gif?".gif":".png")); QVERIFY2(reader.canRead(),qPrintable(reader.errorString()));
+        QCOMPARE(reader.size(),QSize(64,48));
+        if(gif) { QCOMPARE(reader.imageCount(),3); QCOMPARE(saved.count(),1); }
+        else QCOMPARE(reader.imageCount(),1);
+    }
     void animationFinitePlayback_data() {
         QTest::addColumn<int>("repeats");
         QTest::newRow("once")<<0; QTest::newRow("repeat-once")<<1;
@@ -589,6 +757,28 @@ private slots:
             summary.write(QStringLiteral("初期化: %1回 / worker PID: %2 / 再生通知: %3\n全フレーム2倍:\n%4\n全フレーム2倍→2倍:\n%5\n")
                 .arg(initialized.count()).arg(pid).arg(frames.count()).arg(firstSummary,window->findChild<QLabel*>("srStatus")->toolTip()).toUtf8());
         }
+        const auto output=artifacts.isEmpty()?files.filePath("hardware-sr.gif"):artifacts+"/sr-animation.gif";
+        QSignalSpy saved(controller,&Sr::Controller::animationSaved);
+        QVERIFY2(controller->saveAnimation(output,&error),qPrintable(error));
+        QTRY_VERIFY_WITH_TIMEOUT(saved.count()==1 || !failure.isEmpty(),30000);
+        QVERIFY2(failure.isEmpty(),qPrintable(controller->statusText()));
+        QImageReader exported(output); QCOMPARE(exported.imageCount(),originals.size()); QCOMPARE(exported.loopCount(),loops);
+        for(int i=0;i<originals.size();++i) {
+            QCOMPARE(exported.read().size(),originals[i].size()*4); QCOMPARE(exported.nextImageDelay(),delays[i]);
+        }
+        // Exercise actual timed playback while zoomed beyond the viewport, after panning.
+        view->resetScale(); view->zoom(2.35); QTest::qWait(80);
+        view->horizontalScrollBar()->setValue(view->horizontalScrollBar()->value()+71);
+        view->verticalScrollBar()->setValue(view->verticalScrollBar()->value()+53);
+        const QPoint pan(view->horizontalScrollBar()->value(),view->verticalScrollBar()->value());
+        const auto zoom=view->transform(); const int frameEvents=frames.count();
+        controller->setAnimationSpeed(500); controller->setAnimationPaused(false);
+        QTRY_VERIFY_WITH_TIMEOUT(frames.count()>=frameEvents+60,10000); controller->setAnimationPaused(true);
+        QCOMPARE(view->transform(),zoom);
+        QCOMPARE(QPoint(view->horizontalScrollBar()->value(),view->verticalScrollBar()->value()),pan);
+        if(!artifacts.isEmpty()) QVERIFY(window->grab().save(artifacts+"/gui-gif-export-pan.png"));
+        window->openFile(output); QTRY_VERIFY_WITH_TIMEOUT(view->getCurrentFileDetails().isMovieLoaded,5000);
+        QCOMPARE(view->getLoadedMovie().frameCount(),originals.size());
     }
     void realScaleAndRepeatGui() {
         if(!qEnvironmentVariableIsSet("QVIEWSR_REAL_WORKER")) QSKIP("Opt-in real-device test.");

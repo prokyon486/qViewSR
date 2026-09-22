@@ -521,16 +521,28 @@ void QVGraphicsView::setDisplayImagePreservingView(const QImage &image)
 {
     if (image.isNull() || getLoadedPixmap().isNull()) return;
     expensiveScaleTimerNew->stop();
-    const QSizeF shown = loadedPixmapItem->boundingRect().size();
-    const QPointF center = mapToScene(viewport()->rect().center());
-    const QPointF relative(center.x() / qMax(1.0, shown.width()),
-                           center.y() / qMax(1.0, shown.height()));
+    const QPoint scrollPosition(horizontalScrollBar()->value(), verticalScrollBar()->value());
     const QSize oldSize = getLoadedPixmap().size();
+    imageCore.setDisplayImage(image);
+    const QSize newSize = getLoadedPixmap().size();
+    if (newSize == oldSize) {
+        // A frame update changes pixels, not the view. Recentring every frame
+        // accumulates integer scrollbar rounding (one pixel per update).
+        // Keep a resampled display at exactly its existing size as well.
+        const auto pixels = loadedPixmapItem->pixmap().size();
+        auto pixmap = getLoadedPixmap();
+        if (pixels != pixmap.size())
+            pixmap = pixmap.scaled(pixels, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        loadedPixmapItem->setPixmap(pixmap);
+        viewport()->update();
+        return;
+    }
+    // Resolution changes keep the same displayed width and image origin. Reuse
+    // the integer scroll position directly rather than round-tripping through
+    // floating-point centreOn(), including for repeated original/SR comparisons.
     makeUnscaled();
     QTransform next = transform();
-    imageCore.setDisplayImage(image);
     loadedPixmapItem->setPixmap(getLoadedPixmap());
-    const QSize newSize = getLoadedPixmap().size();
     const qreal ratio = qreal(oldSize.width()) / newSize.width();
     next.scale(ratio, ratio);
     absoluteTransform.scale(ratio, ratio);
@@ -538,7 +550,8 @@ void QVGraphicsView::setDisplayImagePreservingView(const QImage &image)
     zoomBasis = next;
     zoomBasisScaleFactor = 1.0;
     scaledSize = newSize;
-    QGraphicsView::centerOn(relative.x() * newSize.width(), relative.y() * newSize.height());
+    horizontalScrollBar()->setValue(scrollPosition.x());
+    verticalScrollBar()->setValue(scrollPosition.y());
     viewport()->update();
 }
 
