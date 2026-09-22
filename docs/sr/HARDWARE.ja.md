@@ -1,6 +1,6 @@
 # NCS実機検証と環境構築
 
-2026-09-22 JSTの初回調査とUSB権限修正後の再試験。**4本すべての単独SRモデル推論が成功した。** これは製品の完成報告ではない。
+2026-09-22 JSTの初回調査、権限修正後の単独試験、およびGUI接続後の試験。**単独推論と4本並列でのGUI表示・保存が成功した。** 長時間負荷や配布版全体の品質保証を意味しない。
 
 ## 確認結果
 
@@ -25,7 +25,7 @@ Codexの制限環境内ではUSB device nodeが見えず`lsusb`が失敗した�
 - g++でQt/OpenCV不要の`ncs-probe`をビルドできた。`inference_engine`、`inference_engine_legacy`、同梱nGraph/TBBでロード可能。
 - 1032 FP16のXML/BINがOMZ 2020.3のhashと一致。IR version 10とtensor shapeを確認。
 - **CPUの定数画像smoke testは成功**。入力128（BGR全channel）、出力mean=0.50205452、min=0.42816615、max=0.84511781。モデルload等は約9504ms、単発Inferは約134ms。これは1回の動作確認で、写真品質・定常性能・NCS比較の結果ではない。
-- **NCS/NCS2全4本の単独smoke testが成功**。4本並列、連続負荷、画像境界、保存は未検証。
+- **NCS/NCS2全4本の単独smoke testが成功**。4本並列・タイル境界・保存の追加試験は下記参照。連続負荷は未実施。
 - `myriad_compile`で2450/2480両方へのoffline compileもexit 0で成功。入出力precisionはprobeと同じFP32に明示した。
 
 各個体の定数画像試験（1回、cold/warmを揃えた性能比較ではない）:
@@ -96,8 +96,31 @@ bash tools/ncs/run_probe.sh "$qviewsr_runtime" --device CPU --model "$qviewsr_mo
 
 probe exit: 0=列挙または指定smoke成功、1=エラー、2=MYRIAD列挙0台、124/137=timeout系。旧runtimeのログはstdoutにも混ざり得るため、製品IPCのparser試験にはこのツールを使わない。
 
-## 次の判定
+## GUIと並列workerの追加検証
 
-USB権限修正・個体別1032・NCS1/NCS2のcompile可否は確認できた。次は実画像のCPU/NCS数値比較 → タイル → NCS2×2/全4本の速度比較へ進める。定数画像の成功を、任意画像・継続負荷・4本並列の保証に拡張しない。
+Qt 6.4.2、CMake 3.28.3、LittleCMS2 2.14、g++ 13.2でビルドした。`tools/build_qviewsr.sh`でviewer・workerと自動試験を再実行できる。
 
-生ログは`diagnostics/local/`へ保存し、Gitには含めない。結果を共有するときは必要な技術情報だけをこの文書へ反映する。
+| 試験 | 結果 |
+|---|---|
+| TilePlan | 1×1、奇数、固定shape前後など64寸法組合せ。全pixelが一度だけ書かれ、reflect101が範囲内。合格 |
+| Qt GUI + fake worker | ICC変換・alpha、ボタン開始、切替・倍率保持、PNG/JPEG ICC、別画面ICCで保存不変、回転保存、中止、ウィンドウ終了、異常終了、hash不一致。合格 |
+| 実worker・全4本 | 写真＋色帯＋文字＋線の897×477入力 → 3588×1908出力、halo 16、9タイル、14.289秒（worker単発、モデルload含む） |
+| Qt GUI → 実機4本 | 上記入力で開始・完成表示・切替・PNG/JPEG保存。offscreenとX11の両方で合格。X11試験全体19.351秒（起動・テスト操作・保存含む） |
+| CPU境界比較 | OMZ写真480×270の単一入力halo 0と、halo 16で4タイル化した出力を比較。外周64 HR pixelを除く内部は画素一致。内部境界x=1792 / y=952も一致 |
+
+全4本の9タイルは、`5.1.1-ma2480`が2、`5.1.2-ma2480`が3、`5.1.3-ma2450`が2、`5.1.4-ma2450`が2。各個体のrequestが動的キューから取得した実績で、固定配分ではない。
+
+CPU比較はこの1枚の境界処理の検証。初代/NCS2の丸め差、任意の内容、透明境界、halo値全般の保証には拡張しない。上記時間は各1回の動作確認であり、CPU優位・4本による高速化・warm性能を結論しない。
+
+実機GUIテストの再実行:
+
+```bash
+./tools/test_gui_hardware.sh /path/to/test.png
+QT_QPA_PLATFORM=xcb ./tools/test_gui_hardware.sh /path/to/test.png
+```
+
+Qt試験の設定は一時フォルダーに隔離する。生成PNG/JPEG、ウィンドウだけのスクリーンショット、デバイス別タイル数は`diagnostics/local/gui-check/`。実行時の入力画像を外部へ送信しない。
+
+次に評価する項目は、写真セットでのCPU/NCS/NCS2の数値・見た目比較、NCS2×2と全4本の待ち時間、30分負荷、抜去・再接続、実モニターICCの検証。GUIでは現在の結果を確認しながら、デバイスを切り替えて試せる。
+
+生ログと画像は`diagnostics/local/`へ保存し、Gitには含めない。共有する技術情報だけを本書に記録する。

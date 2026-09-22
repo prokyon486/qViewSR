@@ -1,6 +1,17 @@
 # qViewSR 設計書
 
-状態: 設計・実機成立性検証。GUIへの超解像組み込みは未実装。2026-09-22。
+状態: **GUI機能検証用の試作版を実装・ビルド済み**。2026-09-22。実機4本からGUI表示・保存まで確認。下記は目標設計を含み、全項目の完了を意味しない。
+
+### 現在の実装
+
+- `src/sr/sr_controller.*`: ツールバー、設定、非同期準備・worker起動、世代管理、中止、検証済み結果の表示、PNG/JPEG保存。Qt 6/C++17。
+- `src/sr/color_pipeline.*`: JPEG APP2/PNG iCCPのICC抽出、LittleCMS2による入力・表示色変換。元画像は`QVImageCore::ReadData`で表示画像から分離。
+- `worker/main.cpp`と`tile_plan.h`: 固定1032モデル、ハロー付きタイル、デバイス別requestと動的配分、正常完了時のみ出力公開。C++14・独立プロセス。
+- `tests/tst_srtests.cpp`: GUIボタン、色変換、alpha、切替と倍率、表示ICC変更、回転保存、キャンセル、終了、worker失敗、hash不一致の試験。実機試験は明示実行。
+- 実装上は役割を上記クラスに集約。後述の個別サービス名は将来の分割案。SR結果は現在画像のメモリー内に1つだけ保持し、再利用キャッシュは未実装。source keyは正立・sRGB化した入力PNGと元ICCのhash。読込前後のsize/mtime変更とキャッシュ登録前のrevisionを確認するが、ファイル全体hashによるrevision管理は後続。
+- 表示ICC手動指定はウィンドウ設定1個。モニターごとの保存や自動割当は未実装。通常はLittleCMS表示変換、手動ICC、またはX11 root ICC取得失敗時のsRGBを使う。
+
+起動・操作・既知の制限は[README-SR.ja.md](../../README-SR.ja.md)、測定済みの結果は[HARDWARE.ja.md](HARDWARE.ja.md)を参照。
 
 ## 1. 目的と引き継ぎ
 
@@ -27,8 +38,8 @@ UbuntuでJPEG/PNGを連続閲覧し、必要な画像だけNCS×2＋NCS2×2で�
 - Intelは初代NCSの対応を2020.3までとしている。[Intelの対応版案内](https://www.intel.com/content/www/us/en/support/articles/000091265/software.html)。別runtimeへの拡張は可能だが、初期版で2022/2023以降のAPIを混在させない。
 - 2020.3のOpen Model Zooに1032 FP16が実在する。XML/BINの取得と当時のSHA-256照合が成功した。取得したIRはversion 10。
 - ホストで旧runtimeをロードでき、1032のCPU定数画像推論が成功。これはNCSの演算成功や写真の品質を保証しない。
-- MYRIADから4個体のID取得が成功。初回のUSB書込権限不足を修正した後、**初代NCS×2・NCS2×2すべてで1032の単独定数画像推論に成功**。2450/2480両方のoffline compileも成功した。実写真の画質と4本並列は未検証。
-- CMake/Qt開発環境は初回確認時に未導入。qView本体のビルド・画面検証はまだ行っていない。
+- MYRIADから4個体のID取得が成功。初回のUSB書込権限不足を修正した後、**初代NCS×2・NCS2×2すべてで1032の単独定数画像推論に成功**。2450/2480両方のoffline compileも成功した。写真を含む897×477入力の4本並列・4倍出力・GUI表示保存まで確認。世代間の画質差と連続負荷は評価中。
+- Qt 6.4.2、CMake 3.28.3、LittleCMS2 2.14で本体とテストをビルド。offscreenとX11の実機GUI試験が成功。
 
 実測と未確認項目は[実機検証記録](HARDWARE.ja.md)に分離する。特に「4本が見える」「firmwareが起動する」「1032がコンパイルできる」「期待した出力になる」「並列化で速くなる」はそれぞれ別の合格条件とする。
 
@@ -57,7 +68,7 @@ flowchart LR
   R --> X[alpha復元 / sRGB ICC付き保存]
 ```
 
-GUIはQt Widgets/C++14を維持し、SR moduleを追加する。初期ビルド基準はUbuntu 24.04のQt 6.4系。既存Qt5対応は通常閲覧に残せるが、SRの受入対象には含めない。色変換はLittleCMS2を使用し、QtのバージョンによるICC LUT対応差を吸収する。JPEG/PNGの元ICC抽出にはlibjpeg/libpngの公式APIを利用する。
+GUIはQt Widgets/C++17にSR moduleを追加する。初期ビルド基準はUbuntu 24.04のQt 6.4以上で、CMakeはQt 6を必須とする。色変換はLittleCMS2を使用する。JPEGのAPP2分割とPNGのiCCPを上限付きで直接読み、PNG CRCとzlib展開を検証する。画素decodeと保存はQtのJPEG/PNG pluginを利用する。
 
 workerはQtをリンクせず、OpenVINO C++ InferenceEngine APIと旧runtimeに対応したOpenCVを使う。runtimeの`LD_LIBRARY_PATH`はworker起動時のみ設定する。GUI側へ古いTBB/OpenCVを流入させない。ホスト`/usr/lib`の差替えやグローバルな`setupvars.sh`の読み込みは行わない。
 
@@ -175,10 +186,13 @@ USB port pathとruntime ID、boot前後PIDを診断表示する。IDは再接続
   "source_key": "sha256",
   "input": "/private/job/input.png",
   "output": "/private/job/output.png",
-  "model_manifest": "/configured/model.json",
-  "scale": 4,
+  "model_xml": "/configured/single-image-super-resolution-1032.xml",
+  "input_sha256": "sha256 of input.png",
+  "width": 897,
+  "height": 477,
   "halo": 16,
-  "device_ids": ["5.1.1-ma2480", "5.1.2-ma2480"],
+  "devices": "all",
+  "lock_file": "/run/user/1000/qviewsr-devices.lock",
   "max_memory_bytes": 2147483648
 }
 ```
@@ -187,7 +201,7 @@ workerは`ncs-sr-worker --job /private/job/job.json`として起動。stdoutはv
 
 completedはjob_id、source_key、出力寸法、色空間sRGB、出力hash、使用デバイス、timingを含む。結果は一時名に書き、close後に同じjob directory内でrenameして公開する。GUIは正常exit、completed、ファイル存在、寸法、hash、色空間を確認する。プロセスexitだけを成功の証拠にしない。
 
-入力サイズ・出力サイズ・倍率・halo・path・モデルhashを起動前に検証。stdout行は64KiB以下、ログは10MiBに制限。起動timeout初期候補60秒、タイル進捗停止timeout120秒。USB bootが長い場合は測定値に基づき調整する。
+入力サイズ・出力サイズ・倍率・halo・path・モデルhashを起動前に検証。stdout行は64KiB以下、GUIが保持するstderrは末尾64KiBに制限。現在の起動・タイル進捗停止timeoutはいずれも120秒。USB bootが長い場合は測定値に基づき調整する。
 
 GUI状態: `Idle → Preparing → Starting → Running → Ready`、任意の途中状態から`Cancelling → Idle`、失敗は`Error`。画像送りでgenerationを増やし、旧jobをcancelする。cancel後の遅延signalや完成通知はjob_id/generation不一致で捨てる。terminate後2秒でkill、終了を待って一時ファイルを除去する。
 

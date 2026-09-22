@@ -3,6 +3,7 @@
 #include "qvapplication.h"
 #include "qvcocoafunctions.h"
 #include "qvrenamedialog.h"
+#include "sr/sr_controller.h"
 
 #include <QFileDialog>
 #include <QMessageBox>
@@ -51,6 +52,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
 
     // Initialize graphicsviewkDefaultBufferAlignment
     graphicsView = new QVGraphicsView(this);
+    srController = new Sr::Controller(this, graphicsView);
     centralWidget()->layout()->addWidget(graphicsView);
 
     // Hide fullscreen label by default
@@ -164,6 +166,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
 
 MainWindow::~MainWindow()
 {
+    delete srController;
     delete ui;
 }
 
@@ -488,7 +491,7 @@ void MainWindow::refreshProperties()
 
 void MainWindow::updateWindowTitle()
 {
-    QString newString = "qView";
+    QString newString = "qViewSR";
     if (getCurrentFileDetails().fileInfo.isFile()) {
         switch (qvApp->getSettingsManager().getInt(SettingsManager::Setting::TitleBarMode)) {
         case 1: {
@@ -511,7 +514,7 @@ void MainWindow::updateWindowTitle()
                 newString +=
                         " - " + QVInfoDialog::formatBytes(getCurrentFileDetails().fileInfo.size());
             }
-            newString += " - qView";
+            newString += " - qViewSR";
             break;
         }
         }

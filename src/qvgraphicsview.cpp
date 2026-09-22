@@ -517,6 +517,31 @@ void QVGraphicsView::updateLoadedPixmapItem()
     emit updatedLoadedPixmapItem();
 }
 
+void QVGraphicsView::setDisplayImagePreservingView(const QImage &image)
+{
+    if (image.isNull() || getLoadedPixmap().isNull()) return;
+    expensiveScaleTimerNew->stop();
+    const QSizeF shown = loadedPixmapItem->boundingRect().size();
+    const QPointF center = mapToScene(viewport()->rect().center());
+    const QPointF relative(center.x() / qMax(1.0, shown.width()),
+                           center.y() / qMax(1.0, shown.height()));
+    const QSize oldSize = getLoadedPixmap().size();
+    makeUnscaled();
+    QTransform next = transform();
+    imageCore.setDisplayImage(image);
+    loadedPixmapItem->setPixmap(getLoadedPixmap());
+    const QSize newSize = getLoadedPixmap().size();
+    const qreal ratio = qreal(oldSize.width()) / newSize.width();
+    next.scale(ratio, ratio);
+    absoluteTransform.scale(ratio, ratio);
+    setTransform(next);
+    zoomBasis = next;
+    zoomBasisScaleFactor = 1.0;
+    scaledSize = newSize;
+    QGraphicsView::centerOn(relative.x() * newSize.width(), relative.y() * newSize.height());
+    viewport()->update();
+}
+
 void QVGraphicsView::resetScale()
 {
     if (!getCurrentFileDetails().isPixmapLoaded)

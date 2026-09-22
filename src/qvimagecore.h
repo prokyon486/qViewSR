@@ -10,6 +10,7 @@
 #include <QTimer>
 #include <QCache>
 #include <QElapsedTimer>
+#include "sr/color_pipeline.h"
 
 #if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
 #  include <QColorSpace>
@@ -79,6 +80,9 @@ public:
         QSize imageSize;
         QColorSpace targetColorSpace;
         ErrorData errorData;
+        QImage sourceImage;
+        Sr::Profile sourceProfile;
+        qint64 lastModifiedMs = 0;
     };
 
     explicit QVImageCore(QObject *parent = nullptr);
@@ -118,8 +122,12 @@ public:
     const QMovie &getLoadedMovie() const { return loadedMovie; }
     const FileDetails &getCurrentFileDetails() const { return currentFileDetails; }
     int getCurrentRotation() const { return currentRotation; }
+    const QImage &getSourceImage() const { return sourceImage; }
+    const Sr::Profile &getSourceProfile() const { return sourceProfile; }
+    void setDisplayImage(const QImage &image);
 
 signals:
+    void sourceChanging();
     void animatedFrameChanged(QRect rect);
 
     void updateLoadedPixmapItem();
@@ -131,6 +139,8 @@ protected:
     FileDetails getEmptyFileDetails();
 
 private:
+    QImage sourceImage;
+    Sr::Profile sourceProfile;
     QPixmap loadedPixmap;
     QMovie loadedMovie;
 
@@ -139,7 +149,7 @@ private:
 
     QFutureWatcher<ReadData> loadFutureWatcher;
 
-    int colorSpaceConversion;
+    int colorSpaceConversion = -1;
 
     static QCache<QString, ReadData> imageCache;
 

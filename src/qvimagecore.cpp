@@ -1,4 +1,4 @@
-#include "qvimagecore.h"
+﻿#include "qvimagecore.h"
 #include "qvapplication.h"
 #include "qvwin32functions.h"
 #include "qvcocoafunctions.h"
@@ -14,6 +14,7 @@
 #include <QIcon>
 #include <QGuiApplication>
 #include <QScreen>
+#include <QDateTime>
 
 QCache<QString, QVImageCore::ReadData> QVImageCore::imageCache;
 
@@ -59,6 +60,8 @@ void QVImageCore::loadFile(const QString &fileName, bool isReloading)
     if (waitingOnLoad) {
         return;
     }
+
+    emit sourceChanging();
 
     QString sanitaryFileName = fileName;
 
@@ -112,10 +115,14 @@ void QVImageCore::loadFile(const QString &fileName, bool isReloading)
 QVImageCore::ReadData QVImageCore::readFile(const QString &fileName,
                                             const QColorSpace &targetColorSpace)
 {
+    const QFileInfo revisionBefore(fileName);
+    const qint64 revisionTime = revisionBefore.lastModified().toMSecsSinceEpoch();
+    const qint64 revisionSize = revisionBefore.size();
     QImageReader imageReader;
     imageReader.setAutoTransform(true);
 
     imageReader.setFileName(fileName);
+    const QSize encodedSize = imageReader.size();
 
     QImage readImage;
     if (imageReader.format() == "svg" || imageReader.format() == "svgz") {
@@ -131,6 +138,8 @@ QVImageCore::ReadData QVImageCore::readFile(const QString &fileName,
     }
 
 #if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
+    const QImage decodedSource = readImage;
+    const Sr::Profile decodedProfile = Sr::readProfile(fileName, decodedSource);
     readImage.convertTo(QImage::Format::Format_ARGB32_Premultiplied);
 #else
     readImage = readImage.convertToFormat(QImage::Format::Format_ARGB32_Premultiplied);
@@ -156,11 +165,24 @@ QVImageCore::ReadData QVImageCore::readFile(const QString &fileName,
         readImage.convertToColorSpace(targetColorSpace);
 #endif
 
+    // Original samples/profile stay independent from the monitor transform.
+    if (decodedProfile.error.isEmpty() && targetColorSpace.isValid()) {
+        const auto managed = Sr::convert(decodedSource, decodedProfile, targetColorSpace.iccProfile());
+        if (!managed.isNull()) readImage = managed;
+    }
+
     QFileInfo fileInfo(fileName);
 
     ReadData readData = { readImage,        fileInfo.absoluteFilePath(),
-                          fileInfo.size(),  imageReader.size(),
+                          fileInfo.size(),  encodedSize,
                           targetColorSpace, {} };
+    readData.sourceImage = decodedSource;
+    readData.sourceProfile = decodedProfile;
+    readData.lastModifiedMs = revisionTime;
+    if (revisionTime != fileInfo.lastModified().toMSecsSinceEpoch() || revisionSize != fileInfo.size()) {
+        readData.errorData = { true, QImageReader::InvalidDataError,
+                              QStringLiteral("Image changed while being read; please reload.") };
+    }
 
     if (readImage.isNull()) {
         readData.errorData = { true, imageReader.error(), imageReader.errorString() };
@@ -192,6 +214,8 @@ void QVImageCore::loadPixmap(const ReadData &readData)
         return;
     }
 
+    sourceImage = readData.sourceImage;
+    sourceProfile = readData.sourceProfile;
     loadedPixmap = QPixmap::fromImage(matchCurrentRotation(readData.image));
 
     // Set file details
@@ -236,12 +260,15 @@ void QVImageCore::loadPixmap(const ReadData &readData)
 
 void QVImageCore::closeImage()
 {
+    emit sourceChanging();
     currentFileDetails = getEmptyFileDetails();
     loadEmptyPixmap();
 }
 
 void QVImageCore::loadEmptyPixmap()
 {
+    sourceImage = {};
+    sourceProfile = {};
     loadedPixmap = QPixmap();
     loadedMovie.stop();
     loadedMovie.setFileName("");
@@ -508,7 +535,10 @@ void QVImageCore::requestCachingFile(const QString &filePath, const QColorSpace 
 
 void QVImageCore::addToCache(const ReadData &&readData)
 {
-    if (readData.image.isNull())
+    const QFileInfo currentRevision(readData.absoluteFilePath);
+    if (readData.image.isNull() || readData.errorData.hasError
+            || readData.lastModifiedMs != currentRevision.lastModified().toMSecsSinceEpoch()
+            || readData.fileSize != currentRevision.size())
         return;
 
     QString cacheKey = getPixmapCacheKey(readData.absoluteFilePath, readData.fileSize,
@@ -516,6 +546,7 @@ void QVImageCore::addToCache(const ReadData &&readData)
     qint64 pixmapMemoryBytes = static_cast<qint64>(readData.image.width()) * readData.image.height()
             * readData.image.depth() / 8;
 
+    pixmapMemoryBytes += readData.sourceImage.sizeInBytes();
     qint64 pixmapMemoryKiB = qMax(pixmapMemoryBytes / 1024, 1LL);
     QVImageCore::imageCache.insert(cacheKey, new ReadData(std::move(readData)), pixmapMemoryKiB);
 }
@@ -530,7 +561,14 @@ QString QVImageCore::getPixmapCacheKey(const QString &absoluteFilePath, const qi
 #else
     QString targetColorSpaceHash = "";
 #endif
-    return absoluteFilePath + "\n" + QString::number(fileSize) + "\n" + targetColorSpaceHash;
+    return absoluteFilePath + "\n" + QString::number(fileSize) + "\n" + targetColorSpaceHash
+            + "\n" + QString::number(QFileInfo(absoluteFilePath).lastModified().toMSecsSinceEpoch());
+}
+
+void QVImageCore::setDisplayImage(const QImage &image)
+{
+    loadedPixmap = QPixmap::fromImage(matchCurrentRotation(image));
+    currentFileDetails.loadedPixmapSize = loadedPixmap.size();
 }
 
 QColorSpace QVImageCore::getTargetColorSpace() const

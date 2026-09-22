@@ -18,8 +18,8 @@ elseif(APPLE)
     set(EXECUTABLE_TYPE MACOSX_BUNDLE)
 endif()
 
-# Enable C++14
-set(CMAKE_CXX_STANDARD 14)
+# Qt 6 requires C++17; the isolated legacy worker remains C++14.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Enable Qt's automatic tools
@@ -28,23 +28,10 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Find required Qt components
-find_package(Qt6 QUIET COMPONENTS Core Gui Network Widgets Svg)
-if(Qt6_FOUND)
-    set(QT_VERSION_MAJOR 6)
-    set(QT_VERSION ${Qt6_VERSION})
-    # Find optional tools
-    find_package(Qt6 QUIET COMPONENTS LinguistTools)
-else()
-    set(QT5_FIND_COMPONENTS Core Gui Network Widgets Svg)
-    if(UNIX AND NOT APPLE)
-        list(APPEND QT5_FIND_COMPONENTS X11Extras)
-    endif()
-    find_package(Qt5 REQUIRED COMPONENTS ${QT5_FIND_COMPONENTS})
-    set(QT_VERSION_MAJOR 5)
-    set(QT_VERSION ${Qt5_VERSION})
-    # Find optional tools
-    find_package(Qt5 QUIET COMPONENTS LinguistTools)
-endif()
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Network Widgets Svg Concurrent)
+set(QT_VERSION_MAJOR 6)
+set(QT_VERSION ${Qt6_VERSION})
+find_package(Qt6 QUIET COMPONENTS LinguistTools)
 
 # Source files
 set(PROJECT_SOURCES
@@ -63,6 +50,8 @@ set(PROJECT_SOURCES
     src/actionmanager.cpp
     src/settingsmanager.cpp
     src/shortcutmanager.cpp
+    src/sr/color_pipeline.cpp
+    src/sr/sr_controller.cpp
 )
 
 # Header files
@@ -81,6 +70,8 @@ set(PROJECT_HEADERS
     src/actionmanager.h
     src/settingsmanager.h
     src/shortcutmanager.h
+    src/sr/color_pipeline.h
+    src/sr/sr_controller.h
 )
 
 # UI form files
@@ -95,7 +86,7 @@ set(PROJECT_FORMS
 )
 
 # To disables both manual and automatic checking for updates
-option(QV_DISABLE_ONLINE_VERSION_CHECK "Disable online version check" OFF)
+option(QV_DISABLE_ONLINE_VERSION_CHECK "Disable online version check" ON)
 if(NOT QV_DISABLE_ONLINE_VERSION_CHECK)
     list(APPEND PROJECT_SOURCES src/updatechecker.cpp)
     list(APPEND PROJECT_HEADERS src/updatechecker.h)
@@ -140,14 +131,19 @@ endif()
 add_executable(${PROJECT_NAME} ${EXECUTABLE_TYPE} ${PROJECT_SOURCES} ${PROJECT_HEADERS} ${PROJECT_FORMS} ${PROJECT_RESOURCES})
 
 target_link_libraries(${PROJECT_NAME} PRIVATE Qt${QT_VERSION_MAJOR}::Core Qt${QT_VERSION_MAJOR}::Gui Qt${QT_VERSION_MAJOR}::Network Qt${QT_VERSION_MAJOR}::Widgets Qt${QT_VERSION_MAJOR}::Svg)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LCMS2 REQUIRED IMPORTED_TARGET lcms2)
+find_package(ZLIB REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Concurrent PkgConfig::LCMS2 ZLIB::ZLIB)
+target_include_directories(${PROJECT_NAME} PRIVATE src)
 
 # Set the executable name to lowercase on Linux
 if(UNIX AND NOT APPLE)
-    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "qview")
+    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "qviewsr")
 endif()
 
 # Add compile definitions based on options
-if(NOT QV_DISABLE_ONLINE_VERSION_CHECK)
+if(QV_DISABLE_ONLINE_VERSION_CHECK)
     target_compile_definitions(${PROJECT_NAME} PRIVATE QV_DISABLE_ONLINE_VERSION_CHECK)
 endif()
 
@@ -199,8 +195,9 @@ elseif(APPLE)
 elseif(UNIX AND NOT APPLE)
     if(NOT NO_X11)
         find_package(X11 REQUIRED)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE X11_LOADED)
         set(PLATFORM_SPECIFIC_LIBS ${X11_LIBRARIES})
-        if(NOT Qt6_FOUND)
+        if(QT_VERSION_MAJOR EQUAL 5)
             list(APPEND PLATFORM_SPECIFIC_LIBS Qt5::X11Extras)
         endif()
         target_link_libraries(${PROJECT_NAME} PRIVATE ${PLATFORM_SPECIFIC_LIBS})
