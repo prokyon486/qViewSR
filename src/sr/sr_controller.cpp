@@ -13,6 +13,9 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QDoubleSpinBox>
+#include <QDateTime>
+#include <QElapsedTimer>
+#include <QMap>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -43,7 +46,27 @@
 #include <cmath>
 
 namespace Sr {
+struct AnimationFrames {
+    QVector<QImage> frames;
+    QVector<int> delays;
+    int loops=0; // Qt convention: 0 plays once, -1 repeats forever.
+    quint64 bytes() const { quint64 n=0; for(const auto& frame:frames) n+=quint64(frame.sizeInBytes()); return n; }
+};
 namespace {
+quint64 animationEstimate(const AnimationFrames& input,double scale,quint64 retained) {
+    quint64 output=0,maxPixels=0;
+    for(const auto& frame:input.frames) {
+        const quint64 pixels=quint64(frame.width())*frame.height();
+        maxPixels=qMax(maxPixels,pixels);
+        output+=quint64(qRound(frame.width()*scale))*qRound(frame.height()*scale)*8;
+    }
+    return retained+input.bytes()*2+output+maxPixels*320+4*192ULL*1024*1024;
+}
+QString animationMemoryError(quint64 required,quint64 budget) {
+    return QStringLiteral("GIFメモリー不足 · 見積り %1 MiB / 上限 %2 MiB\nSR設定のアニメーション用メモリー上限を増やしてください。")
+        .arg((required+1024*1024-1)/(1024*1024)).arg(budget/(1024*1024));
+}
+
 QString scaleText(double scale) { return QString::number(scale,'g',6); }
 double validScale(double scale) { return std::isfinite(scale)?qBound(1.25,scale,4.0):4.0; }
 // Long text must not enlarge the toolbar's size hint or push the label into
@@ -112,6 +135,7 @@ Configuration Configuration::load() {
     result.devices=settings.value("sr/devices","all").toString();
     result.displayProfile=settings.value("sr/displayProfile").toString();
     result.memoryMiB=qBound(1024,settings.value("sr/memoryMiB",2048).toInt(),16384);
+    result.animationMemoryMiB=qBound(1024,settings.value("sr/animationMemoryMiB",8192).toInt(),65536);
     result.halo=qBound(0,settings.value("sr/halo",16).toInt(),64);
     result.denoise=qBound(0,settings.value("sr/denoise",0).toInt(),15);
     result.scale=validScale(settings.value("sr/scale",4.0).toDouble());
@@ -121,7 +145,7 @@ void Configuration::save() const {
     QSettings s;
     s.setValue("sr/runtime",runtimeRoot); s.setValue("sr/worker",workerPath); s.setValue("sr/model",modelPath);
     s.setValue("sr/devices",devices); s.setValue("sr/displayProfile",displayProfile);
-    s.setValue("sr/memoryMiB",memoryMiB); s.setValue("sr/halo",halo); s.setValue("sr/denoise",denoise); s.setValue("sr/scale",scale);
+    s.setValue("sr/memoryMiB",memoryMiB); s.setValue("sr/animationMemoryMiB",animationMemoryMiB); s.setValue("sr/halo",halo); s.setValue("sr/denoise",denoise); s.setValue("sr/scale",scale);
 }
 QProcessEnvironment Configuration::environment() const {
     auto env=QProcessEnvironment::systemEnvironment();
@@ -140,6 +164,14 @@ struct Controller::Job {
     QString inputDescription;
     QString inputHash, sourceKey, error;
     QImage alpha;
+    Profile profile;
+    std::shared_ptr<const AnimationFrames> inputs, originals;
+    std::shared_ptr<AnimationFrames> outputs=std::make_shared<AnimationFrames>();
+    bool animated=false;
+    int frame=0;
+    quint64 budget=0,retainedBytes=0;
+    QMap<QString,int> deviceTiles;
+    double wallMs=0;
     QByteArray log;
     QJsonObject request;
     bool sent=false;
@@ -208,10 +240,12 @@ Controller::Controller(MainWindow* window,QVGraphicsView* view)
         ensureWorker();
         if(window_->windowHandle()) connect(window_->windowHandle(),&QWindow::screenChanged,this,[this]{display();});
     });
+    animationTimer_.setSingleShot(true); animationTimer_.setTimerType(Qt::PreciseTimer);
+    connect(&animationTimer_,&QTimer::timeout,this,&Controller::advanceAnimation);
     updateActions();
 }
 Controller::~Controller() {
-    watchdog_.stop();
+    animationTimer_.stop(); watchdog_.stop();
     if(job_) job_->cancelled=true;
     stopWorker();
 }
@@ -233,6 +267,8 @@ void Controller::setConfiguration(const Configuration& config) {
     if(changed) restartWorker(); else if(!worker_) ensureWorker();
 }
 void Controller::invalidate() {
+    animationTimer_.stop(); animationPlaying_=false; animationIndex_=0; animationLoopsDone_=0; animationEnded_=false;
+    originalAnimation_.reset(); resultAnimation_.reset(); originalDisplayFrames_.clear(); resultDisplayFrames_.clear(); animationDisplayProfile_.clear();
     ++generation_; sourceReady_=false; result_={}; showingSr_=false; resultSummary_.clear();
     resultScale_=1.0; resultSteps_.clear();
     cancel(); updateActions();
@@ -253,6 +289,7 @@ void Controller::updateActions() {
     scale_->setEnabled(!job_); settings_->setEnabled(!job_);
     cancel_->setEnabled(bool(job_) && !job_->cancelled);
     toggle_->setEnabled(!result_.isNull()); save_->setEnabled(!result_.isNull() && !saving_);
+    save_->setText(hasAnimation()?QStringLiteral("SRフレームを保存…"):QStringLiteral("SRを保存…"));
     toggle_->setText(showingSr_?QStringLiteral("元画像を表示"):QStringLiteral("SRを表示"));
     emit stateChanged();
 }
@@ -268,20 +305,35 @@ QByteArray Controller::displayIcc(QString* description) const {
     if(description)*description=space.isValid()?QStringLiteral("自動画面ICC"):QStringLiteral("sRGB（画面ICC未取得）");
     return space.isValid()?space.iccProfile():srgbProfile();
 }
-void Controller::display() {
+void Controller::display(bool updateStatus) {
     if(!sourceReady_) return;
     QString description,error;
     const auto destination=displayIcc(&description);
     if(destination.isEmpty()) { setStatus(QStringLiteral("画面ICCを読み込めません。SR設定を確認してください。")); return; }
-    const auto& source=showingSr_?result_:view_->getImageCore().getSourceImage();
+    const auto& source=hasAnimation()?(showingSr_?resultAnimation_->frames[animationIndex_]:originalAnimation_->frames[animationIndex_]):
+        (showingSr_?result_:view_->getImageCore().getSourceImage());
     const Profile profile=showingSr_?Profile{srgbProfile(),QStringLiteral("sRGB"),{},false}:view_->getImageCore().getSourceProfile();
-    auto image=convert(source,profile,destination,&error);
-    if(image.isNull()) { setStatus(readFailure(error)); return; }
+    QImage image;
+    if(hasAnimation()) {
+        if(animationDisplayProfile_!=destination) {
+            originalDisplayFrames_.fill(QImage(),animationFrameCount()); resultDisplayFrames_.fill(QImage(),animationFrameCount());
+            animationDisplayProfile_=destination;
+        }
+        auto& cache=showingSr_?resultDisplayFrames_:originalDisplayFrames_;
+        if(cache[animationIndex_].isNull()) cache[animationIndex_]=convert(source,profile,destination,&error);
+        image=cache[animationIndex_];
+        result_=resultAnimation_->frames[animationIndex_];
+    } else image=convert(source,profile,destination,&error);
+    if(image.isNull()) { animationTimer_.stop(); animationPlaying_=false; setStatus(readFailure(error)); return; }
     view_->setDisplayImagePreservingView(image);
-    if(!job_) setStatus(showingSr_?QStringLiteral("SR ×%1（%2回） · %3×%4").arg(scaleText(resultScale_)).arg(resultSteps_.size()).arg(result_.width()).arg(result_.height()):
-                              QStringLiteral("元画像 · ")+view_->getImageCore().getSourceProfile().description);
-    status_->setToolTip(QStringLiteral("入力: %1\n表示: %2\nSR保存: sRGB\n%3")
-        .arg(view_->getImageCore().getSourceProfile().description,description,resultSummary_));
+    if(updateStatus && !job_) {
+        QString summary=showingSr_?QStringLiteral("SR ×%1（%2回） · %3×%4").arg(scaleText(resultScale_)).arg(resultSteps_.size()).arg(result_.width()).arg(result_.height()):
+                              QStringLiteral("元画像 · ")+view_->getImageCore().getSourceProfile().description;
+        if(hasAnimation()) summary+=QStringLiteral(" · GIF %1フレーム · %2").arg(animationFrameCount()).arg(animationPlaying_?QStringLiteral("再生中"):QStringLiteral("一時停止"));
+        setStatus(summary);
+        status_->setToolTip(QStringLiteral("入力: %1\n表示: %2\nSR保存: sRGB\n%3")
+            .arg(view_->getImageCore().getSourceProfile().description,description,resultSummary_));
+    }
 }
 void Controller::start() { startJob(false); }
 void Controller::startAgain() { startJob(true); }
@@ -294,28 +346,79 @@ void Controller::startJob(bool fromResult) {
         setStatus(QStringLiteral("推論プログラム / モデル / ランタイムが見つかりません。SR設定を確認してください。"));
         emit failed(status_->text()); return;
     }
-    if(view_->getCurrentFileDetails().isMovieLoaded && view_->getLoadedMovie().state()==QMovie::Running) window_->pause();
-    view_->getImageCore().freezeAnimationForSr();
-    display();
-    const auto source=fromResult?result_:view_->getImageCore().getSourceImage();
-    const quint64 pixels=quint64(source.width())*source.height();
-    const quint64 requiredBytes=pixels*320 + quint64(result_.sizeInBytes()) +
-        quint64(view_->getImageCore().getSourceImage().sizeInBytes()) + 4*192ULL*1024*1024;
-    if(requiredBytes > quint64(config.memoryMiB)*1024*1024) {
-        setStatus(QStringLiteral("SRメモリー不足 · 見積り %1 MiB / 上限 %2 MiB\nSR設定で上限を変更するか、小さい入力画像を選んでください。")
-            .arg((requiredBytes+1024*1024-1)/(1024*1024)).arg(config.memoryMiB));
-        emit failed(status_->text()); return;
+    const auto path=view_->getCurrentFileDetails().fileInfo.absoluteFilePath();
+    const bool animated=hasAnimation() || (view_->getCurrentFileDetails().isMovieLoaded && QImageReader::imageFormat(path)=="gif");
+    if(!animated) {
+        if(view_->getCurrentFileDetails().isMovieLoaded && view_->getLoadedMovie().state()==QMovie::Running) window_->pause();
+        view_->getImageCore().freezeAnimationForSr(); display();
     }
     auto job=std::make_shared<Job>();
-    job->generation=generation_; job->configuration=config; job->size=source.size();
+    job->generation=generation_; job->configuration=config; job->animated=animated;
+    job->budget=quint64(animated?config.animationMemoryMiB:config.memoryMiB)*1024*1024;
+    job->retainedBytes=retainedAnimationBytes()+quint64(result_.sizeInBytes())+quint64(view_->getImageCore().getSourceImage().sizeInBytes());
     job->cumulativeScale=(fromResult?resultScale_:1.0)*config.scale;
     job->steps=fromResult?resultSteps_:QStringList{}; job->steps<<scaleText(config.scale);
     job->inputDescription=fromResult?QStringLiteral("前回のSR（sRGB）"):QStringLiteral("元画像");
+    job->profile=fromResult?Profile{srgbProfile(),QStringLiteral("sRGB"),{},false}:view_->getImageCore().getSourceProfile();
     if(!job->directory->isValid()) { setStatus(QStringLiteral("一時フォルダーを作成できません")); return; }
-    job_=job; setStatus(QStringLiteral("sRGB入力を準備中…"));
-    progress_->setRange(0,0); progress_->show(); updateActions();
+    if(hasAnimation()) {
+        job->inputs=fromResult?resultAnimation_:originalAnimation_; job->originals=originalAnimation_;
+    } else if(!animated) {
+        auto input=std::make_shared<AnimationFrames>(); input->frames<< (fromResult?result_:view_->getImageCore().getSourceImage());
+        job->inputs=input;
+    }
+    job_=job; progress_->setRange(0,0); progress_->show(); updateActions();
+    if(job->inputs) { prepareFrame(job); return; }
+    setStatus(QStringLiteral("GIF全フレームを読み込み中…"));
     auto* watcher=new QFutureWatcher<QString>(this);
-    const auto profile=fromResult?Profile{srgbProfile(),QStringLiteral("sRGB"),{},false}:view_->getImageCore().getSourceProfile();
+    connect(watcher,&QFutureWatcher<QString>::finished,this,[this,job,watcher] {
+        const auto error=watcher->result(); watcher->deleteLater();
+        if(job!=job_) return;
+        if(job->cancelled || job->generation!=generation_) { finish(job); return; }
+        if(!error.isEmpty()) { finish(job,error); return; }
+        prepareFrame(job);
+    });
+    watcher->setFuture(QtConcurrent::run([path,job] {
+        const QFileInfo before(path); const auto revision=before.lastModified(); const auto bytes=before.size();
+        QImageReader reader(path); reader.setAutoTransform(true);
+        auto input=std::make_shared<AnimationFrames>();
+        const int count=reader.imageCount();
+        while(reader.canRead()) {
+            if(job->cancelled) return QString();
+            const QSize size=reader.size();
+            if(!size.isValid() || size.width()>100000 || size.height()>100000) return QStringLiteral("GIFのフレーム寸法が不正です");
+            const quint64 pixels=quint64(size.width())*size.height();
+            const quint64 predicted=job->retainedBytes+input->bytes()*2+pixels*8+
+                quint64(qRound(size.width()*job->configuration.scale))*qRound(size.height()*job->configuration.scale)*8*qMax(count,int(input->frames.size())+1)+
+                pixels*320+4*192ULL*1024*1024;
+            if(predicted>job->budget) return animationMemoryError(predicted,job->budget);
+            auto image=reader.read();
+            if(image.isNull()) return QStringLiteral("GIFフレームを読み込めません: ")+reader.errorString();
+            if(!input->frames.isEmpty() && image.size()!=input->frames.first().size()) return QStringLiteral("GIFの合成後フレーム寸法が一致しません");
+            input->frames<<image; input->delays<<qMax(1,reader.nextImageDelay());
+        }
+        if(input->frames.isEmpty() || (count>0 && count!=input->frames.size())) return QStringLiteral("GIFを最後のフレームまで読み込めませんでした");
+        input->loops=reader.loopCount();
+        const QFileInfo after(path);
+        if(after.size()!=bytes || after.lastModified()!=revision) return QStringLiteral("GIFが読込中に変更されました。読み直してください");
+        job->inputs=input; job->originals=input;
+        return QString();
+    }));
+}
+void Controller::prepareFrame(const std::shared_ptr<Job>& job) {
+    if(job!=job_) return;
+    if(job->cancelled || job->generation!=generation_) { finish(job); return; }
+    const auto source=job->inputs->frames[job->frame]; job->size=source.size();
+    const quint64 pixels=quint64(source.width())*source.height();
+    const quint64 required=job->animated?animationEstimate(*job->inputs,job->configuration.scale,job->retainedBytes):
+        pixels*320+job->retainedBytes+4*192ULL*1024*1024;
+    if(required>job->budget) { finish(job,job->animated?animationMemoryError(required,job->budget):
+        QStringLiteral("SRメモリー不足 · 見積り %1 MiB / 上限 %2 MiB\nSR設定で上限を変更してください。")
+        .arg((required+1024*1024-1)/(1024*1024)).arg(job->configuration.memoryMiB)); return; }
+    job->id=QUuid::createUuid().toString(QUuid::WithoutBraces);
+    job->sent=false; job->request={}; job->completion={}; job->alpha={};
+    setStatus(job->animated?QStringLiteral("フレーム %1/%2 · sRGB入力を準備中…").arg(job->frame+1).arg(job->inputs->frames.size()):QStringLiteral("sRGB入力を準備中…"));
+    auto* watcher=new QFutureWatcher<QString>(this);
     connect(watcher,&QFutureWatcher<QString>::finished,this,[this,job,watcher] {
         const auto error=watcher->result(); watcher->deleteLater();
         if(job!=job_) return;
@@ -323,13 +426,16 @@ void Controller::startJob(bool fromResult) {
         if(!error.isEmpty()) { finish(job,error); return; }
         launch(job);
     });
-    watcher->setFuture(QtConcurrent::run([source,profile,job] {
+    watcher->setFuture(QtConcurrent::run([source,job] {
+        // The worker refuses to overwrite files. The preceding frame is already
+        // decoded into memory, so keep disk use bounded by reusing its output path.
+        const auto output=job->directory->filePath("output.png");
+        if(QFileInfo::exists(output) && !QFile::remove(output)) return QStringLiteral("前フレームの一時出力を削除できません");
         QString error;
-        auto input=toSrgb(source,profile,&error);
+        auto input=toSrgb(source,job->profile,&error);
         if(input.isNull() || job->cancelled) return error;
         if(transparent(input)) {
             job->alpha=input.convertToFormat(QImage::Format_Alpha8);
-            // Fully transparent pixels have no visible colour; normalise hidden RGB.
             for(int y=0;y<input.height();++y) {
                 uchar* row=input.scanLine(y);
                 for(int x=0;x<input.width();++x) if(row[x*4+3]==0) row[x*4]=row[x*4+1]=row[x*4+2]=0;
@@ -338,10 +444,11 @@ void Controller::startJob(bool fromResult) {
         const auto path=job->directory->filePath("input.png");
         if(!input.convertToFormat(QImage::Format_RGB888).save(path,"PNG")) return QStringLiteral("SR入力PNGを保存できません");
         job->inputHash=QString::fromLatin1(hash(path));
-        job->sourceKey=QString::fromLatin1(QCryptographicHash::hash(job->inputHash.toUtf8()+profile.icc,QCryptographicHash::Sha256).toHex());
+        job->sourceKey=QString::fromLatin1(QCryptographicHash::hash(job->inputHash.toUtf8()+job->profile.icc,QCryptographicHash::Sha256).toHex());
         return QString();
     }));
 }
+
 void Controller::stopWorker() {
     backendWatchdog_.stop(); backendReady_=false; stoppingWorker_=false;
     auto process=worker_; worker_=nullptr;
@@ -424,7 +531,7 @@ void Controller::launch(const std::shared_ptr<Job>& job) {
         {"model_xml",QFileInfo(job->configuration.modelPath).absoluteFilePath()},
         {"input_sha256",job->inputHash},{"width",job->size.width()},{"height",job->size.height()},
         {"halo",job->configuration.halo},{"denoise",job->configuration.denoise},{"devices",job->configuration.devices},
-        {"max_memory_bytes",double(job->configuration.memoryMiB)*1024*1024}};
+        {"max_memory_bytes",double(job->budget)}};
     ensureWorker(); dispatch();
 }
 void Controller::dispatch() {
@@ -434,7 +541,9 @@ void Controller::dispatch() {
     if(!backendReady_) { setStatus(QStringLiteral("デバイスの初期化完了を待っています…")); return; }
     job_->sent=true;
     worker_->write(QJsonDocument(job_->request).toJson(QJsonDocument::Compact)+"\n");
-    watchdog_.start(120000); setStatus(QStringLiteral("準備済みデバイスで処理中…"));
+    watchdog_.start(120000);
+    const auto frame=job_->animated?QStringLiteral("GIF %1/%2フレーム · ").arg(job_->frame+1).arg(job_->inputs->frames.size()):QString();
+    setStatus(frame+QStringLiteral("準備済みデバイスで処理中…"));
 }
 void Controller::acceptResult(const std::shared_ptr<Job>& job) {
     watchdog_.stop();
@@ -446,16 +555,15 @@ void Controller::acceptResult(const std::shared_ptr<Job>& job) {
         if(job!=job_) return;
         if(job->cancelled || job->generation!=generation_) { finish(job); return; }
         if(result.isNull()) { finish(job,job->error); return; }
-        result_=result; showingSr_=true; resultScale_=job->cumulativeScale; resultSteps_=job->steps;
-        QStringList stats;
+        job->outputs->frames<<result;
+        job->wallMs+=job->completion.value("wall_ms").toDouble();
         for(const auto& value:job->completion.value("devices").toArray()) {
-            auto device=value.toObject(); stats<<QStringLiteral("%1: %2タイル").arg(device.value("id").toString()).arg(device.value("tiles").toInt());
+            const auto device=value.toObject(); job->deviceTiles[device.value("id").toString()]+=device.value("tiles").toInt();
         }
-        resultSummary_=QStringLiteral("倍率: %1（元画像比 ×%2） / 入力: %3\n").arg(job->steps.join(" × "),scaleText(job->cumulativeScale),job->inputDescription)
-            +stats.join(" / ")+QStringLiteral("\nノイズ低減: %1 / 処理: %2秒（初期化除く）")
-            .arg(job->configuration.denoise).arg(job->completion.value("wall_ms").toDouble()/1000,0,'f',2);
-        if(!job->warnings.isEmpty()) resultSummary_+="\n"+job->warnings.join("\n");
-        finish(job); display(); emit resultReady();
+        if(++job->frame<job->inputs->frames.size()) {
+            QTimer::singleShot(0,this,[this,job]{prepareFrame(job);}); return;
+        }
+        publishResult(job);
     });
     watcher->setFuture(QtConcurrent::run([job] {
         auto fail=[&](const QString& error) { job->error=error; return QImage(); };
@@ -478,6 +586,70 @@ void Controller::acceptResult(const std::shared_ptr<Job>& job) {
         if(image.isNull()) return fail(QStringLiteral("指定倍率の画像用メモリーを確保できません"));
         image.setColorSpace(QColorSpace::SRgb); return image;
     }));
+}
+void Controller::publishResult(const std::shared_ptr<Job>& job) {
+    result_=job->outputs->frames.first(); showingSr_=true; resultScale_=job->cumulativeScale; resultSteps_=job->steps;
+    QStringList stats;
+    for(auto i=job->deviceTiles.cbegin();i!=job->deviceTiles.cend();++i) stats<<QStringLiteral("%1: %2タイル").arg(i.key()).arg(i.value());
+    resultSummary_=QStringLiteral("倍率: %1（元画像比 ×%2） / 入力: %3\n").arg(job->steps.join(" × "),scaleText(job->cumulativeScale),job->inputDescription)
+        +stats.join(" / ")+QStringLiteral("\nノイズ低減: %1 / 処理: %2秒（初期化除く）").arg(job->configuration.denoise).arg(job->wallMs/1000,0,'f',2);
+    if(job->animated) {
+        animationTimer_.stop();
+        if(!hasAnimation()) animationSpeed_=view_->getLoadedMovie().speed();
+        view_->getImageCore().freezeAnimationForSr();
+        job->outputs->delays=job->inputs->delays; job->outputs->loops=job->inputs->loops;
+        originalAnimation_=job->originals; resultAnimation_=job->outputs;
+        animationIndex_=0; animationLoopsDone_=0; animationPlaying_=true; animationEnded_=false;
+        animationDisplayProfile_.clear(); originalDisplayFrames_.clear(); resultDisplayFrames_.clear();
+        resultSummary_+=QStringLiteral("\nGIF: %1フレーム / 再生: %2 / PNG・JPEG保存は現在のSRフレーム").arg(animationFrameCount())
+            .arg(animationLoopCount()<0?QStringLiteral("無限ループ"):QStringLiteral("%1回").arg(animationLoopCount()+1));
+    }
+    if(!job->warnings.isEmpty()) resultSummary_+="\n"+job->warnings.join("\n");
+    finish(job); display(); if(hasAnimation()) scheduleAnimation(); emit resultReady();
+}
+int Controller::animationFrameCount() const { return hasAnimation()?resultAnimation_->frames.size():0; }
+int Controller::animationDelay(int frame) const { return hasAnimation()?resultAnimation_->delays.value(frame):0; }
+int Controller::animationLoopCount() const { return hasAnimation()?resultAnimation_->loops:0; }
+quint64 Controller::retainedAnimationBytes() const {
+    quint64 bytes=0;
+    if(originalAnimation_) bytes+=originalAnimation_->bytes();
+    if(resultAnimation_) bytes+=resultAnimation_->bytes();
+    for(const auto& frame:originalDisplayFrames_) bytes+=quint64(frame.sizeInBytes());
+    for(const auto& frame:resultDisplayFrames_) bytes+=quint64(frame.sizeInBytes());
+    return bytes;
+}
+void Controller::scheduleAnimation(int renderMs) {
+    animationTimer_.stop();
+    if(hasAnimation() && animationPlaying_ && animationSpeed_>0)
+        animationTimer_.start(qMax(1,int(qint64(animationDelay(animationIndex_))*100/animationSpeed_)-renderMs));
+}
+void Controller::advanceAnimation() {
+    if(!hasAnimation() || !animationPlaying_) return;
+    if(animationIndex_+1==animationFrameCount()) {
+        if(animationLoopCount()>=0 && animationLoopsDone_>=animationLoopCount()) {
+            animationPlaying_=false; animationEnded_=true; display(); updateActions(); return;
+        }
+        if(animationLoopCount()>=0) ++animationLoopsDone_;
+    }
+    animationIndex_=(animationIndex_+1)%animationFrameCount();
+    QElapsedTimer rendering; rendering.start(); display(false);
+    emit animationFrameChanged(animationIndex_); scheduleAnimation(int(rendering.elapsed()));
+}
+void Controller::setAnimationPaused(bool paused) {
+    if(!hasAnimation()) return;
+    if(!paused && animationEnded_) {
+        animationIndex_=0; animationLoopsDone_=0; animationEnded_=false;
+    }
+    animationPlaying_=!paused; display(); scheduleAnimation(); updateActions();
+}
+void Controller::stepAnimation() {
+    if(!hasAnimation()) return;
+    animationPlaying_=false; animationTimer_.stop();
+    animationIndex_=(animationIndex_+1)%animationFrameCount(); animationLoopsDone_=0; animationEnded_=false;
+    display(); emit animationFrameChanged(animationIndex_); updateActions();
+}
+void Controller::setAnimationSpeed(int percent) {
+    animationSpeed_=qBound(0,percent,1000); scheduleAnimation();
 }
 void Controller::readEvents() {
     if(!worker_) return;
@@ -529,8 +701,13 @@ void Controller::readEvents() {
             else if(event=="progress") {
                 const int total=message.value("total").toInt(),done=message.value("completed").toInt();
                 if(total<1 || done<0 || done>total) { protocolFailure(); return; }
-                progress_->setRange(0,total); progress_->setValue(done);
-                setStatus(QStringLiteral("処理中 %1/%2 · %3").arg(done).arg(total).arg(message.value("device").toString()));
+                if(job->animated) {
+                    progress_->setRange(0,1000); progress_->setValue(int(1000*(job->frame+double(done)/total)/job->inputs->frames.size()));
+                    setStatus(QStringLiteral("GIF %1/%2フレーム · タイル %3/%4 · %5").arg(job->frame+1).arg(job->inputs->frames.size()).arg(done).arg(total).arg(message.value("device").toString()));
+                } else {
+                    progress_->setRange(0,total); progress_->setValue(done);
+                    setStatus(QStringLiteral("処理中 %1/%2 · %3").arg(done).arg(total).arg(message.value("device").toString()));
+                }
             }
             watchdog_.start(120000);
         }
@@ -567,12 +744,20 @@ bool Controller::saveResult(const QString& path,const QByteArray& format,QString
     }
     return writeImage(view_->getImageCore().matchCurrentRotation(result_),path,format,Qt::white,error);
 }
-void Controller::saveAs() {
+void Controller::saveAs() { saveFrameAs(false); }
+void Controller::saveDisplayedFrameAs() { saveFrameAs(hasAnimation() && !showingSr_); }
+void Controller::saveFrameAs(bool originalFrame) {
     if(result_.isNull() || saving_) return;
     const auto original=view_->getCurrentFileDetails().fileInfo;
+    if(hasAnimation()) setAnimationPaused(true);
+    QString error;
+    const auto frame=originalFrame?toSrgb(originalAnimation_->frames[animationIndex_],view_->getImageCore().getSourceProfile(),&error):result_;
+    if(frame.isNull()) { setStatus(error); return; }
+    const auto image=view_->getImageCore().matchCurrentRotation(frame);
+    const auto suffix=originalFrame?QStringLiteral("_original"):"_sr"+scaleText(resultScale_).replace('.','p')+"x_"+QString::number(resultSteps_.size())+"pass";
     QString selected;
-    QString path=QFileDialog::getSaveFileName(window_,QStringLiteral("SR画像を保存（sRGB ICC付き）"),
-        original.absolutePath()+"/"+original.completeBaseName()+"_sr"+scaleText(resultScale_).replace('.','p')+"x_"+QString::number(resultSteps_.size())+"pass.png",QStringLiteral("PNG (*.png);;JPEG (*.jpg *.jpeg)"),&selected);
+    QString path=QFileDialog::getSaveFileName(window_,originalFrame?QStringLiteral("現在の元画像フレームを保存（sRGB ICC付き）"):hasAnimation()?QStringLiteral("現在のSRフレームを保存（sRGB ICC付き）"):QStringLiteral("SR画像を保存（sRGB ICC付き）"),
+        original.absolutePath()+"/"+original.completeBaseName()+suffix+(hasAnimation()?QStringLiteral("_frame%1").arg(animationIndex_+1,5,10,QLatin1Char('0')):QString())+".png",QStringLiteral("PNG (*.png);;JPEG (*.jpg *.jpeg)"),&selected);
     if(path.isEmpty()) return;
     QByteArray format=selected.startsWith("JPEG")?QByteArray("jpeg"):QByteArray("png");
     if(QFileInfo(path).suffix().isEmpty()) path+=format=="jpeg"?".jpg":".png";
@@ -581,14 +766,13 @@ void Controller::saveAs() {
         setStatus(QStringLiteral("元画像への上書きはできません")); return;
     }
     QColor background=Qt::white;
-    if(format=="jpeg" && transparent(result_)) {
+    if(format=="jpeg" && transparent(image)) {
         background=QColorDialog::getColor(Qt::white,window_,QStringLiteral("JPEGの透明部分の背景色"));
         if(!background.isValid()) return;
     }
-    const auto image=view_->getImageCore().matchCurrentRotation(result_);
     const auto generation=generation_;
     auto* watcher=new QFutureWatcher<QString>(this);
-    saving_=true; updateActions(); setStatus(QStringLiteral("SR画像を保存中…"));
+    saving_=true; updateActions(); setStatus(QStringLiteral("画像を保存中…"));
     connect(watcher,&QFutureWatcher<QString>::finished,this,[this,watcher,generation,path] {
         const auto error=watcher->result(); watcher->deleteLater(); saving_=false; updateActions();
         if(generation==generation_) setStatus(error.isEmpty()?QStringLiteral("保存しました: ")+QFileInfo(path).fileName():error);
@@ -646,6 +830,8 @@ void Controller::showSettings() {
     form->addRow(QStringLiteral("表示プロファイル"),displayMode);
     auto* icc=field(QStringLiteral("手動ICCファイル"),configuration_.displayProfile=="sRGB"?QString():configuration_.displayProfile,false);
     auto* memory=new QSpinBox(&dialog); memory->setRange(1024,16384); memory->setSuffix(" MiB"); memory->setValue(configuration_.memoryMiB); form->addRow(QStringLiteral("SRメモリー上限"),memory);
+    auto* animationMemory=new QSpinBox(&dialog); animationMemory->setRange(1024,65536); animationMemory->setSuffix(" MiB");
+    animationMemory->setValue(configuration_.animationMemoryMiB); form->addRow(QStringLiteral("アニメーション用メモリー上限"),animationMemory);
     auto* halo=new QSpinBox(&dialog); halo->setRange(0,64); halo->setValue(configuration_.halo); form->addRow(QStringLiteral("タイル境界の余白（画素）"),halo);
     auto* noise=new QSpinBox(&dialog); noise->setObjectName("srDenoise");
     noise->setRange(0,15); noise->setSpecialValueText(QStringLiteral("なし")); noise->setValue(configuration_.denoise);
@@ -660,6 +846,6 @@ void Controller::showSettings() {
     conf.runtimeRoot=runtime->text(); conf.workerPath=worker->text(); conf.modelPath=model->text();
     conf.devices=(devices->currentIndex()>=0 && devices->currentText()==devices->itemText(devices->currentIndex()))?devices->currentData().toString():devices->currentText().trimmed();
     conf.displayProfile=displayMode->currentIndex()==0?QString():displayMode->currentIndex()==1?QStringLiteral("sRGB"):icc->text();
-    conf.memoryMiB=memory->value(); conf.halo=halo->value(); conf.denoise=noise->value(); setConfiguration(conf);
+    conf.memoryMiB=memory->value(); conf.animationMemoryMiB=animationMemory->value(); conf.halo=halo->value(); conf.denoise=noise->value(); setConfiguration(conf);
 }
 }

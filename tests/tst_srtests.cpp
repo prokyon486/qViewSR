@@ -35,6 +35,23 @@ class SrTests : public QObject {
         auto* button=qobject_cast<QToolButton*>(toolbar->widgetForAction(action));
         QVERIFY(button); QTest::mouseClick(button,Qt::LeftButton);
     }
+    // Locally generated GIF: moving opaque blocks on transparency; disposal=2.
+    QString gifFixture(bool looping=true) {
+        auto data=QByteArray::fromBase64("R0lGODlhIAAYAIEAAAAAAP8AAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQJCAAAACwAAAAAIAAYAAAITgABCBxIsKDBgwgTKlzIsKHDhwgDSJwoEWJEihMtHsSYUWNBjhU9EgQZQORIkCYHkkwpcCVLlylhmpQpkqZHmxpxWtQJkSfLn0CDCtUYEAAh+QQJEAAAACwAAAAAIAAYAIEAAAAA/wAAAAAAAAAITwABCBxIsKDBgwgTKlzIsKHDhxAFBphIcWLEgxUrXjSYkeLGgh0tfhwYMsBIkiFPSkypsqRKAC5bsjwZk+bMkTVx3vyYk+fOl0CDCh16MCAAIfkECRgAAAAsAAAAACAAGACBAAAAAAD/AAAAAAAACE4AAQgcSLCgwYMIEypcyLChw4cQGQaYSHFixIMVK140mJHixoIdLX4cGDLASJIhTwosqRIAS5UvT8YcOfNjzY03L+aMuBNiz5ZAgwodGRAAOw==");
+        if(!looping) data.remove(data.indexOf("NETSCAPE2.0")-3,19);
+        const auto path=files.filePath(looping?"animated.gif":"once.gif");
+        QFile file(path);
+        if(!file.open(QIODevice::WriteOnly) || file.write(data)!=data.size()) return {};
+        return path;
+    }
+    void loadAnimation(const QString& path, const QString& mode="animation") {
+        QFile::remove(files.filePath("model.frames.jsonl"));
+        auto animationConfig=config; animationConfig.devices=mode; animationConfig.scale=2; animationConfig.denoise=3;
+        controller->setConfiguration(animationConfig);
+        window->openFile(path);
+        QTRY_VERIFY_WITH_TIMEOUT(view->getCurrentFileDetails().isMovieLoaded,5000);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->backendReady(),5000);
+    }
 private slots:
     void initTestCase() {
         QVERIFY(files.isValid());
@@ -361,23 +378,156 @@ private slots:
         click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,12000);
         QCOMPARE(controller->resultImage().size(),size*4);
     }
-    void animatedFrameAndCmyk() {
-        const auto animated=files.filePath("animated.gif");
-        QFile gif(animated); QVERIFY(gif.open(QIODevice::WriteOnly));
-        gif.write(QByteArray::fromBase64("R0lGODlhIAAYAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAFAAAACwAAAAAIAAYAAAILwABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJjQEBACH5BAEUAAEALAAAAAAgABgAgQAA/wAAAAAAAAAAAAgvAAEIHEiwoMGDCBMqXMiwocOHECNKnEixosWLGDNq3Mixo8ePIEOKHEmypMmNAQEAOw==")); gif.close();
-        window->openFile(animated);
-        QTRY_VERIFY_WITH_TIMEOUT(view->getCurrentFileDetails().isMovieLoaded,5000);
-        QTRY_COMPARE_WITH_TIMEOUT(view->getLoadedMovie().currentFrameNumber(),1,5000);
-        window->pause();
+    void animationFramesPlaybackAndRepeat() {
+        const auto path=gifFixture(); QVERIFY(!path.isEmpty()); loadAnimation(path);
+        const auto pid=controller->backendPid();
+        QSignalSpy initialized(controller,&Sr::Controller::backendInitialized);
+        QSignalSpy ready(controller,&Sr::Controller::resultReady),changed(controller,&Sr::Controller::animationFrameChanged);
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        QVERIFY(controller->hasAnimation()); QCOMPARE(controller->animationFrameCount(),3);
+        QCOMPARE(controller->animationLoopCount(),-1);
+        QCOMPARE(controller->animationDelay(0),80); QCOMPARE(controller->animationDelay(1),160); QCOMPARE(controller->animationDelay(2),240);
+        QTRY_VERIFY_WITH_TIMEOUT(changed.count()>=3,2000);
+        QVERIFY(controller->animationPlaying()); window->pause(); QVERIFY(!controller->animationPlaying());
+        const int paused=controller->animationFrameIndex(); QTest::qWait(300); QCOMPARE(controller->animationFrameIndex(),paused);
+        while(controller->animationFrameIndex()!=0) window->nextFrame();
+        view->originalSize(); view->zoom(1.25);
+        const qreal shownWidth=view->transform().m11()*view->getLoadedPixmap().width();
+        QImageReader reader(path);
+        QVector<QImage> originals,firstResults;
+        for(int i=0;i<3;++i) {
+            originals<<reader.read();
+            QCOMPARE(controller->animationFrameIndex(),i);
+            QCOMPARE(controller->resultImage().size(),QSize(64,48)); firstResults<<controller->resultImage();
+            const QImage input(files.filePath(QStringLiteral("model.frame-%1.png").arg(i+1)));
+            QVERIFY(!input.isNull()); QCOMPARE(input.size(),QSize(32,24));
+            QCOMPARE(input.pixelColor(i*10+3,10),originals.last().pixelColor(i*10+3,10));
+            QCOMPARE(input.pixelColor(31,0),QColor(Qt::black)); // Hidden RGB excluded from SR.
+            QCOMPARE(controller->resultImage().pixelColor(i*20+6,20).alpha(),255);
+            QCOMPARE(controller->resultImage().pixelColor(62,0).alpha(),0);
+            click("srToggle"); QCOMPARE(view->getLoadedPixmap().size(),QSize(32,24));
+            const auto displayed=view->getLoadedPixmap().toImage();
+            QCOMPARE(displayed.pixelColor(i*10+3,10),originals.last().pixelColor(i*10+3,10));
+            QCOMPARE(displayed.pixelColor(31,0).alpha(),0);
+            if(i>0) QCOMPARE(displayed.pixelColor((i-1)*10+3,10).alpha(),0); // Disposal removes the preceding block.
+            click("srToggle");
+            QVERIFY(qAbs(view->transform().m11()*view->getLoadedPixmap().width()-shownWidth)<1);
+            window->nextFrame();
+        }
+        QVERIFY(firstResults[0]!=firstResults[1]); QVERIFY(firstResults[1]!=firstResults[2]);
+        window->increaseSpeed(); QCOMPARE(controller->animationSpeed(),125);
+        window->decreaseSpeed(); QCOMPARE(controller->animationSpeed(),100);
+        window->decreaseSpeed(); window->resetSpeed(); QCOMPARE(controller->animationSpeed(),100);
+        for(auto* action:window->findChildren<QAction*>()) {
+            const auto data=action->data().toStringList();
+            if(!data.isEmpty() && data.last()=="gifdisable") QVERIFY(action->isEnabled());
+        }
+        click("srRepeat"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),2,8000); controller->setAnimationPaused(true);
+        QCOMPARE(controller->animationFrameCount(),3); QCOMPARE(controller->resultImage().size(),QSize(128,96));
+        QCOMPARE(controller->resultScale(),4.0); QCOMPARE(controller->resultPasses(),2);
+        QCOMPARE(controller->backendPid(),pid); QCOMPARE(initialized.count(),0);
+        while(controller->animationFrameIndex()!=0) window->nextFrame();
+        for(int i=0;i<3;++i) {
+            const QImage input(files.filePath(QStringLiteral("model.frame-%1.png").arg(i+4)));
+            QCOMPARE(input.size(),QSize(64,48));
+            QCOMPARE(input.pixelColor(i*20+6,20),QColor(firstResults[i].pixelColor(i*20+6,20).rgb()));
+            click("srToggle");
+            QCOMPARE(view->getLoadedPixmap().size(),originals[i].size());
+            QCOMPARE(view->getLoadedPixmap().toImage().pixelColor(i*10+3,10),originals[i].pixelColor(i*10+3,10));
+            click("srToggle"); window->nextFrame();
+        }
+        view->rotateImage(90); window->nextFrame();
+        QCOMPARE(view->getLoadedPixmap().size(),QSize(96,128));
+        QString error; QVERIFY2(controller->saveResult(files.filePath("gif-frame.png"),"png",&error),qPrintable(error));
+        QCOMPARE(QImage(files.filePath("gif-frame.png")).size(),QSize(96,128));
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),3,8000); controller->setAnimationPaused(true);
+        QCOMPARE(controller->resultScale(),2.0); QCOMPARE(controller->resultPasses(),1);
+        QCOMPARE(controller->resultImage().size(),QSize(64,48));
+        // Navigation releases both frame sequences and stops the playback timer.
+        window->openFile(sourcePath);
+        QTRY_VERIFY(!controller->hasAnimation()); const int events=changed.count();
+        QTest::qWait(300); QCOMPARE(changed.count(),events); QVERIFY(!controller->hasResult());
+    }
+    void animationFinitePlayback_data() {
+        QTest::addColumn<int>("repeats");
+        QTest::newRow("once")<<0; QTest::newRow("repeat-once")<<1;
+    }
+    void animationFinitePlayback() {
+        QFETCH(int,repeats);
+        const auto path=gifFixture(repeats>0);
+        if(repeats>0) {
+            QFile file(path); QVERIFY(file.open(QIODevice::ReadWrite)); auto bytes=file.readAll();
+            bytes[bytes.indexOf("NETSCAPE2.0")+13]=char(repeats);
+            QVERIFY(file.seek(0)); QCOMPARE(file.write(bytes),bytes.size()); file.close();
+        }
+        loadAnimation(path);
+        QSignalSpy ready(controller,&Sr::Controller::resultReady),changed(controller,&Sr::Controller::animationFrameChanged);
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        QCOMPARE(controller->animationLoopCount(),repeats);
+        QTRY_VERIFY_WITH_TIMEOUT(!controller->animationPlaying(),2000);
+        QCOMPARE(controller->animationFrameIndex(),2); QCOMPARE(changed.count(),3*(repeats+1)-1);
+        window->pause(); QCOMPARE(controller->animationFrameIndex(),0); QVERIFY(controller->animationPlaying());
+        window->pause(); window->nextFrame(); window->nextFrame();
+        QCOMPARE(controller->animationFrameIndex(),2);
+        window->pause(); QCOMPARE(controller->animationFrameIndex(),2); // A manual pause on the last frame must not rewind.
+        QTRY_VERIFY_WITH_TIMEOUT(!controller->animationPlaying(),2000);
+    }
+    void animationFailure_data() {
+        QTest::addColumn<bool>("existing");
+        QTest::newRow("initial")<<false; QTest::newRow("repeat")<<true;
+    }
+    void animationFailure() {
+        QFETCH(bool,existing);
+        loadAnimation(gifFixture(),existing?"animation":"animation-bad-second");
+        QSignalSpy ready(controller,&Sr::Controller::resultReady),failed(controller,&Sr::Controller::failed);
+        QImage previous;
+        if(existing) {
+            click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+            controller->setAnimationPaused(true); previous=controller->resultImage();
+            auto bad=controller->configuration(); bad.devices="animation-bad-second"; controller->setConfiguration(bad);
+        }
+        if(existing) click("srRepeat"); else click("srRun");
+        QTRY_VERIFY_WITH_TIMEOUT(!controller->isBusy(),8000);
+        QCOMPARE(failed.count(),1); QCOMPARE(ready.count(),existing?1:0);
+        QCOMPARE(controller->hasAnimation(),existing);
+        if(existing) { QCOMPARE(controller->resultImage(),previous); QCOMPARE(controller->resultPasses(),1); }
+        else { QVERIFY(!controller->hasResult()); QVERIFY(view->getCurrentFileDetails().isMovieLoaded); }
+    }
+    void animationCancelAndNavigate_data() {
+        QTest::addColumn<bool>("navigate");
+        QTest::newRow("cancel")<<false; QTest::newRow("navigate")<<true;
+    }
+    void animationCancelAndNavigate() {
+        QFETCH(bool,navigate); loadAnimation(gifFixture());
         QSignalSpy ready(controller,&Sr::Controller::resultReady);
         click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
-        QCOMPARE(controller->resultImage().size(),QSize(128,96));
-        view->zoom(1.25); QTest::qWait(100);
-        QCOMPARE(view->getLoadedPixmap().size(),QSize(128,96));
-        click("srToggle");
-        QCOMPARE(view->getImageCore().getSourceImage().pixelColor(5,5),QColor(Qt::blue));
-        window->pause();
-        QVERIFY(view->getCurrentFileDetails().isMovieLoaded); QVERIFY(!controller->hasResult());
+        controller->setAnimationPaused(true); const auto previous=controller->resultImage();
+        auto delayed=controller->configuration(); delayed.devices="animation-delay"; controller->setConfiguration(delayed);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->backendReady(),5000);
+        const auto pid=controller->backendPid(); QFile::remove(files.filePath("model.frames.jsonl"));
+        click("srRepeat");
+        auto inputs=[this] { QFile log(files.filePath("model.frames.jsonl")); if(!log.open(QIODevice::ReadOnly)) return 0; return int(log.readAll().count('\n')); };
+        QTRY_COMPARE_WITH_TIMEOUT(inputs(),2,5000); // First frame finished; second is still running.
+        QVERIFY(controller->isBusy()); QCOMPARE(controller->resultImage(),previous); QCOMPARE(ready.count(),1);
+        if(navigate) window->openFile(sourcePath); else click("srCancel");
+        QTRY_VERIFY_WITH_TIMEOUT(!controller->isBusy(),5000);
+        QCOMPARE(ready.count(),1); QCOMPARE(controller->backendPid(),pid);
+        if(navigate) { QVERIFY(!controller->hasAnimation()); QVERIFY(!controller->hasResult()); }
+        else { QCOMPARE(controller->resultImage(),previous); QCOMPARE(controller->animationFrameCount(),3); }
+    }
+    void animationMemoryBudget() {
+        auto path=gifFixture(); QFile file(path); QVERIFY(file.open(QIODevice::ReadWrite));
+        // Large logical screen with small delta frames: reject based on composed frames.
+        QVERIFY(file.seek(6)); QCOMPARE(file.write(QByteArray::fromHex("00080008")),qint64(4)); file.close();
+        loadAnimation(path);
+        auto limited=controller->configuration(); limited.animationMemoryMiB=1024; controller->setConfiguration(limited);
+        QSignalSpy failed(controller,&Sr::Controller::failed);
+        click("srRun"); QTRY_VERIFY_WITH_TIMEOUT(!controller->isBusy(),5000);
+        QCOMPARE(failed.count(),1); QVERIFY(controller->statusText().contains(QStringLiteral("GIFメモリー不足")));
+        QVERIFY(!controller->hasResult()); QVERIFY(view->getCurrentFileDetails().isMovieLoaded);
+    }
+    void cmykDecodedRgb() {
+        QSignalSpy ready(controller,&Sr::Controller::resultReady);
         const auto cmyk=files.filePath("cmyk.jpg");
         QFile jpeg(cmyk); QVERIFY(jpeg.open(QIODevice::WriteOnly));
         jpeg.write(QByteArray::fromBase64("/9j/7gAOQWRvYmUAZAAAAAAA/9sAQwAIBgYHBgUIBwcHCQkICgwUDQwLCwwZEhMPFB0aHx4dGhwcICQuJyAiLCMcHCg3KSwwMTQ0NB8nOT04MjwuMzQy/8AAFAgAGAAgBEMRAE0RAFkRAEsRAP/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+v/aAA4EQwBNAFkASwAAPwD2uuvr3+vdaKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK//Z")); jpeg.close();
@@ -385,8 +535,60 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(view->getCurrentFileDetails().fileInfo.absoluteFilePath(),QFileInfo(cmyk).absoluteFilePath(),5000);
         QTRY_VERIFY_WITH_TIMEOUT(window->findChild<QAction*>("srRun")->isEnabled(),5000);
         QVERIFY(view->getImageCore().getSourceProfile().assumedSrgb);
-        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),2,8000);
+        click("srRun"); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
         QCOMPARE(controller->resultImage().size(),QSize(128,96));
+    }
+    void realAnimationGui() {
+        if(!qEnvironmentVariableIsSet("QVIEWSR_REAL_WORKER")) QSKIP("Opt-in real-device GIF test.");
+        auto real=config; real.workerPath=qEnvironmentVariable("QVIEWSR_REAL_WORKER");
+        real.runtimeRoot=qEnvironmentVariable("QVIEWSR_REAL_RUNTIME"); real.modelPath=qEnvironmentVariable("QVIEWSR_REAL_MODEL");
+        real.devices="all"; real.scale=2.0;
+        QSignalSpy initialized(controller,&Sr::Controller::backendInitialized),failure(controller,&Sr::Controller::failed);
+        controller->setConfiguration(real);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->backendReady() || !failure.isEmpty(),120000);
+        QVERIFY2(failure.isEmpty(),qPrintable(controller->statusText()));
+        const auto pid=controller->backendPid(); QCOMPARE(initialized.count(),1);
+        const auto path=qEnvironmentVariable("QVIEWSR_REAL_IMAGE");
+        QImageReader reader(path); QVector<QImage> originals; QVector<int> delays;
+        while(reader.canRead()) { originals<<reader.read(); delays<<reader.nextImageDelay(); }
+        QVERIFY(originals.size()>1); const int loops=reader.loopCount();
+        window->openFile(path);
+        QTRY_VERIFY_WITH_TIMEOUT(view->getCurrentFileDetails().isMovieLoaded,5000);
+        QSignalSpy ready(controller,&Sr::Controller::resultReady),frames(controller,&Sr::Controller::animationFrameChanged);
+        click("srRun"); QTRY_VERIFY_WITH_TIMEOUT(ready.count()==1 || !failure.isEmpty(),120000);
+        QVERIFY2(failure.isEmpty(),qPrintable(controller->statusText()));
+        QCOMPARE(controller->animationFrameCount(),originals.size()); QCOMPARE(controller->animationLoopCount(),loops);
+        const auto firstSummary=window->findChild<QLabel*>("srStatus")->toolTip();
+        QCOMPARE(firstSummary.count(QStringLiteral("タイル")),4);
+        QTRY_VERIFY_WITH_TIMEOUT(frames.count()>=3,3000);
+        controller->setAnimationPaused(true);
+        while(controller->animationFrameIndex()!=0) window->nextFrame();
+        const auto artifacts=qEnvironmentVariable("QVIEWSR_GUI_ARTIFACTS");
+        if(!artifacts.isEmpty()) QDir().mkpath(artifacts);
+        QString error; window->resize(1400,850);
+        for(int i=0;i<originals.size();++i) {
+            QCOMPARE(controller->animationFrameIndex(),i);
+            QCOMPARE(controller->animationDelay(i),delays[i]);
+            QCOMPARE(controller->resultImage().size(),originals[i].size()*2);
+            if(!artifacts.isEmpty()) {
+                QVERIFY2(controller->saveResult(artifacts+QStringLiteral("/sr-frame-%1.png").arg(i),"png",&error),qPrintable(error));
+                QTest::qWait(100); QVERIFY(window->grab().save(artifacts+QStringLiteral("/gui-frame-%1.png").arg(i)));
+            }
+            click("srToggle"); QCOMPARE(view->getLoadedPixmap().size(),originals[i].size());
+            const auto displayed=view->getLoadedPixmap().toImage();
+            QCOMPARE(displayed.pixelColor(30,30),originals[i].pixelColor(30,30));
+            click("srToggle"); window->nextFrame();
+        }
+        click("srRepeat"); QTRY_VERIFY_WITH_TIMEOUT(ready.count()==2 || !failure.isEmpty(),120000);
+        QVERIFY2(failure.isEmpty(),qPrintable(controller->statusText())); controller->setAnimationPaused(true);
+        QCOMPARE(controller->resultImage().size(),originals[0].size()*4);
+        QCOMPARE(controller->animationFrameCount(),originals.size()); QCOMPARE(controller->resultPasses(),2);
+        QCOMPARE(controller->backendPid(),pid); QCOMPARE(initialized.count(),1);
+        if(!artifacts.isEmpty()) {
+            QFile summary(artifacts+"/animation-summary.txt"); QVERIFY(summary.open(QIODevice::WriteOnly));
+            summary.write(QStringLiteral("初期化: %1回 / worker PID: %2 / 再生通知: %3\n全フレーム2倍:\n%4\n全フレーム2倍→2倍:\n%5\n")
+                .arg(initialized.count()).arg(pid).arg(frames.count()).arg(firstSummary,window->findChild<QLabel*>("srStatus")->toolTip()).toUtf8());
+        }
     }
     void realScaleAndRepeatGui() {
         if(!qEnvironmentVariableIsSet("QVIEWSR_REAL_WORKER")) QSKIP("Opt-in real-device test.");

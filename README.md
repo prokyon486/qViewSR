@@ -1,4 +1,4 @@
-> **qViewSR fork:** [日本語の起動・操作・ビルド手順](README-SR.ja.md) — NCS/NCS2による4倍超解像とICC対応を実装したGUI検証版です。
+> **qViewSR fork:** [日本語の起動・操作・ビルド手順](README-SR.ja.md) — NCS/NCS2による倍率指定・GIF全フレーム超解像とICC対応を実装したGUI検証版です。
 
 <h1 align=center>qView</h1>
 
