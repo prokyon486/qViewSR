@@ -4,6 +4,8 @@
 #include "qvcocoafunctions.h"
 #include "qvlinuxx11functions.h"
 #include <cstring>
+#include <algorithm>
+#include <QHash>
 #include <random>
 #include <QMessageBox>
 #include <QDir>
@@ -361,95 +363,75 @@ void QVImageCore::updateFolderInfo(QString dirPath)
             return;
     }
 
-    currentFileDetails.folderFileInfoList = getCompatibleFiles(dirPath);
+    auto files = getCompatibleFiles(dirPath);
+    const DirInfo dirInfo = { QDir(dirPath).absolutePath(), qvGetSettingInt(SortMode),
+                             qvGetSettingBool(SortDescending) };
 
-    DirInfo dirInfo = { dirPath, currentFileDetails.folderFileInfoList.count(),
-                        qvGetSettingInt(SortMode), qvGetSettingBool(SortDescending) };
-    // If the current folder changed since the last image, assign a new seed for random sorting
-    const bool shouldSort = lastDirInfo != dirInfo;
-    lastDirInfo = dirInfo;
-
-    const auto sortFn = [&]() {
-        // Sorting
-        switch (dirInfo.sortMode) {
-        case 0: {
-            // Natural sorting
-            QCollator collator;
-            collator.setNumericMode(true);
-            std::sort(currentFileDetails.folderFileInfoList.begin(),
-                      currentFileDetails.folderFileInfoList.end(),
-                      [&](const CompatibleFile &file1, const CompatibleFile &file2) {
-                          if (dirInfo.sortDescending)
-                              return collator.compare(file1.fileName, file2.fileName) > 0;
-                          else
-                              return collator.compare(file1.fileName, file2.fileName) < 0;
-                      });
-            break;
+    if (dirInfo.sortMode == 5) {
+        // Keep the existing shuffle when refreshing the same folder. Remove
+        // vanished files and append newly discovered files in random order.
+        // File count alone cannot detect a rename or a same-count replacement.
+        QList<CompatibleFile> ordered;
+        if (!(lastDirInfo != dirInfo)) {
+            QHash<QString, CompatibleFile> remaining;
+            remaining.reserve(files.size());
+            for (const auto &file : files)
+                remaining.insert(file.absoluteFilePath, file);
+            for (const auto &previous : currentFileDetails.folderFileInfoList) {
+                auto found = remaining.find(previous.absoluteFilePath);
+                if (found != remaining.end()) {
+                    ordered.append(found.value());
+                    remaining.erase(found);
+                }
+            }
+            files = remaining.values();
         }
-        case 1:
-            // Date modified
-            std::sort(currentFileDetails.folderFileInfoList.begin(),
-                      currentFileDetails.folderFileInfoList.end(),
-                      [&](const CompatibleFile &file1, const CompatibleFile &file2) {
-                          if (dirInfo.sortDescending)
-                              return file1.lastModified < file2.lastModified;
-                          else
-                              return file1.lastModified > file2.lastModified;
-                      });
-            break;
-        case 2:
-            // Date created
-            std::sort(currentFileDetails.folderFileInfoList.begin(),
-                      currentFileDetails.folderFileInfoList.end(),
-                      [&](const CompatibleFile &file1, const CompatibleFile &file2) {
-                          if (dirInfo.sortDescending)
-                              return file1.lastCreated < file2.lastCreated;
-                          else
-                              return file1.lastCreated > file2.lastCreated;
-                      });
-            break;
-        case 3:
-            // Size
-            std::sort(currentFileDetails.folderFileInfoList.begin(),
-                      currentFileDetails.folderFileInfoList.end(),
-                      [&](const CompatibleFile &file1, const CompatibleFile &file2) {
-                          if (dirInfo.sortDescending)
-                              return file1.size < file2.size;
-                          else
-                              return file1.size > file2.size;
-                      });
-            break;
-        case 4: {
-            // Type
-            QCollator collator;
-            std::sort(currentFileDetails.folderFileInfoList.begin(),
-                      currentFileDetails.folderFileInfoList.end(),
-                      [&](const CompatibleFile &file1, const CompatibleFile &file2) {
-                          if (dirInfo.sortDescending)
-                              return collator.compare(file1.mimeType, file2.mimeType) > 0;
-                          else
-                              return collator.compare(file1.mimeType, file2.mimeType) < 0;
-                      });
-            break;
-        }
-        case 5:
-            // Random
-            std::shuffle(currentFileDetails.folderFileInfoList.begin(),
-                         currentFileDetails.folderFileInfoList.end(),
-                         std::default_random_engine(
-                                 std::chrono::system_clock::now().time_since_epoch().count()));
-            break;
-        default:
-            Q_ASSERT(false);
-            break;
-        }
-    };
-
-    if (shouldSort) {
-        sortFn();
+        std::shuffle(files.begin(), files.end(),
+                     std::default_random_engine(
+                             std::chrono::system_clock::now().time_since_epoch().count()));
+        ordered.append(files);
+        files = std::move(ordered);
+    } else {
+        // Every scan starts in filesystem order, including scans with unchanged
+        // file counts/settings. Always sort before publishing the new list.
+        QCollator nameCollator;
+        nameCollator.setNumericMode(true);
+        QCollator typeCollator;
+        const auto compareNumber = [](qint64 a, qint64 b) { return (a > b) - (a < b); };
+        std::sort(files.begin(), files.end(),
+                  [&](const CompatibleFile &file1, const CompatibleFile &file2) {
+                      int order = 0;
+                      switch (dirInfo.sortMode) {
+                      case 0: // Natural filename order (below).
+                          break;
+                      case 1: // Newest/largest first, as in the existing menus.
+                          order = compareNumber(file2.lastModified, file1.lastModified);
+                          break;
+                      case 2:
+                          order = compareNumber(file2.lastCreated, file1.lastCreated);
+                          break;
+                      case 3:
+                          order = compareNumber(file2.size, file1.size);
+                          break;
+                      case 4:
+                          order = typeCollator.compare(file1.mimeType, file2.mimeType);
+                          break;
+                      default:
+                          Q_ASSERT(false);
+                      }
+                      if (order == 0)
+                          order = nameCollator.compare(file1.fileName, file2.fileName);
+                      // Collation can equate distinct names (e.g. 2 and 02).
+                      // Use the exact filename to make every tie deterministic.
+                      if (order == 0)
+                          order = QString::compare(file1.fileName, file2.fileName,
+                                                   Qt::CaseSensitive);
+                      return dirInfo.sortDescending ? order > 0 : order < 0;
+                  });
     }
 
-    // Set current file index variable
+    currentFileDetails.folderFileInfoList = std::move(files);
+    lastDirInfo = dirInfo;
     currentFileDetails.updateLoadedIndexInFolder();
 }
 

@@ -61,13 +61,12 @@ public:
     struct DirInfo
     {
         QString dirPath;
-        qsizetype fileCount;
         int sortMode;
         bool sortDescending;
 
         bool operator!=(const DirInfo &other) const
         {
-            return dirPath != other.dirPath || fileCount != other.fileCount
+            return dirPath != other.dirPath
                     || sortMode != other.sortMode || sortDescending != other.sortDescending;
         }
     };
@@ -156,7 +155,7 @@ private:
 
     static QCache<QString, ReadData> imageCache;
 
-    DirInfo lastDirInfo;
+    DirInfo lastDirInfo{};
 
     QStringList lastFilesPreloaded;
     QStringList preloadFilesInProgress;

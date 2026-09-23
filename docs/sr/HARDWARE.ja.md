@@ -184,3 +184,13 @@ workerの単発実測は初回9タイル4.30秒、追加25タイル8.77秒（初
 GIF保存の試験は、透明色・背景へのdisposal、元の表示時間、有限/無限ループ、回転、sRGB ICCの埋込み、表示ICCを変更しても保存データが同一であること、保存ダイアログのGIF/PNG選択と拡張子、中止/画像送り時の既存ファイル保持、元画像への上書き拒否を含む。減色経路では透明部分を含む多色グラデーションと同一フレームの繰り返しを使い、可視画素とalphaがフレーム間で同一であることを確認した。8-bit RGBのRMSEはこの合成画像で約9.9であり、すべての写真の画質を保証する指標ではない。
 
 実機の保存GIF・スクリーンショットは`diagnostics/local/gui-gif-export-check/`、実機ログは`diagnostics/local/gif-export-hardware.log`、ローカルCTestログは`diagnostics/local/gif-export-ctest.log`に保存した。GitHub CIは実行していない。
+
+### 画像送りの表示順の修正（2026-09-23）
+
+フォーク元の取り込み時点（`c5eca1c`）にも存在した、`QVImageCore::updateFolderInfo()`のソート省略を特定した。フォルダーを`QDir::Unsorted`で読み直した後、件数と設定が同じ場合に未整列の一覧をそのまま採用していた。`goToFile()`は画像表示から3秒以上経過すると一覧を更新するため、待ってから戻ると異なるファイルへ移動する。
+
+自作の`_1.PNG`、`_2.png`、`A2.png`、`a2.png`、`a02.png`、`a10.PNG`などの小型PNGと、4096×4096・約50 MBのBMPを同じフォルダーに置いて検証した。修正前は一周手前まで右キーで進み、3.1秒待って左キーで戻すと、期待する`Z1.png`ではなく`a02.png`が表示された。先読み無効・有効の両方で再現した。
+
+修正後のローカルCTestは3スイートすべて合格（ActionManagerTests 3件、SrTests 55件、NavigationTests 22件。明示実行用の実機SRシナリオ3件は通常どおりスキップ）。表示順は全6モード×昇順/降順、同順位の決定、件数が同じ改名・容量・更新日時の変更、ランダム順の維持と追加/削除を検証した。左右キーで全ファイルを往復し、フォルダー端の折り返しと表示中ファイルのindexも確認した。
+
+X11上でも先読み無効・有効の左右キー試験に合格した。テストはウィンドウ表示・アクティブ化を待ってからキー入力を送る。画像・設定は一時フォルダーに隔離し、ユーザーの画像・設定を書き換えない。ログは`diagnostics/local/navigation-before.log`、`navigation-ctest.log`、`navigation-final-test.log`、`navigation-x11.log`。GitHub CIは実行していない。
