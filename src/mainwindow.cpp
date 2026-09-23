@@ -3,6 +3,7 @@
 #include "qvapplication.h"
 #include "qvcocoafunctions.h"
 #include "qvrenamedialog.h"
+#include "sr/sr_controller.h"
 
 #include <QFileDialog>
 #include <QMessageBox>
@@ -51,6 +52,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
 
     // Initialize graphicsviewkDefaultBufferAlignment
     graphicsView = new QVGraphicsView(this);
+    srController = new Sr::Controller(this, graphicsView);
     centralWidget()->layout()->addWidget(graphicsView);
 
     // Hide fullscreen label by default
@@ -128,6 +130,18 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
         ActionManager::actionTriggered(triggeredAction, this);
     });
 
+    // Keep the ordinary animation controls usable for the SR frame sequence.
+    connect(srController, &Sr::Controller::stateChanged, this, [this] {
+        disableActions();
+        if (!srController->hasAnimation() && !getCurrentFileDetails().isMovieLoaded) return;
+        const bool playing = srController->hasAnimation() ? srController->animationPlaying()
+                                                        : graphicsView->getLoadedMovie().state() == QMovie::Running;
+        for (const auto &action : qvApp->getActionManager().getAllClonesOfAction("pause", this)) {
+            action->setText(playing ? tr("Pause") : tr("Res&ume"));
+            action->setIcon(QIcon::fromTheme(playing ? "media-playback-pause" : "media-playback-start"));
+        }
+        if (info->isVisible()) refreshProperties();
+    });
     // Enable actions related to having a window
     disableActions();
 
@@ -164,6 +178,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
 
 MainWindow::~MainWindow()
 {
+    delete srController;
     delete ui;
 }
 
@@ -307,6 +322,7 @@ void MainWindow::paintEvent(QPaintEvent *event)
 void MainWindow::fullscreenChanged()
 {
     const bool isFullscreen = windowState().testFlag(Qt::WindowFullScreen);
+    srController->setFullscreen(isFullscreen);
     const auto fullscreenActions =
             qvApp->getActionManager().getAllClonesOfAction("fullscreen", this);
     for (const auto &fullscreenAction : fullscreenActions) {
@@ -419,7 +435,7 @@ void MainWindow::disableActions()
                 if (cloneData.last() == "disable") {
                     clone->setEnabled(getCurrentFileDetails().isPixmapLoaded);
                 } else if (cloneData.last() == "gifdisable") {
-                    clone->setEnabled(getCurrentFileDetails().isMovieLoaded);
+                    clone->setEnabled(getCurrentFileDetails().isMovieLoaded || srController->hasAnimation());
                 } else if (cloneData.last() == "undodisable") {
                     clone->setEnabled(!lastDeletedFiles.isEmpty()
                                       && !lastDeletedFiles.top().pathInTrash.isEmpty());
@@ -478,7 +494,9 @@ void MainWindow::populateOpenWithMenu(const QList<OpenWith::OpenWithItem> openWi
 void MainWindow::refreshProperties()
 {
     int value4;
-    if (getCurrentFileDetails().isMovieLoaded)
+    if (srController->hasAnimation())
+        value4 = srController->animationFrameCount();
+    else if (getCurrentFileDetails().isMovieLoaded)
         value4 = graphicsView->getLoadedMovie().frameCount();
     else
         value4 = 0;
@@ -488,7 +506,7 @@ void MainWindow::refreshProperties()
 
 void MainWindow::updateWindowTitle()
 {
-    QString newString = "qView";
+    QString newString = "qViewSR";
     if (getCurrentFileDetails().fileInfo.isFile()) {
         switch (qvApp->getSettingsManager().getInt(SettingsManager::Setting::TitleBarMode)) {
         case 1: {
@@ -511,7 +529,7 @@ void MainWindow::updateWindowTitle()
                 newString +=
                         " - " + QVInfoDialog::formatBytes(getCurrentFileDetails().fileInfo.size());
             }
-            newString += " - qView";
+            newString += " - qViewSR";
             break;
         }
         }
@@ -1050,6 +1068,10 @@ void MainWindow::lastFile()
 
 void MainWindow::saveFrameAs()
 {
+    if (srController->hasAnimation()) {
+        srController->saveDisplayedFrameAs();
+        return;
+    }
     QSettings settings;
     settings.beginGroup("recents");
     if (!getCurrentFileDetails().isMovieLoaded)
@@ -1079,7 +1101,11 @@ void MainWindow::saveFrameAs()
 
 void MainWindow::pause()
 {
-    if (!getCurrentFileDetails().isMovieLoaded)
+    if (srController->hasAnimation()) {
+        srController->setAnimationPaused(srController->animationPlaying());
+        return;
+    }
+    if (!getCurrentFileDetails().isMovieLoaded && !graphicsView->getImageCore().isAnimationFrozenForSr())
         return;
 
     const auto pauseActions = qvApp->getActionManager().getAllClonesOfAction("pause", this);
@@ -1101,6 +1127,10 @@ void MainWindow::pause()
 
 void MainWindow::nextFrame()
 {
+    if (srController->hasAnimation()) {
+        srController->stepAnimation();
+        return;
+    }
     if (!getCurrentFileDetails().isMovieLoaded)
         return;
 
@@ -1142,6 +1172,10 @@ void MainWindow::slideshowAction()
 
 void MainWindow::decreaseSpeed()
 {
+    if (srController->hasAnimation()) {
+        srController->setAnimationSpeed(srController->animationSpeed() - 25);
+        return;
+    }
     if (!getCurrentFileDetails().isMovieLoaded)
         return;
 
@@ -1150,6 +1184,10 @@ void MainWindow::decreaseSpeed()
 
 void MainWindow::resetSpeed()
 {
+    if (srController->hasAnimation()) {
+        srController->setAnimationSpeed(100);
+        return;
+    }
     if (!getCurrentFileDetails().isMovieLoaded)
         return;
 
@@ -1158,6 +1196,10 @@ void MainWindow::resetSpeed()
 
 void MainWindow::increaseSpeed()
 {
+    if (srController->hasAnimation()) {
+        srController->setAnimationSpeed(srController->animationSpeed() + 25);
+        return;
+    }
     if (!getCurrentFileDetails().isMovieLoaded)
         return;
 

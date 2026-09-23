@@ -1,89 +1,29 @@
-# Tests for qView
-# This CMakeLists.txt should be included by the parent project
-
-# Find Qt Test component and other dependencies
-find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Core Gui Network Widgets Svg Test REQUIRED)
-
-# Get the same source files as the main project
-set(TEST_SOURCES
-    tst_actionmanagertests.cpp
-    ../src/mainwindow.cpp
-    ../src/openwith.cpp
-    ../src/qvgraphicsview.cpp
-    ../src/qvoptionsdialog.cpp
-    ../src/qvapplication.cpp
-    ../src/qvaboutdialog.cpp
-    ../src/qvrenamedialog.cpp
-    ../src/qvwelcomedialog.cpp
-    ../src/qvinfodialog.cpp
-    ../src/qvimagecore.cpp
-    ../src/qvshortcutdialog.cpp
-    ../src/actionmanager.cpp
-    ../src/settingsmanager.cpp
-    ../src/shortcutmanager.cpp
-)
-
-# Add platform-specific sources
-if(WIN32)
-    if(NOT NO_WIN32)
-        list(APPEND TEST_SOURCES ../src/qvwin32functions.cpp)
+find_package(Qt6 REQUIRED COMPONENTS Test)
+set(APP_TEST_SOURCES ${PROJECT_SOURCES})
+list(REMOVE_ITEM APP_TEST_SOURCES src/main.cpp)
+list(TRANSFORM APP_TEST_SOURCES PREPEND "${PROJECT_SOURCE_DIR}/")
+foreach(target IN ITEMS actionmanagertests srtests navigationtests)
+    add_executable(${target} tst_${target}.cpp ${APP_TEST_SOURCES} "${PROJECT_SOURCE_DIR}/resources/resources.qrc")
+    target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    set_target_properties(${target} PROPERTIES AUTOUIC_SEARCH_PATHS "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(${target} PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Widgets Qt6::Svg
+        qviewsr_i18n Qt6::Concurrent Qt6::Test PkgConfig::LCMS2 ZLIB::ZLIB GIF::GIF ${PLATFORM_SPECIFIC_LIBS})
+    target_compile_definitions(${target} PRIVATE "VERSION=${PROJECT_VERSION}" QT_DEPRECATED_WARNINGS QT_NO_FOREACH
+        "SR_SOURCE_DIR=\"${PROJECT_SOURCE_DIR}\"")
+    if(QV_DISABLE_ONLINE_VERSION_CHECK)
+        target_compile_definitions(${target} PRIVATE QV_DISABLE_ONLINE_VERSION_CHECK)
     endif()
-elseif(APPLE)
-    if(NOT NO_COCOA)
-        list(APPEND TEST_SOURCES ../src/qvcocoafunctions.mm)
+    if(UNIX AND NOT APPLE AND NOT NO_X11)
+        target_compile_definitions(${target} PRIVATE X11_LOADED)
     endif()
-elseif(UNIX AND NOT APPLE)
-    if(NOT NO_X11)
-        list(APPEND TEST_SOURCES ../src/qvlinuxx11functions.cpp)
+    if(WIN32 AND NOT NO_WIN32)
+        target_compile_definitions(${target} PRIVATE WIN32_LOADED)
     endif()
-endif()
-
-# Add updatechecker if enabled
-if(NOT QV_DISABLE_ONLINE_VERSION_CHECK)
-    list(APPEND TEST_SOURCES ../src/updatechecker.cpp)
-endif()
-
-# Test executable
-add_executable(actionmanagertests ${TEST_SOURCES})
-
-# Add include directory for source headers
-target_include_directories(actionmanagertests PRIVATE ../src)
-
-# Add Qt resources
-set(TEST_RESOURCES ../resources/resources.qrc)
-target_sources(actionmanagertests PRIVATE ${TEST_RESOURCES})
-
-# Link to Qt libraries
-target_link_libraries(actionmanagertests PRIVATE 
-    Qt${QT_VERSION_MAJOR}::Core 
-    Qt${QT_VERSION_MAJOR}::Gui 
-    Qt${QT_VERSION_MAJOR}::Network 
-    Qt${QT_VERSION_MAJOR}::Widgets 
-    Qt${QT_VERSION_MAJOR}::Svg 
-    Qt${QT_VERSION_MAJOR}::Test
-)
-
-# Platform-specific libraries
-if(WIN32 AND NOT NO_WIN32)
-    target_compile_definitions(actionmanagertests PRIVATE WIN32_LOADED)
-elseif(APPLE AND NOT NO_COCOA)
-    target_compile_definitions(actionmanagertests PRIVATE COCOA_LOADED)
-endif()
-
-if(PLATFORM_SPECIFIC_LIBS)
-    target_link_libraries(actionmanagertests PRIVATE ${PLATFORM_SPECIFIC_LIBS})
-endif()
-
-# Add compile definitions
-target_compile_definitions(actionmanagertests PRIVATE
-    "VERSION=${PROJECT_VERSION}"
-    QT_DEPRECATED_WARNINGS
-    QT_NO_FOREACH
-)
-
-if(NOT QV_DISABLE_ONLINE_VERSION_CHECK)
-    target_compile_definitions(actionmanagertests PRIVATE QV_DISABLE_ONLINE_VERSION_CHECK)
-endif()
-
-# Add the test
+    if(APPLE AND NOT NO_COCOA)
+        target_compile_definitions(${target} PRIVATE COCOA_LOADED)
+    endif()
+endforeach()
 add_test(NAME ActionManagerTests COMMAND actionmanagertests)
+add_test(NAME SrTests COMMAND srtests)
+add_test(NAME NavigationTests COMMAND navigationtests)
+set_tests_properties(ActionManagerTests SrTests NavigationTests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 180)

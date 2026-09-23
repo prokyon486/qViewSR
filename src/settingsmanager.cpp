@@ -44,7 +44,7 @@ static const SettingDefinition settingDefinitions[] = {
     { SettingsManager::Setting::PastActualSizeEnabled, true, "pastactualsizeenabled" },
     { SettingsManager::Setting::ColorSpaceConversion, 1, "colorspaceconversion" },
     // Miscellaneous settings
-    { SettingsManager::Setting::Language, "system", "language" },
+    { SettingsManager::Setting::Language, "ja", "language" },
     { SettingsManager::Setting::SortMode, 0, "sortmode" },
     { SettingsManager::Setting::SortDescending, false, "sortdescending" },
     { SettingsManager::Setting::PreloadingMode, 1, "preloadingmode" },
@@ -64,6 +64,12 @@ static QVector<QString> settingKeys;
 
 SettingsManager::SettingsManager(QObject *parent) : QObject(parent)
 {
+    // Apply the requested Japanese menus once; later explicit language choices remain available.
+    QSettings settings;
+    if(!settings.value("sr/japaneseMenusV1",false).toBool()) {
+        settings.setValue("options/language","ja");
+        settings.setValue("sr/japaneseMenusV1",true);
+    }
     initializeSettingDataCache();
     loadSettings();
     loadTranslation();
@@ -103,12 +109,18 @@ bool SettingsManager::loadTranslation() const
     if (lang == "en")
         return true;
 
-    QTranslator *translator = new QTranslator();
+    if(lang == "ja") {
+        auto* qtTranslator=new QTranslator(QCoreApplication::instance());
+        if(qtTranslator->load("qtbase_ja.qm",":/i18n")) QCoreApplication::installTranslator(qtTranslator);
+        else delete qtTranslator;
+    }
+    QTranslator *translator = new QTranslator(QCoreApplication::instance());
     bool success = translator->load("qview_" + lang + ".qm", QLatin1String(":/i18n"));
     if (success) {
         qInfo() << "Loaded translation" << lang;
         QCoreApplication::installTranslator(translator);
     }
+    if(!success) delete translator;
     return success;
 }
 

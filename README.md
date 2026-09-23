@@ -1,3 +1,5 @@
+> **qViewSR fork:** [日本語の起動・操作・ビルド手順](README-SR.ja.md) — NCS/NCS2による倍率指定・GIF全フレーム超解像とICC対応を実装したGUI検証版です。
+
 <h1 align=center>qView</h1>
 
 <p align=center>qView is an image viewer designed with minimalism and usability in mind.</p>

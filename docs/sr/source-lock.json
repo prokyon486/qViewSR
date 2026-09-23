@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "recorded_on": "2026-09-22",
+  "sources": {
+    "qview": {
+      "upstream": "https://github.com/jurplel/qView",
+      "fork": "https://github.com/prokyon486/qViewSR",
+      "ref": "main",
+      "commit": "c5eca1c7176549e0f0718d11201547ddcdb1f8c9"
+    },
+    "open_model_zoo": {
+      "upstream": "https://github.com/openvinotoolkit/open_model_zoo",
+      "fork": "https://github.com/prokyon486/qViewSR-open-model-zoo",
+      "ref": "2020.3",
+      "commit": "912eeaddc034e31dedd34617d82bcc2ddf83e542"
+    },
+    "openvino": {
+      "upstream": "https://github.com/openvinotoolkit/openvino",
+      "fork": "https://github.com/prokyon486/qViewSR-openvino",
+      "ref": "2020.3.2",
+      "commit": "0b3773b7405d955d48642667ac5113289b9baab2"
+    },
+    "imageviewer_reference_only": {
+      "upstream": "https://github.com/AlienCowEatCake/ImageViewer",
+      "commit": "8ee711c5b4bfeb133c675da7dc4c262dc5b29787",
+      "path": "src/ImageViewer/src/Decoders/Impl/Internal/Utils/CmsUtils.cpp"
+    }
+  },
+  "runtime": {
+    "release": "2020.3.2",
+    "package_version": "2020.3.355",
+    "observed_ie_build": "2020.3.2-3506-c35b42b1d89-releases/2020/3",
+    "url": "https://storage.openvinotoolkit.org/repositories/openvino/packages/2020.3.2/l_openvino_toolkit_runtime_ubuntu18_p_2020.3.355.tgz",
+    "file": "runtime-downloads/openvino-2020.3.355.tgz",
+    "size": 198240675,
+    "sha256": "50ba2256d5e006d4f2bfa2d0c46c618a40f749740fb0e591567337652b36bbee",
+    "checksum_provenance": "Locally computed after download from the official HTTPS distribution; not an independently published vendor checksum.",
+    "extract_directory": "openvino-2020.3.355",
+    "archive_root": "l_openvino_toolkit_runtime_ubuntu18_p_2020.3.355"
+  },
+  "model": {
+    "name": "single-image-super-resolution-1032",
+    "weights_precision": "FP16",
+    "api_blob_precision": "FP32",
+    "ir_version": 10,
+    "scale": 4,
+    "input_order": "BGR",
+    "input_layout": "NCHW",
+    "input_range": [
+      0,
+      255
+    ],
+    "output_nominal_range": [
+      0,
+      1
+    ],
+    "inputs": {
+      "0": [
+        1,
+        3,
+        270,
+        480
+      ],
+      "1": [
+        1,
+        3,
+        1080,
+        1920
+      ]
+    },
+    "output_shape": [
+      1,
+      3,
+      1080,
+      1920
+    ],
+    "checksum_provenance": "Open Model Zoo 2020.3 models/intel/single-image-super-resolution-1032/model.yml; verified after download.",
+    "files": [
+      {
+        "url": "https://download.01.org/opencv/2020/openvinotoolkit/2020.3/open_model_zoo/models_bin/1/single-image-super-resolution-1032/FP16/single-image-super-resolution-1032.xml",
+        "file": "models/1032-fp16/single-image-super-resolution-1032.xml",
+        "size": 41093,
+        "sha256": "25be6418ee76c33169470ada73b924864fb439c5fc5a208b7fa4b0e64f6f84d1"
+      },
+      {
+        "url": "https://download.01.org/opencv/2020/openvinotoolkit/2020.3/open_model_zoo/models_bin/1/single-image-super-resolution-1032/FP16/single-image-super-resolution-1032.bin",
+        "file": "models/1032-fp16/single-image-super-resolution-1032.bin",
+        "size": 59882,
+        "sha256": "abae5907d40ef7e47d680435a99484b74076a985a6b8c3353b64fa77e6d3c149"
+      }
+    ]
+  },
+  "preservation": {
+    "repository": "prokyon486/qViewSR-runtime-archive",
+    "visibility": "private",
+    "tag": "runtime-2020.3.355-20260922",
+    "asset_naming": "basename of each locked file",
+    "scope": "Owner-only preservation of original runtime with bundled libraries, firmware, licenses, model and Ubuntu dependencies. Not a public redistribution license."
+  }
+}

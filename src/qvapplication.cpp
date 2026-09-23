@@ -11,7 +11,7 @@
 
 QVApplication::QVApplication(int &argc, char **argv) : QApplication(argc, argv)
 {
-    setDesktopFileName("com.interversehq.qView.desktop");
+    setDesktopFileName("io.github.prokyon486.qViewSR");
 
     // Connections
     connect(&actionManager, &ActionManager::recentsMenuUpdated, this,
