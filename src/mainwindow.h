@@ -15,6 +15,9 @@ namespace Ui {
 class MainWindow;
 }
 namespace Sr { class Controller; }
+namespace Model3D { class View; }
+class QToolBar;
+class QLabel;
 
 class MainWindow : public QMainWindow
 {
@@ -101,6 +104,7 @@ public:
     void lastFile();
 
     void saveFrameAs();
+    void saveModelViewAs();
 
     void pause();
 
@@ -161,6 +165,15 @@ private:
     Sr::Controller *srController;
     Ui::MainWindow *ui;
     QVGraphicsView *graphicsView;
+    Model3D::View *modelView = nullptr;
+    QToolBar *modelToolbar = nullptr;
+    QMenu *modelMenu = nullptr;
+    QAction *modelSaveAction = nullptr;
+    QAction *modelResetAction = nullptr;
+    QLabel *modelStatus = nullptr;
+    void createModelActions();
+    void updateModelActions();
+    void switchDocumentView();
 
     QMenu *contextMenu;
     QMenu *virtualMenu;

@@ -4,6 +4,9 @@
 #include "qvcocoafunctions.h"
 #include "qvrenamedialog.h"
 #include "sr/sr_controller.h"
+#include "model3d/model_view.h"
+#include <QToolBar>
+#include <QMimeData>
 
 #include <QFileDialog>
 #include <QMessageBox>
@@ -118,6 +121,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
         ActionManager::actionTriggered(triggeredAction, this);
     });
 
+    createModelActions();
+
     // Add all actions to this window so keyboard shortcuts are always triggered
     // using virtual menu to hold them so i can connect to the triggered signal
     virtualMenu = new QMenu(this);
@@ -178,6 +183,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
 
 MainWindow::~MainWindow()
 {
+    delete modelView;
     delete srController;
     delete ui;
 }
@@ -286,7 +292,9 @@ void MainWindow::paintEvent(QPaintEvent *event)
 
     // Find the top of the viewport to account for the menu bar if it's inside the window
     // and/or the label that displays titlebar text in full screen mode.
-    const int viewportY = graphicsView->mapTo(this, QPoint()).y();
+    const auto *activeView = getCurrentFileDetails().isModelDocument && modelView
+            ? static_cast<const QWidget *>(modelView) : static_cast<const QWidget *>(graphicsView);
+    const int viewportY = activeView->mapTo(this, QPoint()).y();
     // On macOS, part of the viewport may be additionally covered with the window's translucent
     // titlebar due to full size content view.
     const int unobscuredViewportY = qMax(getTitlebarOverlap(), viewportY);
@@ -323,6 +331,7 @@ void MainWindow::fullscreenChanged()
 {
     const bool isFullscreen = windowState().testFlag(Qt::WindowFullScreen);
     srController->setFullscreen(isFullscreen);
+    updateModelActions();
     const auto fullscreenActions =
             qvApp->getActionManager().getAllClonesOfAction("fullscreen", this);
     for (const auto &fullscreenAction : fullscreenActions) {
@@ -408,6 +417,7 @@ void MainWindow::openRecent(int i)
 
 void MainWindow::fileChanged()
 {
+    switchDocumentView();
     populateOpenWithTimer->start();
     disableActions();
 
@@ -433,7 +443,9 @@ void MainWindow::disableActions()
             for (const auto &clone : clonesOfAction) {
                 const auto &cloneData = clone->data().toStringList();
                 if (cloneData.last() == "disable") {
-                    clone->setEnabled(getCurrentFileDetails().isPixmapLoaded);
+                    const bool model = getCurrentFileDetails().isModelDocument;
+                    const bool imageOnly = QStringList{"originalsize", "rotateright", "rotateleft", "mirror", "flip"}.contains(data.first());
+                    clone->setEnabled(getCurrentFileDetails().isPixmapLoaded || (model && !imageOnly));
                 } else if (cloneData.last() == "gifdisable") {
                     clone->setEnabled(getCurrentFileDetails().isMovieLoaded || srController->hasAnimation());
                 } else if (cloneData.last() == "undodisable") {
@@ -450,8 +462,112 @@ void MainWindow::disableActions()
 
     const auto &openWithMenus = qvApp->getActionManager().getAllClonesOfMenu("openwith", this);
     for (const auto &menu : openWithMenus) {
-        menu->setEnabled(getCurrentFileDetails().isPixmapLoaded);
+        menu->setEnabled(getCurrentFileDetails().isPixmapLoaded || getCurrentFileDetails().isModelDocument);
     }
+}
+
+void MainWindow::createModelActions()
+{
+    modelMenu = menuBar()->addMenu(QStringLiteral("3D表示"));
+    modelMenu->setObjectName("modelMenu");
+    modelSaveAction = new QAction(QStringLiteral("表示中の3DをPNG保存…"), this);
+    modelSaveAction->setObjectName("modelSave");
+    modelSaveAction->setData(QStringList{"modelsave"});
+    modelSaveAction->setShortcut(QKeySequence("Ctrl+Shift+S"));
+    addAction(modelSaveAction);
+    connect(modelSaveAction, &QAction::triggered, this, &MainWindow::saveModelViewAs);
+    modelResetAction = new QAction(QStringLiteral("3Dの全体表示に戻す"), this);
+    modelResetAction->setData(QStringList{"modelreset"});
+    connect(modelResetAction, &QAction::triggered, this, &MainWindow::resetZoom);
+    modelMenu->addAction(modelSaveAction);
+    modelMenu->addAction(modelResetAction);
+    auto *help = modelMenu->addAction(QStringLiteral("3D操作方法"));
+    help->setData(QStringList{"modelhelp"});
+    connect(help, &QAction::triggered, this, [this] {
+        QMessageBox::information(this, QStringLiteral("3D操作方法"), QStringLiteral(
+            "Ctrl＋左ドラッグ: モデル回転\n左ドラッグ: カメラの平行移動\nホイール: 近づく／遠ざかる\nShift＋ホイール: 画角の変更\n中央クリック／表示をリセット: 全体表示\n←／→: 前／次のファイル\nダブルクリック: 全画面\nCtrl＋Shift＋S: 表示領域をPNG保存\n\n"
+            "静的GLBを表示します。元のGLBは変更しません。\nPNGはメニューを除いた表示領域の実ピクセル数で保存します。\n3D表示・PNGはsRGBです。3Dには画面ICC変換を適用しません。"));
+    });
+    contextMenu->addSeparator();
+    contextMenu->addMenu(modelMenu);
+    modelToolbar = new QToolBar(QStringLiteral("3D表示"), this);
+    modelToolbar->setObjectName("modelToolbar");
+    modelToolbar->setMovable(false); modelToolbar->setFloatable(false);
+    modelToolbar->addAction(modelResetAction);
+    modelToolbar->addAction(modelSaveAction);
+    modelStatus = new QLabel(modelToolbar);
+    modelStatus->setObjectName("modelStatus");
+    modelStatus->setTextFormat(Qt::PlainText); modelStatus->setWordWrap(false);
+    modelStatus->setMinimumWidth(1);
+    modelStatus->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    modelToolbar->addWidget(modelStatus);
+    addToolBar(Qt::BottomToolBarArea, modelToolbar);
+    modelToolbar->setFixedHeight(qMax(32, fontMetrics().height() + 12));
+    updateModelActions();
+}
+
+void MainWindow::updateModelActions()
+{
+    if (!modelToolbar) return;
+    const bool active = getCurrentFileDetails().isModelDocument;
+    const bool ready = active && modelView && modelView->isReady();
+    modelToolbar->setVisible(active && !isFullScreen());
+    modelMenu->menuAction()->setVisible(active);
+    modelSaveAction->setEnabled(ready);
+    modelResetAction->setEnabled(ready);
+    if (!active || !modelView) return;
+    const auto pixels = modelView->exportSize();
+    modelStatus->setText(ready ? QStringLiteral("GLB · 画角 %1° · PNG %2×%3 · Ctrl＋ドラッグ: 回転")
+                        .arg(modelView->fieldOfView(), 0, 'f', 0).arg(pixels.width()).arg(pixels.height())
+                              : modelView->message().section('\n', 0, 0));
+    modelStatus->setToolTip(modelView->detailText());
+}
+
+void MainWindow::switchDocumentView()
+{
+    const bool model = getCurrentFileDetails().isModelDocument;
+    if (model && !modelView) {
+        modelView = new Model3D::View(this);
+        centralWidget()->layout()->addWidget(modelView);
+        connect(modelView, &Model3D::View::stateChanged, this, &MainWindow::updateModelActions, Qt::QueuedConnection);
+        connect(modelView, &Model3D::View::previousRequested, this, &MainWindow::previousFile);
+        connect(modelView, &Model3D::View::nextRequested, this, &MainWindow::nextFile);
+        connect(modelView, &Model3D::View::fullscreenRequested, this, &MainWindow::toggleFullScreen);
+        connect(modelView, &Model3D::View::filesDropped, this, [this](const QList<QUrl> &urls) {
+            QMimeData mime; mime.setUrls(urls); graphicsView->loadMimeData(&mime);
+        });
+    }
+    graphicsView->setVisible(!model);
+    if (modelView) {
+        modelView->setVisible(model);
+        if (model) {
+            // A GLB has no pixel dimensions with which to resize the window.
+            justLaunchedWithImage = false;
+            modelView->loadModel(getCurrentFileDetails().fileInfo.absoluteFilePath());
+            modelView->setFocus();
+        } else {
+            modelView->clear();
+            graphicsView->setFocus();
+        }
+    }
+    updateModelActions();
+}
+
+void MainWindow::saveModelViewAs()
+{
+    if (!getCurrentFileDetails().isModelDocument || !modelView || !modelView->isReady()) return;
+    const auto file = getCurrentFileDetails().fileInfo;
+    QFileDialog dialog(this, QStringLiteral("表示中の3DをPNG保存"), file.absolutePath());
+    dialog.setAcceptMode(QFileDialog::AcceptSave);
+    dialog.setFileMode(QFileDialog::AnyFile);
+    dialog.setNameFilter(QStringLiteral("PNG画像 (*.png)"));
+    dialog.setDefaultSuffix("png");
+    dialog.selectFile(file.completeBaseName() + "-view.png");
+    if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) return;
+    const auto destination = dialog.selectedFiles().first();
+    QString error;
+    if (!modelView->savePng(destination, &error))
+        QMessageBox::critical(this, QStringLiteral("PNG保存エラー"), error);
 }
 
 void MainWindow::requestPopulateOpenWithMenu()
@@ -524,8 +640,11 @@ void MainWindow::updateWindowTitle()
             newString += "/" + QString::number(getCurrentFileDetails().folderFileInfoList.count());
             newString += " - " + getCurrentFileDetails().fileInfo.fileName();
             if (!getCurrentFileDetails().errorData.hasError) {
-                newString += " - " + QString::number(getCurrentFileDetails().baseImageSize.width());
-                newString += "x" + QString::number(getCurrentFileDetails().baseImageSize.height());
+                if (getCurrentFileDetails().isModelDocument) newString += " - GLB 3D";
+                else {
+                    newString += " - " + QString::number(getCurrentFileDetails().baseImageSize.width());
+                    newString += "x" + QString::number(getCurrentFileDetails().baseImageSize.height());
+                }
                 newString +=
                         " - " + QVInfoDialog::formatBytes(getCurrentFileDetails().fileInfo.size());
             }
@@ -546,7 +665,7 @@ void MainWindow::updateWindowFilePath()
     if (!windowHandle())
         return;
 
-    const bool shouldPopulate = getCurrentFileDetails().isPixmapLoaded;
+    const bool shouldPopulate = getCurrentFileDetails().isPixmapLoaded || getCurrentFileDetails().isModelDocument;
     windowHandle()->setFilePath(shouldPopulate ? getCurrentFileDetails().fileInfo.absoluteFilePath()
                                                : "");
 }
@@ -665,7 +784,7 @@ QScreen *MainWindow::screenContaining(const QRect &rect)
 
 bool MainWindow::getIsPixmapLoaded() const
 {
-    return getCurrentFileDetails().isPixmapLoaded;
+    return getCurrentFileDetails().isPixmapLoaded || getCurrentFileDetails().isModelDocument;
 }
 
 void MainWindow::setJustLaunchedWithImage(bool value)
@@ -765,7 +884,7 @@ void MainWindow::openWith(const OpenWith::OpenWithItem &openWithItem)
 
 void MainWindow::openContainingFolder()
 {
-    if (!getCurrentFileDetails().isPixmapLoaded)
+    if (!getCurrentFileDetails().isPixmapLoaded && !getCurrentFileDetails().isModelDocument)
         return;
 
     const QFileInfo selectedFileInfo = getCurrentFileDetails().fileInfo;
@@ -959,6 +1078,13 @@ void MainWindow::undoDelete()
 
 void MainWindow::copy()
 {
+    if (getCurrentFileDetails().isModelDocument) {
+        auto *data = new QMimeData;
+        data->setUrls({QUrl::fromLocalFile(getCurrentFileDetails().fileInfo.absoluteFilePath())});
+        if (modelView && modelView->isReady()) data->setImageData(modelView->capture());
+        QApplication::clipboard()->setMimeData(data);
+        return;
+    }
     auto *mimeData = graphicsView->getMimeData();
     if (!mimeData->hasImage() || !mimeData->hasUrls()) {
         mimeData->deleteLater();
@@ -988,7 +1114,7 @@ void MainWindow::paste()
 
 void MainWindow::rename()
 {
-    if (!getCurrentFileDetails().isPixmapLoaded)
+    if (!getCurrentFileDetails().isPixmapLoaded && !getCurrentFileDetails().isModelDocument)
         return;
 
     auto *renameDialog = new QVRenameDialog(this, getCurrentFileDetails().fileInfo);
@@ -1004,17 +1130,20 @@ void MainWindow::rename()
 
 void MainWindow::zoomIn()
 {
-    graphicsView->zoomIn();
+    if (getCurrentFileDetails().isModelDocument && modelView) modelView->dolly(1);
+    else graphicsView->zoomIn();
 }
 
 void MainWindow::zoomOut()
 {
-    graphicsView->zoomOut();
+    if (getCurrentFileDetails().isModelDocument && modelView) modelView->dolly(-1);
+    else graphicsView->zoomOut();
 }
 
 void MainWindow::resetZoom()
 {
-    graphicsView->resetScale();
+    if (getCurrentFileDetails().isModelDocument && modelView) modelView->resetView();
+    else graphicsView->resetScale();
 }
 
 void MainWindow::originalSize()

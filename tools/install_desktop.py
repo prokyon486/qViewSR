@@ -48,7 +48,7 @@ def main():
             env["XDG_CONFIG_HOME"] = temporary
             mimes = subprocess.check_output([binary, "--supported-mime-types"], env=env,
                                             text=True, timeout=30).strip()
-            if not mimes or any(not mime.startswith(("image/", "application/"))
+            if not mimes or any(not mime.startswith(("image/", "application/", "model/"))
                                 for mime in mimes.rstrip(";").split(";")):
                 raise ValueError("Unexpected supported MIME type list")
             user_data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")).resolve()
@@ -63,10 +63,10 @@ def main():
 Version=1.0
 Type=Application
 Name=qViewSR
-GenericName=Image Viewer
-GenericName[ja]=超解像画像ビューア
-Comment=View images with color management and NCS super-resolution
-Comment[ja]=カラープロファイル対応・NCS超解像画像ビューア
+GenericName=Image and 3D Viewer
+GenericName[ja]=超解像画像・3Dビューア
+Comment=View images with color management, NCS super-resolution and static GLB models
+Comment[ja]=カラープロファイル・NCS超解像・静的GLB表示に対応したビューア
 Exec={exec_argument(launcher)} %f
 TryExec={desktop_string(launcher)}
 Icon={APP_ID}
@@ -74,8 +74,8 @@ Terminal=false
 StartupNotify=true
 StartupWMClass=qViewSR
 Categories=Qt;Graphics;Viewer;Photography;
-Keywords=photos;pictures;super-resolution;NCS;
-Keywords[ja]=画像;写真;超解像;NCS;
+Keywords=photos;pictures;super-resolution;NCS;3D;GLB;
+Keywords[ja]=画像;写真;超解像;NCS;3D;GLB;
 MimeType={mimes}
 """
             staged = Path(temporary) / entry.name

@@ -112,7 +112,12 @@ void QVApplication::pickFile(MainWindow *parent)
     auto *fileDialog = new QFileDialog(parent, tr("Open..."));
     fileDialog->setDirectory(settings.value("lastFileDialogDir", QDir::homePath()).toString());
     fileDialog->setFileMode(QFileDialog::ExistingFiles);
-    fileDialog->setNameFilters(qvApp->getNameFilterList());
+    auto filters = qvApp->getNameFilterList();
+    QStringList allPatterns;
+    for (const auto &extension : qvApp->getFileExtensionList()) allPatterns << "*" + extension;
+    filters.prepend(QStringLiteral("画像と3Dモデル (%1)").arg(allPatterns.join(' ')));
+    filters.insert(1, QStringLiteral("GLB 3Dモデル (*.glb *.GLB)"));
+    fileDialog->setNameFilters(filters);
     if (parent)
         fileDialog->setWindowModality(Qt::WindowModal);
 
@@ -355,6 +360,8 @@ void QVApplication::defineFilterLists()
     filterString.chop(1);
     filterString += ")";
 
+    fileExtensionList << ".glb";
+
     // Build mime type list
     const auto &byteArrayMimeTypes = QImageReader::supportedMimeTypes();
     mimeTypeNameList.reserve(byteArrayMimeTypes.size() - 1);
@@ -366,6 +373,8 @@ void QVApplication::defineFilterLists()
 
         mimeTypeNameList << mime;
     }
+
+    mimeTypeNameList << "model/gltf-binary";
 
     // Build name filter list for file dialogs
     nameFilterList << filterString;

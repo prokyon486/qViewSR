@@ -70,7 +70,11 @@ void QVInfoDialog::updateInfo()
     ui->dimensionsLabel->setText(tr("%1 x %2 (%3 MP)")
                                          .arg(QString::number(width), QString::number(height),
                                               QString::number(megapixels)));
-    int gcd = getGcd(width, height);
+    if (width <= 0 || height <= 0) {
+        ui->dimensionsLabel->setText(QStringLiteral("—"));
+        ui->ratioLabel->setText(QStringLiteral("—"));
+    }
+    int gcd = (width > 0 && height > 0) ? getGcd(width, height) : 0;
     if (gcd != 0)
         ui->ratioLabel->setText(QString::number(width / gcd) + ":" + QString::number(height / gcd));
     if (frameCount != 0) {

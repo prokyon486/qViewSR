@@ -257,7 +257,10 @@ void Controller::setStatus(QString text) {
     text.replace("\r\n","\n"); text.replace('\r','\n');
     status_->setText(text.section('\n',0,0).replace('\t',' '));
 }
-void Controller::setFullscreen(bool fullscreen) { toolbar_->setVisible(!fullscreen); }
+void Controller::setFullscreen(bool fullscreen) {
+    fullscreen_ = fullscreen;
+    toolbar_->setVisible(!fullscreen_ && !view_->getCurrentFileDetails().isModelDocument);
+}
 QString Controller::statusText() const { return status_->text(); }
 qint64 Controller::backendPid() const { return worker_?worker_->processId():0; }
 void Controller::setConfiguration(const Configuration& config) {
@@ -277,6 +280,8 @@ void Controller::invalidate() {
     cancel(); updateActions();
 }
 void Controller::sourceLoaded() {
+    toolbar_->setVisible(!fullscreen_ && !view_->getCurrentFileDetails().isModelDocument);
+    if(!view_->getCurrentFileDetails().isModelDocument) ensureWorker();
     sourceReady_=!view_->getImageCore().getSourceImage().isNull();
     if(!job_) {
         setStatus(sourceReady_?QStringLiteral("元画像 · ")+view_->getImageCore().getSourceProfile().description:
@@ -487,7 +492,7 @@ void Controller::restartWorker() {
     QTimer::singleShot(10000,process,[process] { if(process && process->state()!=QProcess::NotRunning) process->kill(); });
 }
 void Controller::ensureWorker() {
-    if(worker_ || stoppingWorker_) return;
+    if(worker_ || stoppingWorker_ || view_->getCurrentFileDetails().isModelDocument) return;
     const auto config=configuration_;
     if(!QFileInfo(config.workerPath).isExecutable() || !QFileInfo::exists(config.modelPath) ||
        !QFileInfo::exists(config.runtimeRoot+"/deployment_tools/inference_engine/lib/intel64/libmyriadPlugin.so")) return;

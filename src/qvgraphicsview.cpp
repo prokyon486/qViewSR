@@ -340,7 +340,7 @@ void QVGraphicsView::loadFile(const QString &fileName)
 
 void QVGraphicsView::reloadFile()
 {
-    if (!getCurrentFileDetails().isPixmapLoaded)
+    if (!getCurrentFileDetails().isPixmapLoaded && !getCurrentFileDetails().isModelDocument)
         return;
 
     imageCore.loadFile(getCurrentFileDetails().fileInfo.absoluteFilePath(), true);
