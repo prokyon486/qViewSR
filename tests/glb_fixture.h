@@ -91,4 +91,38 @@ inline bool cube(const QString &path, bool animated = false)
     }
     return write(path,container(json,binary));
 }
+
+// An opaque dark card with a hole and a translucent band. It checks coverage
+// inside the geometry, in addition to the empty background outside the model.
+inline bool alphaCard(const QString &path)
+{
+    QByteArray binary;
+    QDataStream vertices(&binary,QIODevice::WriteOnly);
+    vertices.setByteOrder(QDataStream::LittleEndian); vertices.setFloatingPointPrecision(QDataStream::SinglePrecision);
+    const QVector<QPointF> uv{{0,0},{1,0},{1,1},{0,0},{1,1},{0,1}};
+    for (const auto &p : uv)
+        vertices << float(p.x()*4-2) << float(p.y()*4-2) << 0.0f << 0.0f << 0.0f << 1.0f << float(p.x()) << float(p.y());
+    const int vertexBytes = binary.size();
+    QImage texture(12,12,QImage::Format_RGBA8888);
+    for (int y = 0; y < 12; ++y) for (int x = 0; x < 12; ++x)
+        texture.setPixelColor(x,y,QColor(41,44,50,(x >= 4 && x < 8 && y >= 4 && y < 8) ? 0 : x >= 9 ? 128 : 255));
+    QByteArray png; QBuffer buffer(&png); buffer.open(QIODevice::WriteOnly); texture.save(&buffer,"png"); binary += png;
+    return write(path,container({
+        {"asset",QJsonObject{{"version","2.0"}}}, {"scene",0},
+        {"scenes",QJsonArray{QJsonObject{{"nodes",QJsonArray{0}}}}},
+        {"nodes",QJsonArray{QJsonObject{{"mesh",0}}}},
+        {"buffers",QJsonArray{QJsonObject{{"byteLength",binary.size()}}}},
+        {"bufferViews",QJsonArray{QJsonObject{{"buffer",0},{"byteLength",vertexBytes},{"byteStride",32},{"target",34962}},
+                                  QJsonObject{{"buffer",0},{"byteOffset",vertexBytes},{"byteLength",png.size()}}}},
+        {"accessors",QJsonArray{QJsonObject{{"bufferView",0},{"componentType",5126},{"count",6},{"type","VEC3"},{"min",QJsonArray{-2,-2,0}},{"max",QJsonArray{2,2,0}}},
+                                QJsonObject{{"bufferView",0},{"byteOffset",12},{"componentType",5126},{"count",6},{"type","VEC3"}},
+                                QJsonObject{{"bufferView",0},{"byteOffset",24},{"componentType",5126},{"count",6},{"type","VEC2"}}}},
+        {"images",QJsonArray{QJsonObject{{"bufferView",1},{"mimeType","image/png"}}}},
+        {"textures",QJsonArray{QJsonObject{{"source",0}}}},
+        {"materials",QJsonArray{QJsonObject{{"alphaMode","BLEND"},{"pbrMetallicRoughness",QJsonObject{
+            {"baseColorTexture",QJsonObject{{"index",0}}},{"metallicFactor",0},{"roughnessFactor",1}}}}}},
+        {"meshes",QJsonArray{QJsonObject{{"primitives",QJsonArray{QJsonObject{
+            {"attributes",QJsonObject{{"POSITION",0},{"NORMAL",1},{"TEXCOORD_0",2}}},{"material",0}}}}}}}
+    },binary));
+}
 }

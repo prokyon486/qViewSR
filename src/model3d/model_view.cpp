@@ -159,7 +159,7 @@ void View::fitDistance()
 }
 void View::resetView()
 {
-    rotation_ = {}; pan_ = {}; fov_ = 45; automaticFit_ = true; fitDistance();
+    rotation_ = {}; pan_ = {}; roll_ = 0; fov_ = 45; automaticFit_ = true; fitDistance();
     emit cameraChanged(); emit stateChanged();
 }
 float View::clipNear() const { return qMax(radius_ * 0.0001f, distance_ - radius_ * 1.8f); }
@@ -180,8 +180,10 @@ void View::changeFieldOfView(double steps)
 void View::rotateModel(const QPointF &delta)
 {
     if (!ready_) return;
-    rotation_ = (QQuaternion::fromAxisAndAngle(0, 1, 0, delta.x() * 0.4)
-                 * QQuaternion::fromAxisAndAngle(1, 0, 0, delta.y() * 0.4) * rotation_).normalized();
+    // Keep mouse motion relative to the screen, including after a camera roll.
+    const auto camera = cameraRotation();
+    rotation_ = (QQuaternion::fromAxisAndAngle(camera.rotatedVector({0, 1, 0}), delta.x() * 0.4)
+                 * QQuaternion::fromAxisAndAngle(camera.rotatedVector({1, 0, 0}), delta.y() * 0.4) * rotation_).normalized();
     emit cameraChanged();
 }
 void View::panCamera(const QPointF &delta)
@@ -189,20 +191,36 @@ void View::panCamera(const QPointF &delta)
     if (!ready_) return;
     automaticFit_ = false;
     const double perPixel = 2 * distance_ * std::tan(qDegreesToRadians(double(fov_)) / 2) / qMax(1, height());
-    pan_ += QPointF(-delta.x(), delta.y()) * perPixel;
+    const auto translation = cameraRotation().rotatedVector(QVector3D(-delta.x(), delta.y(), 0)) * perPixel;
+    pan_ += QPointF(translation.x(), translation.y());
     emit cameraChanged();
+}
+void View::rollCamera(int degrees)
+{
+    if (!ready_) return;
+    // Positive camera Z rotation makes the image turn clockwise. Keep the
+    // position, view direction/target, projection and model transform intact.
+    roll_ = (roll_ + degrees % 360) % 360;
+    if (roll_ >= 180) roll_ -= 360;
+    if (roll_ < -180) roll_ += 360;
+    emit cameraChanged(); emit stateChanged();
 }
 QSize View::exportSize() const { return size() * devicePixelRatioF(); }
 QString View::detailText() const
 {
-    return message_ + QStringLiteral("\nCtrl＋ドラッグ: 回転 / ドラッグ: 平行移動\nホイール: 距離 / Shift＋ホイール: 画角\n中央クリック: 全体表示 / ダブルクリック: 全画面\nPNG: 表示領域の実ピクセル数、sRGB（3D表示は画面ICC変換なし）")
+    return message_ + QStringLiteral("\nCtrl＋ドラッグ: モデル回転 / ドラッグ: 平行移動\nCtrl＋→／←: 右／左に1°ロール（位置・注視点・画角は一定）\nホイール: 距離 / Shift＋ホイール: 画角\n中央クリック: 全体表示 / ダブルクリック: 全画面\n照明: ワールド座標に固定\nPNG: 透明背景、表示領域の実ピクセル数、sRGB（3D表示は画面ICC変換なし）")
             + (document_.warnings.isEmpty() ? QString() : "\n" + document_.warnings.join('\n'));
 }
-QImage View::capture()
+QImage View::capture(bool transparentBackground)
 {
     if (!ready_ || !isVisible()) return {};
+    const auto background = quickWindow()->color();
+    // View3D always renders alpha; only the hosting Qt Quick background is
+    // opaque on screen. Preserve actual coverage/material alpha, not a color key.
+    if (transparentBackground) setClearColor(Qt::transparent);
     // Renders outstanding camera/resize changes too; never includes the Qt Widgets toolbar.
     auto image = grabFramebuffer();
+    if (transparentBackground) setClearColor(background);
     image.setDevicePixelRatio(1.0);
     image.setColorSpace(QColorSpace::SRgb);
     return image;
@@ -213,7 +231,7 @@ bool View::savePng(const QString &path, QString *error)
     if (QFileInfo(path).suffix().compare("png", Qt::CaseInsensitive) != 0
             || QFileInfo(path).canonicalFilePath() == QFileInfo(source_.toLocalFile()).canonicalFilePath())
         return failed(QStringLiteral("GLBは変更できません。別の名前のPNGファイルを指定してください。"));
-    const auto image = capture();
+    const auto image = capture(true);
     if (image.isNull()) return failed(QStringLiteral("保存できる3D表示がありません。"));
     QSaveFile file(path);
     if (!file.open(QIODevice::WriteOnly)) return failed(file.errorString());

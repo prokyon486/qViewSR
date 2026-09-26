@@ -481,12 +481,32 @@ void MainWindow::createModelActions()
     connect(modelResetAction, &QAction::triggered, this, &MainWindow::resetZoom);
     modelMenu->addAction(modelSaveAction);
     modelMenu->addAction(modelResetAction);
+    modelRollRightAction = new QAction(QStringLiteral("右に1°ロール"), this);
+    modelRollRightAction->setObjectName("modelRollRight");
+    modelRollRightAction->setData(QStringList{"modelrollright"});
+    modelRollRightAction->setShortcut(QKeySequence("Ctrl+Right"));
+    addAction(modelRollRightAction);
+    connect(modelRollRightAction, &QAction::triggered, this, [this] {
+        if (modelView) modelView->rollCamera(1);
+    });
+    modelRollLeftAction = new QAction(QStringLiteral("左に1°ロール"), this);
+    modelRollLeftAction->setObjectName("modelRollLeft");
+    modelRollLeftAction->setData(QStringList{"modelrollleft"});
+    modelRollLeftAction->setShortcut(QKeySequence("Ctrl+Left"));
+    addAction(modelRollLeftAction);
+    connect(modelRollLeftAction, &QAction::triggered, this, [this] {
+        if (modelView) modelView->rollCamera(-1);
+    });
+    modelMenu->addSeparator();
+    modelMenu->addAction(modelRollRightAction);
+    modelMenu->addAction(modelRollLeftAction);
+    modelMenu->addSeparator();
     auto *help = modelMenu->addAction(QStringLiteral("3D操作方法"));
     help->setData(QStringList{"modelhelp"});
     connect(help, &QAction::triggered, this, [this] {
         QMessageBox::information(this, QStringLiteral("3D操作方法"), QStringLiteral(
-            "Ctrl＋左ドラッグ: モデル回転\n左ドラッグ: カメラの平行移動\nホイール: 近づく／遠ざかる\nShift＋ホイール: 画角の変更\n中央クリック／表示をリセット: 全体表示\n←／→: 前／次のファイル\nダブルクリック: 全画面\nCtrl＋Shift＋S: 表示領域をPNG保存\n\n"
-            "静的GLBを表示します。元のGLBは変更しません。\nPNGはメニューを除いた表示領域の実ピクセル数で保存します。\n3D表示・PNGはsRGBです。3Dには画面ICC変換を適用しません。"));
+            "Ctrl＋左ドラッグ: モデル回転\nCtrl＋→／←: 右／左に1°ロール（位置・注視点・画角は一定）\n左ドラッグ: カメラの平行移動\nホイール: 近づく／遠ざかる\nShift＋ホイール: 画角の変更\n中央クリック／表示をリセット: 全体表示\n←／→: 前／次のファイル\nダブルクリック: 全画面\nCtrl＋Shift＋S: 表示領域をPNG保存\n\n"
+            "静的GLBを表示します。元のGLBは変更しません。\nPNGは背景を透明にして、メニューを除いた表示領域の実ピクセル数で保存します。\n照明はワールド座標に固定されています。\n3D表示・PNGはsRGBです。3Dには画面ICC変換を適用しません。"));
     });
     contextMenu->addSeparator();
     contextMenu->addMenu(modelMenu);
@@ -515,10 +535,12 @@ void MainWindow::updateModelActions()
     modelMenu->menuAction()->setVisible(active);
     modelSaveAction->setEnabled(ready);
     modelResetAction->setEnabled(ready);
+    modelRollRightAction->setEnabled(ready);
+    modelRollLeftAction->setEnabled(ready);
     if (!active || !modelView) return;
     const auto pixels = modelView->exportSize();
-    modelStatus->setText(ready ? QStringLiteral("GLB · 画角 %1° · PNG %2×%3 · Ctrl＋ドラッグ: 回転")
-                        .arg(modelView->fieldOfView(), 0, 'f', 0).arg(pixels.width()).arg(pixels.height())
+    modelStatus->setText(ready ? QStringLiteral("GLB · 画角 %1° · ロール %2° · PNG %3×%4")
+                        .arg(modelView->fieldOfView(), 0, 'f', 0).arg(modelView->cameraRoll()).arg(pixels.width()).arg(pixels.height())
                               : modelView->message().section('\n', 0, 0));
     modelStatus->setToolTip(modelView->detailText());
 }

@@ -14,6 +14,7 @@ class View : public QQuickWidget
     Q_PROPERTY(QVector3D modelCenter READ modelCenter NOTIFY cameraChanged)
     Q_PROPERTY(QQuaternion modelRotation READ modelRotation NOTIFY cameraChanged)
     Q_PROPERTY(QVector3D cameraPosition READ cameraPosition NOTIFY cameraChanged)
+    Q_PROPERTY(QQuaternion cameraRotation READ cameraRotation NOTIFY cameraChanged)
     Q_PROPERTY(float fieldOfView READ fieldOfView NOTIFY cameraChanged)
     Q_PROPERTY(float clipNear READ clipNear NOTIFY cameraChanged)
     Q_PROPERTY(float clipFar READ clipFar NOTIFY cameraChanged)
@@ -27,9 +28,10 @@ public:
     void resetView();
     void dolly(double steps);
     void changeFieldOfView(double steps);
+    void rollCamera(int degrees);
     void rotateModel(const QPointF &delta);
     void panCamera(const QPointF &delta);
-    QImage capture();
+    QImage capture(bool transparentBackground = false);
     bool savePng(const QString &path, QString *error = nullptr);
     bool isReady() const { return ready_; }
     QString message() const { return message_; }
@@ -38,6 +40,8 @@ public:
     QVector3D modelCenter() const { return center_; }
     QQuaternion modelRotation() const { return rotation_; }
     QVector3D cameraPosition() const { return center_ + QVector3D(pan_.x(), pan_.y(), distance_); }
+    QQuaternion cameraRotation() const { return QQuaternion::fromAxisAndAngle(0, 0, 1, roll_); }
+    int cameraRoll() const { return roll_; }
     float fieldOfView() const { return fov_; }
     float distance() const { return distance_; }
     float radius() const { return radius_; }
@@ -75,6 +79,7 @@ private:
     QQuaternion rotation_;
     QPointF pan_, lastPointer_;
     float radius_ = 1, distance_ = 3, fov_ = 45;
+    int roll_ = 0;
     bool ready_ = false, fitted_ = false, automaticFit_ = true, dragging_ = false;
     quint64 generation_ = 0;
     QString message_, rendererError_;

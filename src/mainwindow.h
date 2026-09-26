@@ -170,6 +170,8 @@ private:
     QMenu *modelMenu = nullptr;
     QAction *modelSaveAction = nullptr;
     QAction *modelResetAction = nullptr;
+    QAction *modelRollRightAction = nullptr;
+    QAction *modelRollLeftAction = nullptr;
     QLabel *modelStatus = nullptr;
     void createModelActions();
     void updateModelActions();
