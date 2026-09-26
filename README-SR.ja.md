@@ -1,3 +1,5 @@
+> **3D対応ブランチ:** 静的GLBの表示・回転・カメラ操作・PNG保存を追加しました。[操作と制約](docs/3d/README.ja.md)を参照してください。
+
 # qViewSR
 
 qViewを基盤に、**NCS×2＋NCS2×2による倍率指定・重ねがけ超解像、GIF全フレームの超解像再生、ICCを考慮した表示と保存**を追加しています。Ubuntu 24.04のGUIで機能検証できる試作版です。実機4本を使い、GUIの開始ボタンから表示・切り替え・保存まで確認済みです。
@@ -32,9 +34,26 @@ python3 tools/install_desktop.py --uninstall
 | 処理を中止 | 「中止」／Ctrl+. |
 | 使用デバイス・表示ICCを変更 | 「SR設定…」 |
 | ズーム／位置移動／画像送り | ホイール／ドラッグ／左右キー |
+| 表示中の画像をComfyUIなどへ渡す | 画像上でCtrl＋左ドラッグし、受け取り側へドロップ |
 | qViewのメニュー | 右クリック |
 
 左右キーは選択中の並べ替え順で移動し、時間を置いて操作しても同じ一覧の順序を保持します。名前順は数字を考慮した自然順で、同順位は正確なファイル名で決定します。日時・容量・種類が同じ場合も名前順で決定します。ランダム順では閲覧中の並びを保持し、新しく追加された画像を末尾へ加えます。
+
+**ComfyUIへのドラッグ:** Ctrlを押して画像上から左ドラッグし、ComfyUIの「Load Image／画像を読み込む」ノードへドロップします。
+元画像の表示中は元のファイルを渡すため、PNG内のメタデータや元の形式を保持します。
+SR表示中は表示中の結果を**全解像度・sRGB ICC付き・透明度を保持したPNG**にして渡します。
+画面のズームや切り抜かれた表示領域、モニター用ICC変換は出力に含めず、画像の回転・左右反転・上下反転は反映します。
+SRアニメーションの表示中はドラッグ開始時の1フレームをPNGにし、元のGIF表示中は元GIFファイルを渡します。
+受け取り側が対応する画像形式・ノードへドロップしてください。ComfyUI以外の、ファイルドロップ対応アプリでも使えます。
+
+通常のドラッグは引き続き画像の位置移動です。ウィンドウ移動を設定で有効にしている場合は**Ctrl＋Shift＋ドラッグ**を使います。
+3D表示のCtrl＋ドラッグはモデル回転のままです。外部ドラッグはコピーのみを許可し、元ファイルを移動・変更しません。
+自分自身へドロップしても画像を開き直さず、SR結果と表示位置を保ちます。
+
+SRの受け渡し用PNGはアプリのキャッシュ領域の`drag-exports`に保存します。
+ブラウザーがドロップ後に読み込めるよう、ウィンドウを閉じても保持し、最終利用から24時間以上経ったファイルを次のPNG生成時に削除します。
+初回のドラッグではPNGを生成するため、大きなSR画像では準備に時間がかかることがあります。
+PNGを作れない場合はエラーを表示し、別の画像を代わりに渡すことはありません。
 
 超解像バーは高さを固定し、メッセージの先頭行だけを操作ボタンの右側からウィンドウ右端まで表示します。2行目以降や横幅に収まらない内容は、マウスを置くと全文を確認できます。フルスクリーンではバーを隠し、Ctrl+U・Ctrl+Spaceなどの操作は引き続き使えます。既存メニューと標準ダイアログも日本語で表示します。
 
@@ -102,6 +121,10 @@ QT_QPA_PLATFORM=xcb ./tools/test_gui_hardware.sh /path/to/test.png
 ./tools/test_gui_hardware.sh /path/to/test.png realScaleAndRepeatGui
 # GIF全フレームを2倍→さらに2倍にし、GIF保存・再読込・拡大再生時の位置保持を確認
 ./tools/test_gui_hardware.sh /path/to/test.gif realAnimationGui
+# デスクトップ上で外部ドラッグの開始・コピー専用・自分自身へのドロップ拒否を確認（NCS不要）
+QT_QPA_PLATFORM=xcb QVIEWSR_TEST_DRAG=1 build/gui/tests/navigationtests externalDragGesture nativeDragContract
+# SRの受け渡しPNG、ICC、GIFの現在フレーム、キャッシュ保持・失敗を確認（テスト用worker）
+QT_QPA_PLATFORM=offscreen build/gui/tests/srtests dragDisplayedResult dragCurrentAnimationFrame dragExportFailureAndExpiry
 ```
 
 テストは専用の一時設定を使い、結果PNG/JPEG・画面画像・デバイス別タイル数を`diagnostics/local/gui-check/`に保存します。Gitには含めません。
@@ -111,7 +134,7 @@ QT_QPA_PLATFORM=xcb ./tools/test_gui_hardware.sh /path/to/test.png
 - ICCなしはsRGBと仮定して表示に明記します。JPEG/PNG/WebPは元ICCも検査し、他形式はデコーダーの色情報を利用します。壊れたICCはSRを拒否します。CMYK/YCCKはデコーダーのRGB出力をsRGBと仮定する経路で処理し、元CMYK ICCをRGBへ誤適用しません。CMYKの厳密な印刷色再現は保証対象外です。
 - 表示ICCの自動取得は既存のX11 rootプロファイルを使います。**複数モニターごとの自動選択・Waylandの色保証は未対応**です。必要な画面ICCはSR設定から手動指定できます。Qtが解析できない画面LUT ICCも手動指定を使います。
 - 30分負荷、USB抜去からの復帰、写真セットでの世代間の画質差・最適台数・速度比較、全ICC形式、透明境界の画質は評価を継続する項目です。4本がCPUより速いとは確認していません。
-- 大きな画像は割当前のメモリー見積りで開始を拒否します。workerとモデルは再利用しますが、SR画像の永続キャッシュやバッチ処理はありません。
+- 大きな画像は割当前のメモリー見積りで開始を拒否します。workerとモデルは再利用しますが、保存済み結果を自動で再利用する推論キャッシュやバッチ処理はありません。
 
 [設計と実装状況](docs/sr/DESIGN.ja.md) · [実機検証記録](docs/sr/HARDWARE.ja.md) · [ソース・アセット固定情報](docs/sr/source-lock.json)
 

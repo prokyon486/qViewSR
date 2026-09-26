@@ -12,6 +12,14 @@
 #include <QtMath>
 #include <QGestureEvent>
 #include <QScrollBar>
+#include <QDrag>
+#include <QPointer>
+#include <QSaveFile>
+#include <QImageWriter>
+#include <QStandardPaths>
+#include <QDateTime>
+#include <QToolTip>
+#include <QUuid>
 
 QVGraphicsView::QVGraphicsView(QWidget *parent) : QGraphicsView(parent)
 {
@@ -48,6 +56,10 @@ QVGraphicsView::QVGraphicsView(QWidget *parent) : QGraphicsView(parent)
     connect(&imageCore, &QVImageCore::fileChanged, this, &QVGraphicsView::postLoad);
     connect(&imageCore, &QVImageCore::updateLoadedPixmapItem, this,
             &QVGraphicsView::updateLoadedPixmapItem);
+    connect(&imageCore, &QVImageCore::sourceChanging, this, [this] {
+        fileDragPending = fileDragGesture = false;
+        viewport()->setCursor(Qt::ArrowCursor);
+    });
 
     // Should replace the other timer eventually
     expensiveScaleTimerNew = new QTimer(this);
@@ -77,12 +89,14 @@ void QVGraphicsView::resizeEvent(QResizeEvent *event)
 
 void QVGraphicsView::dropEvent(QDropEvent *event)
 {
+    if (event->source() == this) { event->ignore(); return; }
     QGraphicsView::dropEvent(event);
     loadMimeData(event->mimeData());
 }
 
 void QVGraphicsView::dragEnterEvent(QDragEnterEvent *event)
 {
+    if (event->source() == this) { event->ignore(); return; }
     QGraphicsView::dragEnterEvent(event);
     if (event->mimeData()->hasUrls()) {
         event->acceptProposedAction();
@@ -91,6 +105,7 @@ void QVGraphicsView::dragEnterEvent(QDragEnterEvent *event)
 
 void QVGraphicsView::dragMoveEvent(QDragMoveEvent *event)
 {
+    if (event->source() == this) { event->ignore(); return; }
     QGraphicsView::dragMoveEvent(event);
     event->acceptProposedAction();
 }
@@ -113,6 +128,19 @@ void QVGraphicsView::enterEvent(QEnterEvent *event)
 
 void QVGraphicsView::mousePressEvent(QMouseEvent *event)
 {
+    fileDragPending = fileDragGesture = false;
+    // Begin on the image rectangle (including transparent pixels), not on empty
+    // viewport space. Plain dragging continues to pan the image.
+    if (event->button() == Qt::LeftButton && event->modifiers() == Qt::ControlModifier
+            && getCurrentFileDetails().isPixmapLoaded && !getCurrentFileDetails().isModelDocument
+            && loadedPixmapItem->boundingRect().contains(loadedPixmapItem->mapFromScene(mapToScene(event->pos())))) {
+        mousePressButton = Qt::NoButton;
+        mousePressModifiers = Qt::NoModifier;
+        fileDragPending = fileDragGesture = true;
+        fileDragStart = event->pos();
+        event->accept();
+        return;
+    }
     const auto startWindowMove = [this, event]() {
 #ifdef COCOA_LOADED
         return QVCocoaFunctions::startSystemMove(window());
@@ -132,9 +160,9 @@ void QVGraphicsView::mousePressEvent(QMouseEvent *event)
         mousePressPosition = event->pos();
     };
 
-    // Check for Ctrl/Cmd drag
+    // Ctrl/Cmd + Shift keeps window movement separate from file dragging.
     if (event->button() == Qt::LeftButton &&
-        event->modifiers().testFlag(Qt::ControlModifier) &&
+        event->modifiers() == (Qt::ControlModifier | Qt::ShiftModifier) &&
         qvApp->getSettingsManager().getBool(SettingsManager::Setting::CtrlDragWindow)) {
         const auto windowState = window()->windowState();
         if (!windowState.testFlag(Qt::WindowFullScreen)
@@ -169,6 +197,38 @@ void QVGraphicsView::mousePressEvent(QMouseEvent *event)
 
 void QVGraphicsView::mouseMoveEvent(QMouseEvent *event)
 {
+    if (fileDragGesture) {
+        event->accept();
+        if (!fileDragPending) return;
+        if (!event->buttons().testFlag(Qt::LeftButton) || event->modifiers() != Qt::ControlModifier) {
+            fileDragPending = false;
+            return;
+        }
+        if ((event->pos() - fileDragStart).manhattanLength() < QApplication::startDragDistance()) return;
+        fileDragPending = false;
+        emit cancelSlideshow();
+        QString error;
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        auto *mime = getFileDragMimeData(&error);
+        QApplication::restoreOverrideCursor();
+        if (!mime->hasUrls()) {
+            delete mime;
+            if (!error.isEmpty()) QToolTip::showText(event->globalPosition().toPoint(), error, viewport());
+            return;
+        }
+        auto *drag = new QDrag(this);
+        drag->setMimeData(mime);
+        drag->setPixmap(getLoadedPixmap().scaled(128, 128, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        drag->setHotSpot(QPoint(-12, -12));
+        // exec processes events: the user can close this window during a drag.
+        const QPointer<QVGraphicsView> guard(this);
+        executeFileDrag(drag);
+        if (guard) {
+            fileDragPending = fileDragGesture = false;
+            viewport()->setCursor(Qt::ArrowCursor);
+        }
+        return;
+    }
     if (mousePressButton == Qt::LeftButton) {
         if (mousePressModifiers.testFlag(Qt::ControlModifier)
             && !event->modifiers().testFlag(Qt::ControlModifier)) {
@@ -188,6 +248,12 @@ void QVGraphicsView::mouseMoveEvent(QMouseEvent *event)
 
 void QVGraphicsView::mouseReleaseEvent(QMouseEvent *event)
 {
+    if (fileDragGesture) {
+        fileDragPending = fileDragGesture = false;
+        viewport()->setCursor(Qt::ArrowCursor);
+        event->accept();
+        return;
+    }
     mousePressButton = Qt::NoButton;
     mousePressModifiers = Qt::NoModifier;
     QGraphicsView::mouseReleaseEvent(event);
@@ -299,6 +365,66 @@ void QVGraphicsView::wheelEvent(QWheelEvent *event)
 
 // Functions
 
+void QVGraphicsView::executeFileDrag(QDrag *drag)
+{
+    // Never offer a move operation: dropping into a file manager must not remove
+    // the original or the PNG that an asynchronous browser upload may still read.
+    drag->exec(Qt::CopyAction, Qt::CopyAction);
+}
+
+QMimeData *QVGraphicsView::getFileDragMimeData(QString *error)
+{
+    auto *mime = new QMimeData;
+    if (error) error->clear();
+    if (!getCurrentFileDetails().isPixmapLoaded || getCurrentFileDetails().isModelDocument) return mime;
+    const auto replacement = dragImageProvider ? dragImageProvider() : std::nullopt;
+    QString path = getCurrentFileDetails().fileInfo.absoluteFilePath();
+    if (replacement) {
+        const auto &image = *replacement;
+        if (image.isNull()) {
+            if (error) *error = QStringLiteral("受け渡し用のSR画像を用意できません。メモリーの空きを確認してください。");
+            return mime;
+        }
+        // Keep immutable exports beyond the drag/window lifetime: browsers read
+        // File objects asynchronously after the native drop has completed.
+        bool reuse = image.cacheKey() == exportedImageKey && QFileInfo(exportedImagePath).isReadable();
+        if (reuse) {
+            QFile cached(exportedImagePath);
+            reuse = cached.open(QIODevice::ReadWrite) && cached.setFileTime(QDateTime::currentDateTimeUtc(), QFileDevice::FileModificationTime);
+        }
+        if (!reuse) {
+            const auto cache = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+            const QDir directory(cache + "/drag-exports");
+            if (cache.isEmpty() || !QDir().mkpath(directory.absolutePath())) {
+                if (error) *error = QStringLiteral("受け渡し用PNGの保存先を作成できません。");
+                return mime;
+            }
+            const auto cutoff = QDateTime::currentDateTimeUtc().addDays(-1);
+            for (const auto &file : directory.entryInfoList({"qviewsr-sr-*.png"}, QDir::Files | QDir::NoSymLinks))
+                if (file.lastModified() < cutoff) QFile::remove(file.absoluteFilePath());
+            const auto target = directory.filePath("qviewsr-sr-" + QUuid::createUuid().toString(QUuid::WithoutBraces) + ".png");
+            QSaveFile file(target);
+            QImageWriter writer(&file, "png");
+            writer.setCompression(1); // Favor drag startup time; PNG stays lossless.
+            if (!file.open(QIODevice::WriteOnly) || !writer.write(image) || !file.commit()) {
+                if (error) *error = QStringLiteral("受け渡し用PNGを保存できません: ") + (file.error() != QFileDevice::NoError ? file.errorString() : writer.errorString());
+                return mime;
+            }
+            exportedImagePath = target;
+            exportedImageKey = image.cacheKey();
+        }
+        path = exportedImagePath;
+    }
+    if (!QFileInfo(path).isFile() || !QFileInfo(path).isReadable()) {
+        if (error) *error = QStringLiteral("受け渡す画像ファイルを読み込めません: ") + path;
+        return mime;
+    }
+    // A real local-file URL becomes a browser File, preserving bytes/metadata.
+    // Do not add imageData: some browsers would synthesize a second bitmap file.
+    mime->setUrls({QUrl::fromLocalFile(path)});
+    return mime;
+}
+
 QMimeData *QVGraphicsView::getMimeData() const
 {
     auto *mimeData = new QMimeData();
@@ -340,7 +466,7 @@ void QVGraphicsView::loadFile(const QString &fileName)
 
 void QVGraphicsView::reloadFile()
 {
-    if (!getCurrentFileDetails().isPixmapLoaded)
+    if (!getCurrentFileDetails().isPixmapLoaded && !getCurrentFileDetails().isModelDocument)
         return;
 
     imageCore.loadFile(getCurrentFileDetails().fileInfo.absoluteFilePath(), true);

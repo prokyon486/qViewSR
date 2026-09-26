@@ -17,6 +17,7 @@
 #include <QLabel>
 #include <QScrollBar>
 #include <QFileDialog>
+#include <QStandardPaths>
 #include "sr/gif_export.h"
 #include "qvapplication.h"
 #include "sr/color_pipeline.h"
@@ -105,6 +106,81 @@ private slots:
         auto invalid=profile; invalid.icc="invalid ICC";
         QVERIFY(Sr::toSrgb(raw,invalid,&error).isNull());
         QVERIFY(!error.isEmpty());
+    }
+    void dragDisplayedResult() {
+        QString error;
+        std::unique_ptr<QMimeData> original(view->getFileDragMimeData(&error));
+        QCOMPARE(original->urls(),QList<QUrl>{QUrl::fromLocalFile(sourcePath)});
+        QCOMPARE(original->formats(),QStringList{"text/uri-list"}); QVERIFY(!original->hasImage());
+        QSignalSpy ready(controller,&Sr::Controller::resultReady); click("srRun");
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        QFile monitor(files.filePath("drag-monitor.icc")); QVERIFY(monitor.open(QIODevice::WriteOnly));
+        monitor.write(QColorSpace(QColorSpace::AdobeRgb).iccProfile()); monitor.close();
+        auto alternate = config; alternate.displayProfile = monitor.fileName(); controller->setConfiguration(alternate);
+        view->originalSize(); view->zoom(2.5);
+        std::unique_ptr<QMimeData> sr(view->getFileDragMimeData(&error));
+        QVERIFY2(error.isEmpty(),qPrintable(error)); QCOMPARE(sr->urls().size(),1); QVERIFY(!sr->hasImage());
+        const auto path = sr->urls().first().toLocalFile(); QVERIFY(path != sourcePath);
+        const QImage snapshot(path);
+        QCOMPARE(snapshot,controller->resultImage().convertToFormat(snapshot.format())); QCOMPARE(snapshot.colorSpace(),QColorSpace(QColorSpace::SRgb));
+        QVERIFY(snapshot.pixelColor(50,50)!=view->getLoadedPixmap().toImage().pixelColor(50,50));
+        std::unique_ptr<QMimeData> repeated(view->getFileDragMimeData(&error)); QCOMPARE(repeated->urls(),sr->urls());
+        view->rotateImage(90);
+        std::unique_ptr<QMimeData> rotated(view->getFileDragMimeData(&error));
+        QCOMPARE(QImage(rotated->urls().first().toLocalFile()).size(),QSize(192,256));
+        QCOMPARE(QImage(path),snapshot); // A later drag cannot overwrite an in-flight upload.
+        click("srToggle");
+        std::unique_ptr<QMimeData> restored(view->getFileDragMimeData(&error)); QCOMPARE(restored->urls(),original->urls());
+        cleanup(); // The receiving browser can read the file after this window has closed.
+        QCOMPARE(QImage(path),snapshot);
+    }
+    void dragCurrentAnimationFrame() {
+        const auto gif = gifFixture(); loadAnimation(gif);
+        QSignalSpy ready(controller,&Sr::Controller::resultReady); click("srRun");
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000); controller->setAnimationPaused(true);
+        QString error;
+        std::unique_ptr<QMimeData> first(view->getFileDragMimeData(&error)); QVERIFY2(error.isEmpty(),qPrintable(error));
+        const auto firstPath = first->urls().first().toLocalFile(); const auto snapshot = controller->resultImage().convertToFormat(QImage::Format_ARGB32);
+        QCOMPARE(QImage(firstPath),snapshot);
+        window->mirror();
+        std::unique_ptr<QMimeData> mirrored(view->getFileDragMimeData(&error));
+        QCOMPARE(QImage(mirrored->urls().first().toLocalFile()),snapshot.mirrored(true,false));
+        window->flip();
+        std::unique_ptr<QMimeData> flipped(view->getFileDragMimeData(&error));
+        QCOMPARE(QImage(flipped->urls().first().toLocalFile()),snapshot.mirrored(true,true));
+        window->mirror(); window->flip();
+        controller->stepAnimation();
+        std::unique_ptr<QMimeData> next(view->getFileDragMimeData(&error));
+        QVERIFY(next->urls()!=first->urls()); QCOMPARE(QImage(next->urls().first().toLocalFile()),controller->resultImage().convertToFormat(QImage::Format_ARGB32));
+        QCOMPARE(QImage(firstPath),snapshot);
+        controller->toggle();
+        std::unique_ptr<QMimeData> original(view->getFileDragMimeData(&error));
+        QCOMPARE(original->urls(),QList<QUrl>{QUrl::fromLocalFile(gif)});
+    }
+    void dragExportFailureAndExpiry() {
+        QSignalSpy ready(controller,&Sr::Controller::resultReady); click("srRun");
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        const auto cacheRoot = qgetenv("XDG_CACHE_HOME");
+        const auto blocker = files.filePath("blocked-cache");
+        { QFile file(blocker); QVERIFY(file.open(QIODevice::WriteOnly)); file.write("not a directory"); }
+        qputenv("XDG_CACHE_HOME",blocker.toUtf8());
+        QString error; std::unique_ptr<QMimeData> failed(view->getFileDragMimeData(&error));
+        qputenv("XDG_CACHE_HOME",cacheRoot);
+        QVERIFY(!failed->hasUrls()); QVERIFY(!error.isEmpty()); QVERIFY(controller->showingSr());
+        const QDir cache(QStandardPaths::writableLocation(QStandardPaths::CacheLocation)+"/drag-exports");
+        QVERIFY(QDir().mkpath(cache.absolutePath()));
+        for (const auto &name : {"qviewsr-sr-expired.png","keep.txt"}) {
+            QFile file(cache.filePath(name)); QVERIFY(file.open(QIODevice::WriteOnly)); file.write("old");
+            QVERIFY(file.flush());
+            QVERIFY(file.setFileTime(QDateTime::currentDateTimeUtc().addDays(-2),QFileDevice::FileModificationTime));
+        }
+        std::unique_ptr<QMimeData> valid(view->getFileDragMimeData(&error));
+        QVERIFY2(error.isEmpty(),qPrintable(error)); QCOMPARE(valid->urls().size(),1);
+        QVERIFY(!QFileInfo::exists(cache.filePath("qviewsr-sr-expired.png"))); QVERIFY(QFileInfo::exists(cache.filePath("keep.txt")));
+        view->setDragImageProvider([] { return std::optional<QImage>(QImage()); });
+        std::unique_ptr<QMimeData> missing(view->getFileDragMimeData(&error));
+        QVERIFY(!missing->hasUrls()); QVERIFY(!error.isEmpty()); // Never silently fall back to the original.
+        view->closeImage(); std::unique_ptr<QMimeData> empty(view->getFileDragMimeData(&error)); QVERIFY(!empty->hasUrls());
     }
     void runToggleExport() {
         view->originalSize(); view->zoom(1.5);
@@ -899,6 +975,7 @@ private slots:
 int main(int argc,char** argv) {
     QTemporaryDir settings;
     qputenv("XDG_CONFIG_HOME",settings.path().toUtf8());
+    qputenv("XDG_CACHE_HOME",settings.filePath("cache").toUtf8());
     QCoreApplication::setOrganizationName("qViewSR-tests");
     QCoreApplication::setApplicationName("qViewSR-tests");
     QSettings s; s.setValue("firstlaunch",true); s.setValue("updatenotifications",false); s.sync();

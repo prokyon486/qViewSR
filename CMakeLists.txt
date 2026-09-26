@@ -28,7 +28,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Find required Qt components
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Network Widgets Svg Concurrent)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Network Widgets Svg Concurrent QuickWidgets Quick3D)
 set(QT_VERSION_MAJOR 6)
 set(QT_VERSION ${Qt6_VERSION})
 
@@ -53,6 +53,8 @@ set(PROJECT_SOURCES
     src/sr/color_pipeline.cpp
     src/sr/sr_controller.cpp
     src/sr/gif_export.cpp
+    src/model3d/glb_document.cpp
+    src/model3d/model_view.cpp
 )
 
 # Header files
@@ -74,6 +76,8 @@ set(PROJECT_HEADERS
     src/sr/color_pipeline.h
     src/sr/sr_controller.h
     src/sr/gif_export.h
+    src/model3d/glb_document.h
+    src/model3d/model_view.h
 )
 
 # UI form files
@@ -137,7 +141,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(LCMS2 REQUIRED IMPORTED_TARGET lcms2)
 find_package(ZLIB REQUIRED)
 find_package(GIF 5.1 REQUIRED)
-target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Concurrent PkgConfig::LCMS2 ZLIB::ZLIB GIF::GIF)
+target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Concurrent Qt6::QuickWidgets Qt6::Quick3D PkgConfig::LCMS2 ZLIB::ZLIB GIF::GIF)
 target_include_directories(${PROJECT_NAME} PRIVATE src)
 
 # Set the executable name to lowercase on Linux
