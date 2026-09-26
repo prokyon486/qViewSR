@@ -332,10 +332,10 @@
           <item row="15" column="1">
            <widget class="QCheckBox" name="ctrlDragCheckbox">
             <property name="toolTip">
-             <string>Enable %1 + drag to move the window</string>
+             <string>Enable %1 + Shift + drag to move the window. %1 + drag on an image copies it to another application.</string>
             </property>
             <property name="text">
-             <string>%1 + drag to move window</string>
+             <string>%1 + Shift + drag to move window</string>
             </property>
             <property name="checked">
              <bool>false</bool>
