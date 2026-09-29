@@ -7,4 +7,7 @@
     <qresource prefix="/images">
         <file>checkmark.png</file>
     </qresource>
+    <qresource prefix="/model3d">
+        <file alias="Scene.qml">model3d/Scene.qml</file>
+    </qresource>
 </RCC>

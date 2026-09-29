@@ -8,6 +8,10 @@
 #include <QDir>
 #include <QTimer>
 #include <QFileInfo>
+#include <functional>
+#include <optional>
+
+class QDrag;
 
 class QVGraphicsView : public QGraphicsView
 {
@@ -23,6 +27,9 @@ public:
     Q_ENUM(GoToFileMode)
 
     QMimeData *getMimeData() const;
+    QMimeData *getFileDragMimeData(QString *error = nullptr);
+    // nullopt selects the original file; an empty image reports export failure.
+    void setDragImageProvider(std::function<std::optional<QImage>()> provider) { dragImageProvider = std::move(provider); }
     void loadMimeData(const QMimeData *mimeData);
     void loadFile(const QString &fileName);
 
@@ -90,6 +97,7 @@ protected:
     void mouseMoveEvent(QMouseEvent *event) override;
 
     void mouseReleaseEvent(QMouseEvent *event) override;
+    virtual void executeFileDrag(QDrag *drag);
 
     bool event(QEvent *event) override;
 
@@ -138,5 +146,11 @@ private:
     Qt::MouseButton mousePressButton;
     Qt::KeyboardModifiers mousePressModifiers;
     QPoint mousePressPosition;
+    bool fileDragPending = false;
+    bool fileDragGesture = false;
+    QPoint fileDragStart;
+    std::function<std::optional<QImage>()> dragImageProvider;
+    qint64 exportedImageKey = 0;
+    QString exportedImagePath;
 };
 #endif // QVGRAPHICSVIEW_H

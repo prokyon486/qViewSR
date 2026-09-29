@@ -50,6 +50,7 @@ public:
         bool isLoadRequested = false;
         bool isPixmapLoaded = false;
         bool isMovieLoaded = false;
+        bool isModelDocument = false;
         QSize baseImageSize;
         QSize loadedPixmapSize;
         QElapsedTimer timeSinceLoaded;

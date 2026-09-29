@@ -226,6 +226,15 @@ Controller::Controller(MainWindow* window,QVGraphicsView* view)
     connect(settings_,&QAction::triggered,this,&Controller::showSettings);
     connect(&view_->getImageCore(),&QVImageCore::sourceChanging,this,&Controller::invalidate);
     connect(view_,&QVGraphicsView::fileChanged,this,&Controller::sourceLoaded);
+    view_->setDragImageProvider([this]() -> std::optional<QImage> {
+        // Export the full-resolution sRGB result/current animation frame, never
+        // the monitor-profile pixels or the zoomed/cropped viewport.
+        if (!showingSr_) return std::nullopt;
+        if (!sourceReady_) return QImage();
+        const auto image = view_->getImageCore().matchCurrentRotation(result_);
+        const auto transform = view_->transform();
+        return image.mirrored(transform.m11() < 0, transform.m22() < 0);
+    });
     watchdog_.setSingleShot(true);
     connect(&watchdog_,&QTimer::timeout,this,[this] {
         if(!job_) return;
@@ -247,6 +256,7 @@ Controller::Controller(MainWindow* window,QVGraphicsView* view)
     updateActions();
 }
 Controller::~Controller() {
+    view_->setDragImageProvider({});
     animationTimer_.stop(); watchdog_.stop();
     if(job_) job_->cancelled=true;
     if(exportCancelled_) *exportCancelled_=true;
@@ -257,7 +267,10 @@ void Controller::setStatus(QString text) {
     text.replace("\r\n","\n"); text.replace('\r','\n');
     status_->setText(text.section('\n',0,0).replace('\t',' '));
 }
-void Controller::setFullscreen(bool fullscreen) { toolbar_->setVisible(!fullscreen); }
+void Controller::setFullscreen(bool fullscreen) {
+    fullscreen_ = fullscreen;
+    toolbar_->setVisible(!fullscreen_ && !view_->getCurrentFileDetails().isModelDocument);
+}
 QString Controller::statusText() const { return status_->text(); }
 qint64 Controller::backendPid() const { return worker_?worker_->processId():0; }
 void Controller::setConfiguration(const Configuration& config) {
@@ -277,6 +290,8 @@ void Controller::invalidate() {
     cancel(); updateActions();
 }
 void Controller::sourceLoaded() {
+    toolbar_->setVisible(!fullscreen_ && !view_->getCurrentFileDetails().isModelDocument);
+    if(!view_->getCurrentFileDetails().isModelDocument) ensureWorker();
     sourceReady_=!view_->getImageCore().getSourceImage().isNull();
     if(!job_) {
         setStatus(sourceReady_?QStringLiteral("元画像 · ")+view_->getImageCore().getSourceProfile().description:
@@ -487,7 +502,7 @@ void Controller::restartWorker() {
     QTimer::singleShot(10000,process,[process] { if(process && process->state()!=QProcess::NotRunning) process->kill(); });
 }
 void Controller::ensureWorker() {
-    if(worker_ || stoppingWorker_) return;
+    if(worker_ || stoppingWorker_ || view_->getCurrentFileDetails().isModelDocument) return;
     const auto config=configuration_;
     if(!QFileInfo(config.workerPath).isExecutable() || !QFileInfo::exists(config.modelPath) ||
        !QFileInfo::exists(config.runtimeRoot+"/deployment_tools/inference_engine/lib/intel64/libmyriadPlugin.so")) return;

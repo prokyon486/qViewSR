@@ -4,6 +4,8 @@
 
 #include <QCommandLineParser>
 #include <QTextStream>
+#include <QtQuick3D/qquick3d.h>
+#include <QSurfaceFormat>
 
 int main(int argc, char *argv[])
 {
@@ -18,7 +20,7 @@ int main(int argc, char *argv[])
     QCommandLineParser parser;
     parser.addHelpOption();
     parser.addVersionOption();
-    parser.addOption({"supported-mime-types", "List supported image MIME types and exit."});
+    parser.addOption({"supported-mime-types", "List supported image/GLB MIME types and exit."});
     parser.addPositionalArgument(QObject::tr("file"), QObject::tr("The file to open."));
 #if defined Q_OS_WIN && WIN32_LOADED && QT_VERSION < QT_VERSION_CHECK(6, 7, 2)
     // Workaround for unicode characters getting mangled in certain cases. To support unicode
@@ -38,6 +40,7 @@ int main(int argc, char *argv[])
         return 0;
     }
 
+    QSurfaceFormat::setDefaultFormat(QQuick3D::idealSurfaceFormat());
     auto *window = QVApplication::newWindow();
     if (!parser.positionalArguments().isEmpty())
         QVApplication::openFile(window, parser.positionalArguments().constFirst(), true);

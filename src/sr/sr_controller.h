@@ -114,6 +114,7 @@ private:
     QImage result_;
     std::shared_ptr<std::atomic_bool> exportCancelled_;
     bool showingSr_ = false, sourceReady_ = false, saving_ = false;
+    bool fullscreen_ = false;
     quint64 generation_ = 0;
     QString resultSummary_;
     double resultScale_ = 1.0;

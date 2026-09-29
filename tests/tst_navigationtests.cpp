@@ -2,9 +2,22 @@
 #include <QtTest>
 #include <QDateTime>
 #include <QThreadPool>
+#include <QDrag>
+#include <QScrollBar>
 #include <algorithm>
 #include "qvapplication.h"
 #include "qvgraphicsview.h"
+
+class RecordingDragView : public QVGraphicsView {
+public:
+    int drags = 0;
+    QList<QUrl> urls;
+protected:
+    void executeFileDrag(QDrag *drag) override {
+        ++drags; urls = drag->mimeData()->urls();
+        drag->deleteLater();
+    }
+};
 
 class NavigationTests : public QObject
 {
@@ -52,6 +65,78 @@ private slots:
             window->close();
             QTRY_VERIFY(window.isNull());
         }
+    }
+    void externalDragGesture()
+    {
+        const auto path = files.filePath("_日本語 #50% & +.png");
+        QImage image(640,480,QImage::Format_RGB32); image.fill(Qt::cyan); QVERIFY(image.save(path));
+        QSettings().setValue("options/ctrldragwindow",true); qvApp->getSettingsManager().loadSettings();
+        RecordingDragView dragView; dragView.resize(320,240); dragView.show(); dragView.loadFile(path);
+        QTRY_VERIFY(dragView.getCurrentFileDetails().isPixmapLoaded); dragView.originalSize();
+        const QPoint start = dragView.viewport()->rect().center();
+        const auto scroll = [&] { return QPoint(dragView.horizontalScrollBar()->value(),dragView.verticalScrollBar()->value()); };
+        const auto move = [&](QPoint point, Qt::KeyboardModifiers modifiers) {
+            QMouseEvent event(QEvent::MouseMove,point,dragView.viewport()->mapToGlobal(point),Qt::NoButton,Qt::LeftButton,modifiers);
+            QApplication::sendEvent(dragView.viewport(),&event);
+        };
+        const auto initial = scroll();
+        // A click and a small movement must not export or pan, even if the old
+        // Ctrl-drag-window option was enabled before upgrading.
+        QTest::mousePress(dragView.viewport(),Qt::LeftButton,Qt::ControlModifier,start);
+        move(start+QPoint(1,0),Qt::ControlModifier);
+        QCOMPARE(dragView.drags,0); QCOMPARE(scroll(),initial);
+        QTest::mouseRelease(dragView.viewport(),Qt::LeftButton,Qt::ControlModifier,start);
+        QTest::mousePress(dragView.viewport(),Qt::LeftButton,Qt::ControlModifier,start);
+        move(start+QPoint(QApplication::startDragDistance()+20,0),Qt::ControlModifier);
+        QCOMPARE(dragView.drags,1); QCOMPARE(dragView.urls,QList<QUrl>{QUrl::fromLocalFile(path)}); QCOMPARE(scroll(),initial);
+        QTest::mouseRelease(dragView.viewport(),Qt::LeftButton,Qt::ControlModifier,start);
+        QTest::mousePress(dragView.viewport(),Qt::LeftButton,Qt::ControlModifier,start);
+        move(start+QPoint(1,0),Qt::NoModifier);
+        move(start+QPoint(50,0),Qt::ControlModifier);
+        QTest::mouseRelease(dragView.viewport(),Qt::LeftButton,Qt::ControlModifier,start);
+        QCOMPARE(dragView.drags,1); QCOMPARE(scroll(),initial);
+        // Ordinary panning still works after a completed or cancelled export.
+        QTest::mousePress(dragView.viewport(),Qt::LeftButton,Qt::NoModifier,start);
+        move(start+QPoint(40,20),Qt::NoModifier);
+        QTest::mouseRelease(dragView.viewport(),Qt::LeftButton,Qt::NoModifier,start+QPoint(40,20));
+        QVERIFY(scroll()!=initial); QCOMPARE(dragView.drags,1);
+        // A file switch cancels a pending drag rather than exporting the wrong image.
+        QTest::mousePress(dragView.viewport(),Qt::LeftButton,Qt::ControlModifier,start);
+        dragView.loadFile(files.filePath("mixed/_1.PNG"));
+        QTRY_COMPARE(dragView.getCurrentFileDetails().fileInfo.fileName(),QString("_1.PNG"));
+        move(start+QPoint(50,0),Qt::ControlModifier);
+        QTest::mouseRelease(dragView.viewport(),Qt::LeftButton,Qt::ControlModifier,start);
+        QCOMPARE(dragView.drags,1);
+        QSettings().setValue("options/ctrldragwindow",false); qvApp->getSettingsManager().loadSettings();
+        QVERIFY(QFile::remove(path));
+    }
+    void nativeDragContract()
+    {
+        if (!qEnvironmentVariableIsSet("QVIEWSR_TEST_DRAG")) QSKIP("Set QVIEWSR_TEST_DRAG=1 on a desktop to exercise the native QDrag loop.");
+        const auto path = files.filePath("mixed/_1.PNG");
+        QVGraphicsView native; native.resize(320,240); native.show(); native.loadFile(path);
+        QTRY_VERIFY(native.getCurrentFileDetails().isPixmapLoaded); QVERIFY(QTest::qWaitForWindowExposed(&native));
+        const QPoint start = native.viewport()->rect().center();
+        bool inspected = false, copyOnly = false, selfIgnored = false;
+        QList<QUrl> urls;
+        QTimer::singleShot(50,&native,[&] {
+            if (auto *drag = native.findChild<QDrag *>()) {
+                inspected = true; copyOnly = drag->supportedActions() == Qt::CopyAction && drag->defaultAction() == Qt::CopyAction;
+                urls = drag->mimeData()->urls();
+                QDragEnterEvent enter(start,Qt::CopyAction,drag->mimeData(),Qt::LeftButton,Qt::ControlModifier);
+                QApplication::sendEvent(native.viewport(),&enter);
+                selfIgnored = enter.source() == &native && !enter.isAccepted();
+            }
+            QDrag::cancel();
+        });
+        QTimer::singleShot(3000,&native,[] { QDrag::cancel(); });
+        QTest::mousePress(native.viewport(),Qt::LeftButton,Qt::ControlModifier,start);
+        const QPoint end = start+QPoint(QApplication::startDragDistance()+10,0);
+        QMouseEvent event(QEvent::MouseMove,end,native.viewport()->mapToGlobal(end),Qt::NoButton,Qt::LeftButton,Qt::ControlModifier);
+        QApplication::sendEvent(native.viewport(),&event);
+        QTest::mouseRelease(native.viewport(),Qt::LeftButton,Qt::ControlModifier,end);
+        QVERIFY(inspected); QVERIFY(copyOnly); QVERIFY(selfIgnored); QCOMPARE(urls,QList<QUrl>{QUrl::fromLocalFile(path)});
+        QVERIFY(QFileInfo::exists(path)); QCOMPARE(native.getCurrentFileDetails().fileInfo.absoluteFilePath(),path);
     }
     void refreshKeepsOrder_data()
     {

@@ -1221,12 +1221,12 @@ No write permission or file is read-only.</source>
         <translation>ダークモードを使用</translation>
     </message>
     <message>
-        <source>Enable %1 + drag to move the window</source>
-        <translation>%1 + ドラッグでウィンドウを移動する</translation>
+        <source>Enable %1 + Shift + drag to move the window. %1 + drag on an image copies it to another application.</source>
+        <translation>%1 + Shift + ドラッグでウィンドウを移動します。画像上の %1 + ドラッグは別のアプリへのコピーです。</translation>
     </message>
     <message>
-        <source>%1 + drag to move window</source>
-        <translation>%1 + ドラッグでウィンドウを移動</translation>
+        <source>%1 + Shift + drag to move window</source>
+        <translation>%1 + Shift + ドラッグでウィンドウを移動</translation>
     </message>
     <message>
         <source>When enabled, the scrolling action zooms the image</source>

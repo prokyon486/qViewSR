@@ -1,4 +1,5 @@
 ﻿#include "qvimagecore.h"
+#include "model3d/glb_document.h"
 #include "qvapplication.h"
 #include "qvwin32functions.h"
 #include "qvcocoafunctions.h"
@@ -81,6 +82,20 @@ void QVImageCore::loadFile(const QString &fileName, bool isReloading)
             closeImage();
         else
             loadFile(currentFileDetails.folderFileInfoList.at(0).absoluteFilePath);
+        return;
+    }
+
+    if (Model3D::isGlb(sanitaryFileName)) {
+        // Keep a single navigator for images and models, without attempting QImage decoding
+        // or putting model data into the image cache. The window owns the 3D renderer.
+        currentFileDetails = getEmptyFileDetails();
+        currentFileDetails.fileInfo = fileInfo;
+        currentFileDetails.isLoadRequested = true;
+        currentFileDetails.isModelDocument = true;
+        currentFileDetails.updateLoadedIndexInFolder();
+        if (currentFileDetails.loadedIndexInFolder == -1) updateFolderInfo();
+        currentFileDetails.timeSinceLoaded.start();
+        loadEmptyPixmap();
         return;
     }
 
@@ -222,6 +237,7 @@ void QVImageCore::loadPixmap(const ReadData &readData)
     loadedPixmap = QPixmap::fromImage(matchCurrentRotation(readData.image));
 
     // Set file details
+    currentFileDetails.isModelDocument = false;
     currentFileDetails.isPixmapLoaded = true;
     currentFileDetails.baseImageSize = readData.imageSize;
     currentFileDetails.loadedPixmapSize = loadedPixmap.size();
@@ -285,6 +301,7 @@ QVImageCore::FileDetails QVImageCore::getEmptyFileDetails()
     return { QFileInfo(),
              currentFileDetails.folderFileInfoList,
              currentFileDetails.loadedIndexInFolder,
+             false,
              false,
              false,
              false,
@@ -482,6 +499,7 @@ void QVImageCore::requestCaching()
 
 void QVImageCore::requestCachingFile(const QString &filePath, const QColorSpace &targetColorSpace)
 {
+    if (Model3D::isGlb(filePath)) return;
     QFile imgFile(filePath);
     QString cacheKey = getPixmapCacheKey(filePath, imgFile.size(), targetColorSpace);
 
