@@ -1,0 +1,232 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 70a88e1..7196a76 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -1,137 +1,27 @@
+-name: Build qView
++name: Build and test qViewSR
+ on:
+   push:
+   pull_request:
+   workflow_dispatch:
+-    inputs:
+-      isRelease:
+-        type: boolean
+-        description: 'Is this a release build?'
+-        required: false
+-        default: false
+-      appleNotarize:
+-        type: boolean
+-        description: 'Notarize with Apple?'
+-        required: false
+-        default: false
++permissions:
++  contents: read
+ jobs:
+-  build:
+-    strategy:
+-      matrix:
+-        include:
+-          - runner: 'ubuntu-22.04'
+-            qtVersion: '5.15.2'
+-          - runner: 'macos-14'
+-            qtVersion: '6.8.3'
+-            qtModules: 'qtimageformats'
+-            buildArch: 'Universal'
+-          - runner: 'macos-14'
+-            qtVersion: '5.15.2'
+-            osSuffix: '_legacy'
+-            buildArch: 'X64'
+-          - runner: 'windows-2022'
+-            qtVersion: '6.8.3'
+-            qtArch: 'win64_msvc2022_64'
+-            osSuffix: '_64'
+-            qtModules: 'qtimageformats'
+-          - runner: 'windows-2022'
+-            qtVersion: '6.8.3'
+-            qtArch: 'win64_msvc2022_arm64_cross_compiled'
+-            osSuffix: '_arm64'
+-            qtModules: 'qtimageformats'
+-            buildArch: 'Arm64'
+-          - runner: 'windows-2022'
+-            qtVersion: '5.15.2'
+-            qtArch: 'win32_msvc2019'
+-            osSuffix: '_32'
+-            buildArch: 'X86'
+-    runs-on: ${{ matrix.runner }}
++  linux:
++    runs-on: ubuntu-24.04
++    timeout-minutes: 20
+     steps:
+-      - name: Set environment variables
+-        shell: bash
+-        run: |
+-          echo "qtArch=${{ matrix.qtArch }}" >> $GITHUB_ENV
+-          echo "buildArch=${{ matrix.buildArch }}" >> $GITHUB_ENV
+-          if [ "${{ inputs.isRelease }}" != "true" ]; then
+-            buildNum=$(date '+%Y-%m-%d').$GITHUB_RUN_ATTEMPT
+-            echo "nightlyDefines=NIGHTLY=$buildNum" >> $GITHUB_ENV
+-            echo "nightlyString=-nightly" >> $GITHUB_ENV
+-            echo "buildNumString=$buildNum" >> $GITHUB_ENV
+-          fi
+-
+       - uses: actions/checkout@v4
+-
+-      - name: Install Qt
+-        uses: jurplel/install-qt-action@v4
+-        with:
+-          version: ${{ matrix.qtVersion }}
+-          arch: ${{ matrix.qtArch }}
+-          cache: true
+-          modules: ${{ matrix.qtModules }}
+-
+-      - name: Build qView
+-        shell: pwsh
+-        run: dist/scripts/build.ps1 -CI
+-
+-      - name: Deploy qView
+-        env:
+-          APPLE_NOTARIZE_REQUESTED: ${{ inputs.appleNotarize }}
+-          APPLE_DEVID_APP_CERT_DATA: ${{ secrets.APPLE_DEVID_APP_CERT_DATA }}
+-          APPLE_DEVID_APP_CERT_PASS: ${{ secrets.APPLE_DEVID_APP_CERT_PASS }}
+-          APPLE_ID_USER: ${{ secrets.APPLE_ID_USER }}
+-          APPLE_ID_PASS: ${{ secrets.APPLE_ID_PASS }}
+-        shell: pwsh
+-        run: |
+-          if ("${{ matrix.skipPlugins }}" -ne "true") {
+-            & dist/scripts/download-plugins.ps1
+-          }
+-          if ($IsWindows) {
+-            & dist/scripts/windeployqt.ps1 ${{ env.buildNumString }}
+-          } elseif ($IsMacOS) {
+-            & dist/scripts/macinstallcert.ps1
+-            bash dist/scripts/macdeploy.sh ${{ env.buildNumString }}
+-          } else {
+-            bash dist/scripts/linuxdeployqt.sh ${{ env.buildNumString }}
+-          }
+-
+-      - name: 'Upload Artifact'
++      - name: Install build dependencies
++        run: sudo bash tools/install_build_deps.sh
++      - name: Build viewer and pinned worker, run tests
++        run: bash tools/build_qviewsr.sh
++      - name: Upload test logs
++        if: always()
+         uses: actions/upload-artifact@v4
+         with:
+-          name: qView${{ env.nightlyString }}-${{ runner.os }}${{ matrix.osSuffix }}-${{ env.buildNumString }}
+-          path: bin
+-
+-  nightly-release:
+-    needs: build
+-    if: github.ref_name == 'master' && github.event_name == 'push'
+-    runs-on: ubuntu-latest
+-    steps:
+-      - name: Download all artifacts
+-        uses: actions/download-artifact@v4
+-        with:
+-          path: artifacts
+-
+-      - name: List downloaded files
+-        run: ls -l artifacts/
+-
+-      - name: Package artifacts for release
+-        run: |
+-          mkdir release_files
+-          cd artifacts
+-          for dir in */ a; do
+-            zip -r "../release_files/$(basename "$dir").zip" "$dir"
+-          done
+-          cd ..
+-          ls -l release_files/
+-
+-      - name: Update "Nightly" Release
+-        uses: andelf/nightly-release@main
+-        env:
+-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-        with:
+-          tag_name: nightly
+-          name: "qView Nightly"
+-          prerelease: true
+-          body: |
+-            Latest automatic build from the master branch. Might be broken.
+-
+-          files: release_files/*.zip
++          name: qviewsr-test-logs
++          path: |
++            build/gui/Testing/Temporary/LastTest.log
++            build/worker/Testing/Temporary/LastTest.log
++# Real NCS/NCS2 and X11 monitor-profile checks run on the local hardware host.
++# Upstream Qt 5 packaging/release jobs do not apply to this Linux Qt 6 prototype.
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+deleted file mode 100644
+index 54fb0e3..0000000
+--- a/.github/workflows/test.yml
++++ /dev/null
+@@ -1,66 +0,0 @@
+-name: Checks
+-
+-on:
+-  push:
+-  pull_request:
+-
+-jobs:
+-  unit-tests:
+-    name: Run Unit Tests
+-    runs-on: ubuntu-latest
+-    steps:
+-      - uses: actions/checkout@v4
+-
+-      - name: Install Qt
+-        uses: jurplel/install-qt-action@v4
+-        with:
+-          version: '6.8'
+-          cache: true
+-          modules: 'qtimageformats'
+-
+-      - name: Configure CMake
+-        run: cmake -B build -DBUILD_TESTS=ON
+-
+-      - name: Build
+-        run: cmake --build build --parallel
+-
+-      - name: Run tests
+-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" ctest --test-dir build
+-
+-  clang-tidy:
+-    name: Run clang-tidy
+-    runs-on: ubuntu-latest
+-    steps:
+-      - uses: actions/checkout@v4
+-
+-      - name: Install Qt
+-        uses: jurplel/install-qt-action@v4
+-        with:
+-          version: '6.8'
+-          cache: true
+-          modules: 'qtimageformats'
+-
+-      - name: Install clang-tidy
+-        run: sudo apt-get update && sudo apt-get install -y clang-tidy
+-
+-      - name: Run clang-tidy
+-        run: ./build.sh --tidy
+-
+-    format:
+-      name: Run clang-format
+-      runs-on: ubuntu-latest
+-      steps:
+-        - uses: actions/checkout@v4
+-
+-        - name: Install Qt
+-          uses: jurplel/install-qt-action@v4
+-          with:
+-            version: '6.8'
+-            cache: true
+-            modules: 'qtimageformats'
+-
+-        - name: Install clang-format
+-          run: sudo apt-get update && sudo apt-get install -y clang-format
+-
+-        - name: Run clang-format
+-          run: ./build.sh --format-check

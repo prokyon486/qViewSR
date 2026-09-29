@@ -49,3 +49,8 @@ build/*
 
 *.qm
 .qm
+
+# qViewSR local runtime, models and diagnostic output
+/.local/
+/diagnostics/local/
+__pycache__/

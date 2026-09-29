@@ -325,6 +325,10 @@
         <extracomment>Open with other program for macos</extracomment>
         <translation>その他...</translation>
     </message>
+    <message>
+        <source>Hide Title&amp;bar</source>
+        <translation>タイトルバーを隠す</translation>
+    </message>
 </context>
 <context>
     <name>MainWindow</name>
@@ -437,7 +441,8 @@ No write permission or file is read-only.</source>
         <source>Error occurred opening
 %3
 %2 (Error %1)</source>
-        <translation type="unfinished"></translation>
+        <translation>%3 を開く際にエラーが発生しました
+%2（エラー %1）</translation>
     </message>
     <message>
         <location filename="../src/mainwindow.cpp" line="855"/>
@@ -531,7 +536,7 @@ No write permission or file is read-only.</source>
     <message>
         <location filename="../src/qvaboutdialog.cpp" line="47"/>
         <source>Nightly %1</source>
-        <translation type="unfinished"></translation>
+        <translation>開発版 %1</translation>
     </message>
     <message>
         <location filename="../src/qvaboutdialog.cpp" line="62"/>
@@ -996,7 +1001,7 @@ No write permission or file is read-only.</source>
     <message>
         <location filename="../src/qvoptionsdialog.ui" line="486"/>
         <source>Display P3</source>
-        <translation type="unfinished"></translation>
+        <translation>Display P3</translation>
     </message>
     <message>
         <location filename="../src/qvoptionsdialog.ui" line="495"/>
@@ -1062,7 +1067,7 @@ No write permission or file is read-only.</source>
     <message>
         <location filename="../src/qvoptionsdialog.ui" line="17"/>
         <source>Settings</source>
-        <translation type="unfinished">設定</translation>
+        <translation>設定</translation>
     </message>
     <message>
         <location filename="../src/qvoptionsdialog.ui" line="524"/>
@@ -1097,7 +1102,7 @@ No write permission or file is read-only.</source>
     <message>
         <location filename="../src/qvoptionsdialog.ui" line="643"/>
         <source>Slideshow direction:</source>
-        <translation type="unfinished">スライドショーの方向</translation>
+        <translation>スライドショーの方向:</translation>
     </message>
     <message>
         <location filename="../src/qvoptionsdialog.ui" line="651"/>
@@ -1112,7 +1117,7 @@ No write permission or file is read-only.</source>
     <message>
         <location filename="../src/qvoptionsdialog.ui" line="664"/>
         <source>Slideshow timer:</source>
-        <translation type="unfinished">スライドショーを進める時間</translation>
+        <translation>スライドショーの間隔:</translation>
     </message>
     <message>
         <location filename="../src/qvoptionsdialog.ui" line="671"/>
@@ -1207,6 +1212,50 @@ No write permission or file is read-only.</source>
         <source>You must restart qView to change the language.</source>
         <translation>言語を変更するには、qViewを再起動する必要があります</translation>
     </message>
+    <message>
+        <source>Hide titlebar</source>
+        <translation>タイトルバーを隠す</translation>
+    </message>
+    <message>
+        <source>Force dark mode</source>
+        <translation>ダークモードを使用</translation>
+    </message>
+    <message>
+        <source>Enable %1 + drag to move the window</source>
+        <translation>%1 + ドラッグでウィンドウを移動する</translation>
+    </message>
+    <message>
+        <source>%1 + drag to move window</source>
+        <translation>%1 + ドラッグでウィンドウを移動</translation>
+    </message>
+    <message>
+        <source>When enabled, the scrolling action zooms the image</source>
+        <translation>有効にすると、スクロールで画像を拡大・縮小します</translation>
+    </message>
+    <message>
+        <source>Scrolling behavior:</source>
+        <translation>スクロール操作:</translation>
+    </message>
+    <message>
+        <source>Auto</source>
+        <translation>自動</translation>
+    </message>
+    <message>
+        <source>Zoom</source>
+        <translation>拡大・縮小</translation>
+    </message>
+    <message>
+        <source>Scroll</source>
+        <translation>スクロール</translation>
+    </message>
+    <message>
+        <source>Use hardware fractional scroll wheel steps when zooming, or always zoom with distinct steps</source>
+        <translation>ホイールの細かな入力で倍率を変えるか、一定の段階で拡大・縮小するかを選択します</translation>
+    </message>
+    <message>
+        <source>Fractional zooming</source>
+        <translation>細かなズーム</translation>
+    </message>
 </context>
 <context>
     <name>QVRenameDialog</name>
@@ -1218,7 +1267,7 @@ No write permission or file is read-only.</source>
     <message>
         <location filename="../src/qvrenamedialog.cpp" line="15"/>
         <source>File name:</source>
-        <translation type="unfinished">ファイル名</translation>
+        <translation>ファイル名:</translation>
     </message>
     <message>
         <location filename="../src/qvrenamedialog.cpp" line="26"/>
@@ -1463,7 +1512,7 @@ No write permission or file is read-only.</source>
     <message>
         <location filename="../src/shortcutmanager.cpp" line="115"/>
         <source>Settings</source>
-        <translation type="unfinished">設定</translation>
+        <translation>設定</translation>
     </message>
     <message>
         <source>Options</source>

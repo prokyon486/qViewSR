@@ -14,6 +14,7 @@
 namespace Ui {
 class MainWindow;
 }
+namespace Sr { class Controller; }
 
 class MainWindow : public QMainWindow
 {
@@ -157,6 +158,7 @@ protected slots:
     void shortcutsUpdated();
 
 private:
+    Sr::Controller *srController;
     Ui::MainWindow *ui;
     QVGraphicsView *graphicsView;
 

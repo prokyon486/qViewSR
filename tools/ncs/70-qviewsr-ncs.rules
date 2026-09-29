@@ -1,0 +1,4 @@
+# Allow the active local desktop user to access NCS/NCS2, including after firmware boot.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="03e7", ATTR{idProduct}=="2150", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="03e7", ATTR{idProduct}=="2485", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="03e7", ATTR{idProduct}=="f63b", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"

@@ -43,6 +43,11 @@ void ActionManagerTests::testClonedActionsUntracked()
 
 int main(int argc, char *argv[])
 {
+    QTemporaryDir settings;
+    qputenv("XDG_CONFIG_HOME", settings.path().toUtf8());
+    QCoreApplication::setOrganizationName("qViewSR-tests");
+    QCoreApplication::setApplicationName("action-manager-tests");
+    QSettings config; config.setValue("firstlaunch", true); config.sync();
     QVApplication app(argc, argv);
     ActionManagerTests actionManagerTests;
     return QTest::qExec(&actionManagerTests, argc, argv);

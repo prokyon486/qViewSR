@@ -32,21 +32,27 @@ QVWelcomeDialog::QVWelcomeDialog(QWidget *parent) : QDialog(parent), ui(new Ui::
     QFont font1 = QFont("Lato", 54, QFont::Light);
 #endif
     ui->logoLabel->setFont(font1);
+    ui->logoLabel->setText("qViewSR");
+    setWindowTitle(QStringLiteral("qViewSRへようこそ"));
 
     // set subtitle font & text
     QFont font2 = QFont("Lato", 14 + modifier);
     font2.setStyleName("Regular");
     const QString subtitleText =
-            tr("Thank you for downloading qView.<br>Here's a few tips to get you started:");
+            QStringLiteral("NCS / NCS2を使った、ICC対応の超解像ビューワです。");
     ui->subtitleLabel->setFont(font2);
     ui->subtitleLabel->setText(subtitleText);
 
     // set info font & text
     QFont font3 = QFont("Lato", 12 + modifier);
     font3.setStyleName("Regular");
-    const QString updateText = tr("<ul><li>Right click to access the main menu</li><li>Drag the "
-                                  "image to reposition it</li><li>Scroll to zoom in and "
-                                  "out</li><li>Use arrow keys to switch files</li></ul>");
+    const QString updateText = QStringLiteral(
+        "<ul><li>画像ファイルをドラッグして開きます</li>"
+        "<li>「超解像 ×4」で処理を開始します（Ctrl+U）</li>"
+        "<li>元画像とSRの切り替えはCtrl+Space</li>"
+        "<li>「SRを保存」で現在の回転・sRGB ICC付きで保存します</li>"
+        "<li>スクロールでズーム、ドラッグで移動、矢印キーで画像送り</li>"
+        "<li>右クリックでqViewの各種メニューを開けます</li></ul>");
     ui->infoLabel->setFont(font3);
     ui->infoLabel->setText(updateText);
 

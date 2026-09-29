@@ -18,8 +18,8 @@ elseif(APPLE)
     set(EXECUTABLE_TYPE MACOSX_BUNDLE)
 endif()
 
-# Enable C++14
-set(CMAKE_CXX_STANDARD 14)
+# Qt 6 requires C++17; the isolated legacy worker remains C++14.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Enable Qt's automatic tools
@@ -28,23 +28,10 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Find required Qt components
-find_package(Qt6 QUIET COMPONENTS Core Gui Network Widgets Svg)
-if(Qt6_FOUND)
-    set(QT_VERSION_MAJOR 6)
-    set(QT_VERSION ${Qt6_VERSION})
-    # Find optional tools
-    find_package(Qt6 QUIET COMPONENTS LinguistTools)
-else()
-    set(QT5_FIND_COMPONENTS Core Gui Network Widgets Svg)
-    if(UNIX AND NOT APPLE)
-        list(APPEND QT5_FIND_COMPONENTS X11Extras)
-    endif()
-    find_package(Qt5 REQUIRED COMPONENTS ${QT5_FIND_COMPONENTS})
-    set(QT_VERSION_MAJOR 5)
-    set(QT_VERSION ${Qt5_VERSION})
-    # Find optional tools
-    find_package(Qt5 QUIET COMPONENTS LinguistTools)
-endif()
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Network Widgets Svg Concurrent)
+set(QT_VERSION_MAJOR 6)
+set(QT_VERSION ${Qt6_VERSION})
+
 
 # Source files
 set(PROJECT_SOURCES
@@ -63,6 +50,9 @@ set(PROJECT_SOURCES
     src/actionmanager.cpp
     src/settingsmanager.cpp
     src/shortcutmanager.cpp
+    src/sr/color_pipeline.cpp
+    src/sr/sr_controller.cpp
+    src/sr/gif_export.cpp
 )
 
 # Header files
@@ -81,6 +71,9 @@ set(PROJECT_HEADERS
     src/actionmanager.h
     src/settingsmanager.h
     src/shortcutmanager.h
+    src/sr/color_pipeline.h
+    src/sr/sr_controller.h
+    src/sr/gif_export.h
 )
 
 # UI form files
@@ -95,7 +88,7 @@ set(PROJECT_FORMS
 )
 
 # To disables both manual and automatic checking for updates
-option(QV_DISABLE_ONLINE_VERSION_CHECK "Disable online version check" OFF)
+option(QV_DISABLE_ONLINE_VERSION_CHECK "Disable online version check" ON)
 if(NOT QV_DISABLE_ONLINE_VERSION_CHECK)
     list(APPEND PROJECT_SOURCES src/updatechecker.cpp)
     list(APPEND PROJECT_HEADERS src/updatechecker.h)
@@ -140,14 +133,20 @@ endif()
 add_executable(${PROJECT_NAME} ${EXECUTABLE_TYPE} ${PROJECT_SOURCES} ${PROJECT_HEADERS} ${PROJECT_FORMS} ${PROJECT_RESOURCES})
 
 target_link_libraries(${PROJECT_NAME} PRIVATE Qt${QT_VERSION_MAJOR}::Core Qt${QT_VERSION_MAJOR}::Gui Qt${QT_VERSION_MAJOR}::Network Qt${QT_VERSION_MAJOR}::Widgets Qt${QT_VERSION_MAJOR}::Svg)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LCMS2 REQUIRED IMPORTED_TARGET lcms2)
+find_package(ZLIB REQUIRED)
+find_package(GIF 5.1 REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Concurrent PkgConfig::LCMS2 ZLIB::ZLIB GIF::GIF)
+target_include_directories(${PROJECT_NAME} PRIVATE src)
 
 # Set the executable name to lowercase on Linux
 if(UNIX AND NOT APPLE)
-    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "qview")
+    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "qviewsr")
 endif()
 
 # Add compile definitions based on options
-if(NOT QV_DISABLE_ONLINE_VERSION_CHECK)
+if(QV_DISABLE_ONLINE_VERSION_CHECK)
     target_compile_definitions(${PROJECT_NAME} PRIVATE QV_DISABLE_ONLINE_VERSION_CHECK)
 endif()
 
@@ -199,8 +198,9 @@ elseif(APPLE)
 elseif(UNIX AND NOT APPLE)
     if(NOT NO_X11)
         find_package(X11 REQUIRED)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE X11_LOADED)
         set(PLATFORM_SPECIFIC_LIBS ${X11_LIBRARIES})
-        if(NOT Qt6_FOUND)
+        if(QT_VERSION_MAJOR EQUAL 5)
             list(APPEND PLATFORM_SPECIFIC_LIBS Qt5::X11Extras)
         endif()
         target_link_libraries(${PROJECT_NAME} PRIVATE ${PLATFORM_SPECIFIC_LIBS})
@@ -220,22 +220,26 @@ if(DEFINED NIGHTLY)
     target_compile_definitions(${PROJECT_NAME} PRIVATE "NIGHTLY=\"${NIGHTLY}\"")
 endif()
 
-# Handle translations
-if(Qt${QT_VERSION_MAJOR}_LinguistTools_FOUND)
-    message(STATUS "LinguistTools found, building translations.")
-    file(GLOB TRANSLATIONS "i18n/qview_*.ts")
-    if(QT_VERSION_MAJOR EQUAL 5)
-        # For Qt5, use qt5_add_translation (not qt5_add_translations)
-        qt5_add_translation(QM_FILES ${TRANSLATIONS})
-        # Add the generated .qm files as resources or install them
-        target_sources(${PROJECT_NAME} PRIVATE ${QM_FILES})
-    else()
-        # For Qt6, use qt_add_translations
-        qt_add_translations(${PROJECT_NAME} TS_FILES ${TRANSLATIONS})
-    endif()
-else()
-    message(STATUS "LinguistTools not found, skipping translations.")
-endif()
+# Bundle translations explicitly. Missing LinguistTools must not silently produce
+# an English-only app; lrelease is provided by qt6-l10n-tools on Ubuntu.
+find_program(QVIEWSR_LRELEASE NAMES lrelease lrelease-qt6 HINTS /usr/lib/qt6/bin REQUIRED)
+find_file(QVIEWSR_QTBASE_JA qtbase_ja.qm HINTS /usr/share/qt6/translations REQUIRED)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/i18n")
+file(GLOB TRANSLATIONS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/i18n/qview_*.ts")
+set(TRANSLATION_QRC "${CMAKE_CURRENT_BINARY_DIR}/qviewsr_i18n.qrc")
+file(WRITE "${TRANSLATION_QRC}" "<RCC><qresource prefix=\"/i18n\">\n")
+set(QM_FILES)
+foreach(ts IN LISTS TRANSLATIONS)
+    get_filename_component(name "${ts}" NAME_WE)
+    set(qm "${CMAKE_CURRENT_BINARY_DIR}/i18n/${name}.qm")
+    add_custom_command(OUTPUT "${qm}" COMMAND "${QVIEWSR_LRELEASE}" -silent "${ts}" -qm "${qm}" DEPENDS "${ts}" VERBATIM)
+    list(APPEND QM_FILES "${qm}")
+    file(APPEND "${TRANSLATION_QRC}" "<file alias=\"${name}.qm\">${qm}</file>\n")
+endforeach()
+file(APPEND "${TRANSLATION_QRC}" "<file alias=\"qtbase_ja.qm\">${QVIEWSR_QTBASE_JA}</file>\n</qresource></RCC>\n")
+add_library(qviewsr_i18n OBJECT "${TRANSLATION_QRC}" ${QM_FILES})
+target_link_libraries(qviewsr_i18n PRIVATE Qt6::Core)
+target_link_libraries(${PROJECT_NAME} PRIVATE qviewsr_i18n)
 
 # Installation rules
 include(GNUInstallDirs)

@@ -3,20 +3,22 @@
 #include "qvwin32functions.h"
 
 #include <QCommandLineParser>
+#include <QTextStream>
 
 int main(int argc, char *argv[])
 {
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
     QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
 #endif
-    QCoreApplication::setOrganizationName("qView");
-    QCoreApplication::setApplicationName("qView");
+    QCoreApplication::setOrganizationName("qViewSR");
+    QCoreApplication::setApplicationName("qViewSR");
     QCoreApplication::setApplicationVersion(QString::number(VERSION));
     QVApplication app(argc, argv);
 
     QCommandLineParser parser;
     parser.addHelpOption();
     parser.addVersionOption();
+    parser.addOption({"supported-mime-types", "List supported image MIME types and exit."});
     parser.addPositionalArgument(QObject::tr("file"), QObject::tr("The file to open."));
 #if defined Q_OS_WIN && WIN32_LOADED && QT_VERSION < QT_VERSION_CHECK(6, 7, 2)
     // Workaround for unicode characters getting mangled in certain cases. To support unicode
@@ -30,6 +32,11 @@ int main(int argc, char *argv[])
 #else
     parser.process(app);
 #endif
+
+    if (parser.isSet("supported-mime-types")) {
+        QTextStream(stdout) << app.getMimeTypeNameList().join(";") << ";\n";
+        return 0;
+    }
 
     auto *window = QVApplication::newWindow();
     if (!parser.positionalArguments().isEmpty())
