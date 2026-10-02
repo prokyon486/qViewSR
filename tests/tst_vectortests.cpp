@@ -19,7 +19,7 @@
 #include <QProcessEnvironment>
 #include <QPushButton>
 #include <QSignalSpy>
-#include <QSpinBox>
+#include <QSlider>
 #include <QSvgRenderer>
 #include <QTemporaryDir>
 #include <QSettings>
@@ -208,7 +208,7 @@ private slots:
 
     void layerColorsAndTransparentCombinations() {
         QVERIFY2(generate(), qPrintable(failure));
-        panel->findChild<QSpinBox*>("vectorOpacity")->setValue(100);
+        panel->findChild<QSlider*>("vectorOpacity")->setValue(100);
         QVERIFY(waitIdle());
         for (const auto& line : {QString("transparent"), QString("white"), QString("black")}) {
             QVERIFY(select("vectorColor", line));

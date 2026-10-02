@@ -31,7 +31,7 @@
 #include <QScreen>
 #include <QSettings>
 #include <QSignalBlocker>
-#include <QSpinBox>
+#include <QSlider>
 #include <QSvgRenderer>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -215,7 +215,7 @@ struct Controller::Private {
     QPointer<QDialog> panel;
     QComboBox *strength, *detail, *color, *background;
     QDoubleSpinBox *width, *scale, *previewScale;
-    QSpinBox *opacity, *suppression;
+    QSlider *opacity, *suppression;
     QCheckBox *showFill, *grayFill, *showResult;
     QPushButton *run, *stop, *svgSave, *pngSave;
     QLabel* status;
@@ -258,13 +258,31 @@ struct Controller::Private {
         width = new QDoubleSpinBox(panel);
         width->setObjectName("vectorWidth"); width->setRange(.3, 3.0); width->setSingleStep(.1); width->setDecimals(1);
         width->setSuffix(QStringLiteral(" px")); form->addRow(QStringLiteral("線幅（元画像基準）"), width);
-        opacity = new QSpinBox(panel);
-        opacity->setObjectName("vectorOpacity"); opacity->setRange(0, 100); opacity->setSuffix(" %");
-        form->addRow(QStringLiteral("主線の濃さ"), opacity);
-        suppression = new QSpinBox(panel);
-        suppression->setObjectName("vectorSuppression"); suppression->setRange(0, 100); suppression->setSingleStep(5); suppression->setSuffix(" %");
-        suppression->setKeyboardTracking(false);
-        form->addRow(QStringLiteral("塗り側の元線を弱める量"), suppression);
+        auto percentageSlider = [this, form](const QString& name, const QString& text, int step) {
+            auto* row = new QWidget(panel);
+            auto* controls = new QHBoxLayout(row);
+            controls->setContentsMargins(0, 0, 0, 0);
+            auto* slider = new QSlider(Qt::Horizontal, row);
+            slider->setObjectName(name);
+            slider->setAccessibleName(text);
+            slider->setRange(0, 100 / step);
+            slider->setPageStep(10 / step);
+            slider->setMinimumWidth(120);
+            auto* value = new QLabel(QStringLiteral("0 %"), row);
+            value->setObjectName(name + QStringLiteral("Value"));
+            value->setMinimumWidth(value->fontMetrics().horizontalAdvance(QStringLiteral("100 %")));
+            value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            value->setBuddy(slider);
+            QObject::connect(slider, &QSlider::valueChanged, value, [value, step](int position) {
+                value->setText(QStringLiteral("%1 %").arg(position * step));
+            });
+            controls->addWidget(slider, 1);
+            controls->addWidget(value);
+            form->addRow(text, row);
+            return slider;
+        };
+        opacity = percentageSlider("vectorOpacity", QStringLiteral("主線の濃さ"), 1);
+        suppression = percentageSlider("vectorSuppression", QStringLiteral("塗り側の元線を弱める量"), 5);
         color = combo("vectorColor", QStringLiteral("主線の色"),
                       {{QStringLiteral("透明（主線を非表示）"), "transparent"}, {QStringLiteral("白"), "white"},
                        {QStringLiteral("黒"), "black"}, {QStringLiteral("元画像から推定"), "source"}});
@@ -304,15 +322,11 @@ struct Controller::Private {
         });
         for (auto* control : {strength, detail})
             QObject::connect(control, &QComboBox::currentIndexChanged, owner, [this] { shapeChanged(); });
-        QObject::connect(suppression, &QSpinBox::valueChanged, owner, [this](int value) {
-            const int rounded = qRound(value / 5.0) * 5;
-            if (value != rounded) { QSignalBlocker block(suppression); suppression->setValue(rounded); }
-            shapeChanged();
-        });
+        QObject::connect(suppression, &QSlider::valueChanged, owner, [this] { shapeChanged(); });
         for (auto* control : {color, background})
             QObject::connect(control, &QComboBox::currentIndexChanged, owner, [this] { appearanceChanged(); });
         QObject::connect(width, &QDoubleSpinBox::valueChanged, owner, [this] { appearanceChanged(); });
-        QObject::connect(opacity, &QSpinBox::valueChanged, owner, [this] { appearanceChanged(); });
+        QObject::connect(opacity, &QSlider::valueChanged, owner, [this] { appearanceChanged(); });
         QObject::connect(previewScale, &QDoubleSpinBox::valueChanged, owner, [this] { appearanceChanged(); });
         for (auto* control : {showFill, grayFill})
             QObject::connect(control, &QCheckBox::toggled, owner, [this] { appearanceChanged(); });
@@ -354,7 +368,7 @@ struct Controller::Private {
         selected(color, "color", "source"); selected(background, "background", "white");
         width->setValue(settings.value("vector/width", 2.6).toDouble());
         opacity->setValue(settings.value("vector/opacity", 85).toInt());
-        suppression->setValue(qRound(settings.value("vector/suppression", 30).toDouble() / 5) * 5);
+        suppression->setValue(qRound(settings.value("vector/suppression", 30).toDouble() / 5));
         showFill->setChecked(settings.value("vector/showFill", false).toBool());
         grayFill->setChecked(settings.value("vector/grayFill", false).toBool());
         scale->setValue(settings.value("vector/exportScale", 4.0).toDouble());
@@ -368,7 +382,7 @@ struct Controller::Private {
         settings.setValue("vector/panelGeometry", panel->saveGeometry());
         settings.setValue("vector/strength", strength->currentData()); settings.setValue("vector/detail", detail->currentData());
         settings.setValue("vector/width", width->value()); settings.setValue("vector/opacity", opacity->value());
-        settings.setValue("vector/suppression", suppression->value()); settings.setValue("vector/color", color->currentData());
+        settings.setValue("vector/suppression", suppression->value() * 5); settings.setValue("vector/color", color->currentData());
         settings.setValue("vector/background", background->currentData()); settings.setValue("vector/showFill", showFill->isChecked());
         settings.setValue("vector/grayFill", grayFill->isChecked()); settings.setValue("vector/exportScale", scale->value());
         settings.setValue("vector/previewScale", previewScale->value());
@@ -442,9 +456,9 @@ struct Controller::Private {
         pngSave->setEnabled(!composedSvg.isEmpty() && !busy());
         for (auto* control : {strength, detail, color, background}) control->setEnabled(!externalBusy);
         showFill->setEnabled(!externalBusy); previewScale->setEnabled(!externalBusy); scale->setEnabled(!externalBusy);
-        suppression->setEnabled(!externalBusy && showFill->isChecked()); grayFill->setEnabled(!externalBusy && showFill->isChecked());
+        suppression->parentWidget()->setEnabled(!externalBusy && showFill->isChecked()); grayFill->setEnabled(!externalBusy && showFill->isChecked());
         const bool linesVisible = color->currentData().toString() != "transparent";
-        width->setEnabled(!externalBusy && linesVisible); opacity->setEnabled(!externalBusy && linesVisible);
+        width->setEnabled(!externalBusy && linesVisible); opacity->parentWidget()->setEnabled(!externalBusy && linesVisible);
         if (updateMessage && !unavailable.isEmpty()) setStatus(unavailable);
         else if (updateMessage && image.isNull() && !busy()) setStatus(QStringLiteral("「生成・更新」で変換を開始します。設定の変更は生成後に自動反映します。"));
         emit owner->stateChanged();
@@ -527,7 +541,7 @@ struct Controller::Private {
         const QSize size = source.size();
         const QString selectedStrength = strength->currentData().toString();
         const QString selectedDetail = detail->currentData().toString();
-        const int selectedSuppression = suppression->value();
+        const int selectedSuppression = suppression->value() * 5;
         setStatus(QStringLiteral("入力画像の色と作業ファイルを準備しています…"));
         updateControls(false);
         auto* watcher = new QFutureWatcher<QString>(owner);
