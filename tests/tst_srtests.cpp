@@ -22,6 +22,7 @@
 #include "qvapplication.h"
 #include "sr/color_pipeline.h"
 #include "sr/sr_controller.h"
+#include "vector/vector_controller.h"
 
 class SrTests : public QObject {
     Q_OBJECT
@@ -106,6 +107,67 @@ private slots:
         auto invalid=profile; invalid.icc="invalid ICC";
         QVERIFY(Sr::toSrgb(raw,invalid,&error).isNull());
         QVERIFY(!error.isEmpty());
+    }
+    void externalVectorPreviewLifecycle() {
+        const auto original=view->getImageCore().getSourceImage();
+        QImage vectorImage(128,96,QImage::Format_RGBA8888);
+        vectorImage.fill(QColor(12,220,75,100)); vectorImage.setColorSpace(QColorSpace::SRgb);
+        controller->setExternalPreview(vectorImage);
+        QVERIFY(controller->showingExternalPreview()); QVERIFY(!controller->showingSr());
+        QCOMPARE(view->getImageCore().getSourceImage(),original);
+        QVERIFY(window->findChild<QAction*>("srToggle")->isEnabled());
+        QVERIFY(!window->findChild<QAction*>("srSave")->isEnabled());
+        QString error;
+        std::unique_ptr<QMimeData> mime(view->getFileDragMimeData(&error));
+        QVERIFY2(error.isEmpty(),qPrintable(error)); QCOMPARE(mime->urls().size(),1);
+        const auto exportPath=mime->urls().first().toLocalFile();
+        const QImage exported(exportPath);
+        QCOMPARE(exported,vectorImage.convertToFormat(exported.format()));
+        QCOMPARE(exported.colorSpace(),QColorSpace(QColorSpace::SRgb));
+        QFile monitor(files.filePath("vector-monitor.icc")); QVERIFY(monitor.open(QIODevice::WriteOnly));
+        monitor.write(QColorSpace(QColorSpace::AdobeRgb).iccProfile()); monitor.close();
+        auto alternate=config; alternate.displayProfile=monitor.fileName(); controller->setConfiguration(alternate);
+        QVERIFY(controller->showingExternalPreview());
+        QVERIFY(view->getLoadedPixmap().toImage().pixelColor(10,10)!=exported.pixelColor(10,10));
+        std::unique_ptr<QMimeData> afterProfile(view->getFileDragMimeData(&error));
+        QCOMPARE(afterProfile->urls(),mime->urls());
+        controller->toggle(); // No SR result exists; this must still restore the original.
+        QVERIFY(!controller->showingExternalPreview()); QVERIFY(!controller->showingSr());
+        QCOMPARE(view->getLoadedPixmap().size(),original.size());
+        std::unique_ptr<QMimeData> restored(view->getFileDragMimeData(&error));
+        QCOMPARE(restored->urls(),QList<QUrl>{QUrl::fromLocalFile(sourcePath)});
+
+        QSignalSpy ready(controller,&Sr::Controller::resultReady);
+        QSignalSpy cleared(controller,&Sr::Controller::externalPreviewCleared);
+        controller->start();
+        QVERIFY(cleared.count()>0); // Invalidate pending vector jobs even before their first preview.
+        controller->setExternalPreview(vectorImage); QVERIFY(!controller->showingExternalPreview());
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        const auto srResult=controller->resultImage();
+        controller->setExternalPreview(vectorImage); QVERIFY(controller->showingExternalPreview());
+        QCOMPARE(controller->resultImage(),srResult);
+        controller->toggle(); controller->toggle();
+        QVERIFY(controller->showingSr()); QCOMPARE(controller->resultImage(),srResult);
+        controller->setExternalPreview(vectorImage);
+        view->closeImage(); QVERIFY(!controller->showingExternalPreview());
+        controller->setExternalPreview(vectorImage); QVERIFY(!controller->showingExternalPreview());
+    }
+    void vectorRejectsFrozenAnimation() {
+        loadAnimation(gifFixture());
+        QSignalSpy ready(controller,&Sr::Controller::resultReady);
+        controller->start(); QTRY_COMPARE_WITH_TIMEOUT(ready.count(),1,8000);
+        QVERIFY(controller->hasAnimation());
+        QVERIFY(view->getImageCore().isAnimationFrozenForSr());
+        QVERIFY(!view->getCurrentFileDetails().isMovieLoaded);
+        const auto playing=controller->animationPlaying();
+        QImage preview(64,48,QImage::Format_ARGB32); preview.fill(Qt::red);
+        controller->setExternalPreview(preview);
+        QVERIFY(!controller->showingExternalPreview());
+        QCOMPARE(controller->animationPlaying(),playing);
+        auto* vector=window->findChild<Vector::Controller*>(); QVERIFY(vector);
+        QSignalSpy rejected(vector,&Vector::Controller::failed);
+        vector->generate(); QCOMPARE(rejected.count(),1); QVERIFY(!vector->hasResult());
+        QVERIFY(!vector->isBusy()); QCOMPARE(controller->animationPlaying(),playing);
     }
     void dragDisplayedResult() {
         QString error;

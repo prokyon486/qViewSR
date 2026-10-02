@@ -43,6 +43,7 @@ public:
     bool isBusy() const { return bool(job_) || saving_; }
     bool hasResult() const { return !result_.isNull(); }
     bool showingSr() const { return showingSr_; }
+    bool showingExternalPreview() const { return !externalPreview_.isNull(); }
     QImage resultImage() const { return result_; }
     double resultScale() const { return resultScale_; }
     int resultPasses() const { return resultSteps_.size(); }
@@ -72,6 +73,8 @@ public slots:
     void saveDisplayedFrameAs();
     void showSettings();
     void setFullscreen(bool fullscreen);
+    void setExternalPreview(const QImage& image);
+    void clearExternalPreview();
 signals:
     void stateChanged();
     void resultReady();
@@ -79,6 +82,7 @@ signals:
     void backendInitialized();
     void animationFrameChanged(int frame);
     void animationSaved(const QString& path);
+    void externalPreviewCleared();
 private:
     struct Job;
     void setStatus(QString text);
@@ -112,6 +116,7 @@ private:
     Configuration configuration_;
     std::shared_ptr<Job> job_;
     QImage result_;
+    QImage externalPreview_;
     std::shared_ptr<std::atomic_bool> exportCancelled_;
     bool showingSr_ = false, sourceReady_ = false, saving_ = false;
     bool fullscreen_ = false;

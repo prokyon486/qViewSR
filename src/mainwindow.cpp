@@ -4,6 +4,7 @@
 #include "qvcocoafunctions.h"
 #include "qvrenamedialog.h"
 #include "sr/sr_controller.h"
+#include "vector/vector_controller.h"
 #include "model3d/model_view.h"
 #include <QToolBar>
 #include <QMimeData>
@@ -123,6 +124,23 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
 
     createModelActions();
 
+    vectorController = new Vector::Controller(this, graphicsView);
+    connect(vectorController, &Vector::Controller::previewReady, srController, &Sr::Controller::setExternalPreview);
+    connect(vectorController, &Vector::Controller::originalRequested, srController, &Sr::Controller::clearExternalPreview);
+    connect(srController, &Sr::Controller::externalPreviewCleared, vectorController, &Vector::Controller::deactivate);
+    connect(srController, &Sr::Controller::stateChanged, this, [this] {
+        if (vectorController) vectorController->setExternalBusy(srController->isBusy());
+    });
+    auto *vectorMenu = menuBar()->addMenu(QStringLiteral("ベクター"));
+    vectorMenu->setObjectName("vectorMenu");
+    auto *vectorPanel = vectorMenu->addAction(QStringLiteral("塗りSVG＋主線SVGを調整…"));
+    vectorPanel->setObjectName("vectorPanelAction");
+    vectorPanel->setData(QStringList{"vectorpanel"});
+    vectorPanel->setShortcut(QKeySequence("Ctrl+Shift+V"));
+    addAction(vectorPanel);
+    connect(vectorPanel, &QAction::triggered, vectorController, &Vector::Controller::showPanel);
+    contextMenu->addMenu(vectorMenu);
+
     // Add all actions to this window so keyboard shortcuts are always triggered
     // using virtual menu to hold them so i can connect to the triggered signal
     virtualMenu = new QMenu(this);
@@ -184,6 +202,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
 MainWindow::~MainWindow()
 {
     delete modelView;
+    delete vectorController;
+    vectorController = nullptr;
     delete srController;
     delete ui;
 }
@@ -331,6 +351,7 @@ void MainWindow::fullscreenChanged()
 {
     const bool isFullscreen = windowState().testFlag(Qt::WindowFullScreen);
     srController->setFullscreen(isFullscreen);
+    if (vectorController) vectorController->setFullscreen(isFullscreen);
     updateModelActions();
     const auto fullscreenActions =
             qvApp->getActionManager().getAllClonesOfAction("fullscreen", this);

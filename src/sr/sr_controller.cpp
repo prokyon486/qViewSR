@@ -229,11 +229,15 @@ Controller::Controller(MainWindow* window,QVGraphicsView* view)
     view_->setDragImageProvider([this]() -> std::optional<QImage> {
         // Export the full-resolution sRGB result/current animation frame, never
         // the monitor-profile pixels or the zoomed/cropped viewport.
-        if (!showingSr_) return std::nullopt;
+        if (!showingSr_ && externalPreview_.isNull()) return std::nullopt;
         if (!sourceReady_) return QImage();
-        const auto image = view_->getImageCore().matchCurrentRotation(result_);
+        auto image = view_->getImageCore().matchCurrentRotation(externalPreview_.isNull() ? result_ : externalPreview_);
         const auto transform = view_->transform();
-        return image.mirrored(transform.m11() < 0, transform.m22() < 0);
+        image = image.mirrored(transform.m11() < 0, transform.m22() < 0);
+        // Qt 6.4 can lose the color-space metadata on transformed images.
+        // Both replacement sources contain sRGB pixels before display conversion.
+        if (image.colorSpace() != QColorSpace(QColorSpace::SRgb)) image.setColorSpace(QColorSpace::SRgb);
+        return image;
     });
     watchdog_.setSingleShot(true);
     connect(&watchdog_,&QTimer::timeout,this,[this] {
@@ -271,6 +275,19 @@ void Controller::setFullscreen(bool fullscreen) {
     fullscreen_ = fullscreen;
     toolbar_->setVisible(!fullscreen_ && !view_->getCurrentFileDetails().isModelDocument);
 }
+void Controller::setExternalPreview(const QImage& image) {
+    if (image.isNull() || isBusy() || !sourceReady_ || hasAnimation() ||
+        view_->getImageCore().isAnimationFrozenForSr() || view_->getCurrentFileDetails().isMovieLoaded ||
+        view_->getCurrentFileDetails().isModelDocument) return;
+    animationTimer_.stop(); animationPlaying_=false;
+    externalPreview_=image; showingSr_=false;
+    display(); updateActions();
+}
+void Controller::clearExternalPreview() {
+    externalPreview_={}; showingSr_=false;
+    emit externalPreviewCleared();
+    display(); updateActions();
+}
 QString Controller::statusText() const { return status_->text(); }
 qint64 Controller::backendPid() const { return worker_?worker_->processId():0; }
 void Controller::setConfiguration(const Configuration& config) {
@@ -286,6 +303,7 @@ void Controller::invalidate() {
     animationTimer_.stop(); animationPlaying_=false; animationIndex_=0; animationLoopsDone_=0; animationEnded_=false;
     originalAnimation_.reset(); resultAnimation_.reset(); originalDisplayFrames_.clear(); resultDisplayFrames_.clear(); animationDisplayProfile_.clear();
     ++generation_; sourceReady_=false; result_={}; showingSr_=false; resultSummary_.clear();
+    externalPreview_={}; emit externalPreviewCleared();
     resultScale_=1.0; resultSteps_.clear();
     cancel(); updateActions();
 }
@@ -306,10 +324,11 @@ void Controller::updateActions() {
     run_->setEnabled(valid && !isBusy()); repeat_->setEnabled(valid && !result_.isNull() && !isBusy());
     scale_->setEnabled(!isBusy()); settings_->setEnabled(!isBusy());
     cancel_->setEnabled((job_ && !job_->cancelled) || (exportCancelled_ && !*exportCancelled_));
-    toggle_->setEnabled(!result_.isNull()); save_->setEnabled(!result_.isNull() && !isBusy());
+    toggle_->setEnabled(!result_.isNull() || !externalPreview_.isNull());
+    save_->setEnabled(!result_.isNull() && externalPreview_.isNull() && !isBusy());
     save_->setText(QStringLiteral("SRを保存…"));
     save_->setToolTip(hasAnimation()?QStringLiteral("GIF: 全フレームを保存。PNG/JPEG: 現在のフレームを保存。GIFは256色・透明/不透明に変換します。"):QStringLiteral("sRGB ICC付きでPNG/JPEGに保存します"));
-    toggle_->setText(showingSr_?QStringLiteral("元画像を表示"):QStringLiteral("SRを表示"));
+    toggle_->setText(showingSr_ || !externalPreview_.isNull()?QStringLiteral("元画像を表示"):QStringLiteral("SRを表示"));
     emit stateChanged();
 }
 QByteArray Controller::displayIcc(QString* description) const {
@@ -329,11 +348,11 @@ void Controller::display(bool updateStatus) {
     QString description,error;
     const auto destination=displayIcc(&description);
     if(destination.isEmpty()) { setStatus(QStringLiteral("画面ICCを読み込めません。SR設定を確認してください。")); return; }
-    const auto& source=hasAnimation()?(showingSr_?resultAnimation_->frames[animationIndex_]:originalAnimation_->frames[animationIndex_]):
+    const auto& source=!externalPreview_.isNull()?externalPreview_:hasAnimation()?(showingSr_?resultAnimation_->frames[animationIndex_]:originalAnimation_->frames[animationIndex_]):
         (showingSr_?result_:view_->getImageCore().getSourceImage());
-    const Profile profile=showingSr_?Profile{srgbProfile(),QStringLiteral("sRGB"),{},false}:view_->getImageCore().getSourceProfile();
+    const Profile profile=showingSr_ || !externalPreview_.isNull()?Profile{srgbProfile(),QStringLiteral("sRGB"),{},false}:view_->getImageCore().getSourceProfile();
     QImage image;
-    if(hasAnimation()) {
+    if(hasAnimation() && externalPreview_.isNull()) {
         if(animationDisplayProfile_!=destination) {
             originalDisplayFrames_.fill(QImage(),animationFrameCount()); resultDisplayFrames_.fill(QImage(),animationFrameCount());
             animationDisplayProfile_=destination;
@@ -346,7 +365,8 @@ void Controller::display(bool updateStatus) {
     if(image.isNull()) { animationTimer_.stop(); animationPlaying_=false; setStatus(readFailure(error)); return; }
     view_->setDisplayImagePreservingView(image);
     if(updateStatus && !isBusy()) {
-        QString summary=showingSr_?QStringLiteral("SR ×%1（%2回） · %3×%4").arg(scaleText(resultScale_)).arg(resultSteps_.size()).arg(result_.width()).arg(result_.height()):
+        QString summary=!externalPreview_.isNull()?QStringLiteral("ベクター調整結果 · %1×%2").arg(externalPreview_.width()).arg(externalPreview_.height()):
+            showingSr_?QStringLiteral("SR ×%1（%2回） · %3×%4").arg(scaleText(resultScale_)).arg(resultSteps_.size()).arg(result_.width()).arg(result_.height()):
                               QStringLiteral("元画像 · ")+view_->getImageCore().getSourceProfile().description;
         if(hasAnimation()) summary+=QStringLiteral(" · GIF %1フレーム · %2").arg(animationFrameCount()).arg(animationPlaying_?QStringLiteral("再生中"):QStringLiteral("一時停止"));
         setStatus(summary);
@@ -365,6 +385,8 @@ void Controller::startJob(bool fromResult) {
         setStatus(QStringLiteral("推論プログラム / モデル / ランタイムが見つかりません。SR設定を確認してください。"));
         emit failed(status_->text()); return;
     }
+    // Also cancel a pending vector render: it must not overwrite a later SR result.
+    externalPreview_={}; emit externalPreviewCleared();
     const auto path=view_->getCurrentFileDetails().fileInfo.absoluteFilePath();
     const bool animated=hasAnimation() || (view_->getCurrentFileDetails().isMovieLoaded && QImageReader::imageFormat(path)=="gif");
     if(!animated) {
@@ -754,7 +776,12 @@ void Controller::cancel() {
     } else if(!job->request.isEmpty() && !job->sent) finish(job);
     // Preparing/decoding futures retain their job and finish when the task exits.
 }
-void Controller::toggle() { if(result_.isNull()) return; showingSr_=!showingSr_; display(); updateActions(); }
+void Controller::toggle() {
+    if (!externalPreview_.isNull()) { clearExternalPreview(); return; }
+    emit externalPreviewCleared();
+    if(result_.isNull()) return;
+    showingSr_=!showingSr_; display(); updateActions();
+}
 bool Controller::saveResult(const QString& path,const QByteArray& format,QString* error) {
     if(result_.isNull()) { if(error)*error=QStringLiteral("保存するSR画像がありません"); return false; }
     const auto original=view_->getCurrentFileDetails().fileInfo;

@@ -15,6 +15,7 @@ namespace Ui {
 class MainWindow;
 }
 namespace Sr { class Controller; }
+namespace Vector { class Controller; }
 namespace Model3D { class View; }
 class QToolBar;
 class QLabel;
@@ -163,6 +164,7 @@ protected slots:
 
 private:
     Sr::Controller *srController;
+    Vector::Controller *vectorController = nullptr;
     Ui::MainWindow *ui;
     QVGraphicsView *graphicsView;
     Model3D::View *modelView = nullptr;

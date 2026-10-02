@@ -1,0 +1,10 @@
+{
+  "python_packages": {"numpy": "2.2.6", "Pillow": "10.2.0", "vtracer": "0.6.15"},
+  "autotrace": {
+    "release": "0.31.10",
+    "url": "https://github.com/autotrace/autotrace/archive/refs/tags/0.31.10.tar.gz",
+    "sha256": "14627f93bb02fe14eeda0163434a7cb9b1f316c0f1727f0bdf6323a831ffe80d",
+    "source_directory": "autotrace-0.31.10",
+    "license_files": ["COPYING", "COPYING.LIB"]
+  }
+}
