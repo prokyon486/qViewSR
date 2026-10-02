@@ -293,7 +293,8 @@ struct Controller::Private {
         form->addRow(showFill); form->addRow(grayFill);
         previewScale = new QDoubleSpinBox(panel);
         previewScale->setObjectName("vectorPreviewScale"); previewScale->setRange(1, 8); previewScale->setSingleStep(.5);
-        previewScale->setSuffix(QStringLiteral(" 倍")); form->addRow(QStringLiteral("プレビュー倍率"), previewScale);
+        previewScale->setSuffix(QStringLiteral(" 倍")); form->addRow(QStringLiteral("受け渡し画像の倍率"), previewScale);
+        previewScale->setToolTip(QStringLiteral("Ctrl＋ドラッグで渡す画像の倍率です。画面のプレビューは倍率に関係なくSVGから描画します。"));
         auto* note = new QLabel(QStringLiteral("透明背景は塗りの白い部分を消しません。主線を透明にしても塗り側の元線は残ります。"), panel);
         note->setWordWrap(true); layout->addWidget(note);
         showResult = new QCheckBox(QStringLiteral("変換結果を表示（オフで元画像）"), panel);
@@ -507,8 +508,8 @@ struct Controller::Private {
                 if (!result.error.isEmpty()) report(result.error);
                 else {
                     image = result.image; composedSvg = result.svg;
-                    if (showResult->isChecked()) { showing = true; emit owner->previewReady(image); }
-                    setStatus(QStringLiteral("プレビュー %1×%2px。PNG保存時は指定倍率でベクターを描き直します。")
+                    if (showResult->isChecked()) { showing = true; emit owner->previewReady(image, composedSvg); }
+                    setStatus(QStringLiteral("SVGを表示中。拡大時もベクターから描画します。受け渡し画像: %1×%2px。")
                               .arg(image.width()).arg(image.height()));
                     emit owner->resultReady();
                 }
@@ -703,7 +704,7 @@ void Controller::setShowingResult(bool showing) {
     showing = showing && hasResult() && !d->externalBusy;
     { QSignalBlocker block(d->showResult); d->showResult->setChecked(showing); }
     const bool changed = d->showing != showing; d->showing = showing;
-    if (showing) emit previewReady(d->image);
+    if (showing) emit previewReady(d->image, d->composedSvg);
     else if (changed) emit originalRequested();
     emit stateChanged();
 }

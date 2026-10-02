@@ -12,6 +12,7 @@
 #include <optional>
 
 class QDrag;
+namespace Vector { class PreviewItem; }
 
 class QVGraphicsView : public QGraphicsView
 {
@@ -65,6 +66,8 @@ public:
     const QMovie &getLoadedMovie() const { return imageCore.getLoadedMovie(); }
     QVImageCore &getImageCore() { return imageCore; }
     void setDisplayImagePreservingView(const QImage &image);
+    bool setVectorPreview(const QByteArray &svg, const QByteArray &displayIcc);
+    bool hasVectorPreview() const;
 
 signals:
     void cancelSlideshow();
@@ -120,7 +123,7 @@ private slots:
 private:
     void updateFilteringMode();
 
-    QGraphicsPixmapItem *loadedPixmapItem;
+    Vector::PreviewItem *loadedPixmapItem;
 
     constexpr static int MARGIN = -2;
     constexpr static qreal MAX_EXPENSIVE_SCALING_SIZE = 3;

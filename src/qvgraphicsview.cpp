@@ -3,6 +3,7 @@
 #include "qvinfodialog.h"
 #include "qvcocoafunctions.h"
 #include "settingsmanager.h"
+#include "vector/vector_preview_item.h"
 #include <QWheelEvent>
 #include <QGraphicsPixmapItem>
 #include <QGraphicsScene>
@@ -57,6 +58,7 @@ QVGraphicsView::QVGraphicsView(QWidget *parent) : QGraphicsView(parent)
     connect(&imageCore, &QVImageCore::updateLoadedPixmapItem, this,
             &QVGraphicsView::updateLoadedPixmapItem);
     connect(&imageCore, &QVImageCore::sourceChanging, this, [this] {
+        setVectorPreview({}, {});
         fileDragPending = fileDragGesture = false;
         viewport()->setCursor(Qt::ArrowCursor);
     });
@@ -67,7 +69,7 @@ QVGraphicsView::QVGraphicsView(QWidget *parent) : QGraphicsView(parent)
     expensiveScaleTimerNew->setInterval(50);
     connect(expensiveScaleTimerNew, &QTimer::timeout, this, [this] { scaleExpensively(); });
 
-    loadedPixmapItem = new QGraphicsPixmapItem();
+    loadedPixmapItem = new Vector::PreviewItem(this);
     scene->addItem(loadedPixmapItem);
 
     // Connect to settings signal
@@ -532,6 +534,9 @@ void QVGraphicsView::zoom(qreal scaleFactor, const QPoint &pos)
 
 void QVGraphicsView::scaleExpensively()
 {
+    // SVG is painted at the actual device resolution for the visible area.
+    // Resampling the fallback pixmap would needlessly change scene coordinates.
+    if (hasVectorPreview()) return;
     // Determine if mirrored or flipped
     bool mirrored = false;
     if (transform().m11() < 0)
@@ -641,6 +646,19 @@ void QVGraphicsView::updateLoadedPixmapItem()
     resetScale();
 
     emit updatedLoadedPixmapItem();
+}
+
+bool QVGraphicsView::setVectorPreview(const QByteArray &svg, const QByteArray &displayIcc)
+{
+    const bool accepted = loadedPixmapItem->setVectorPreview(svg, displayIcc);
+    if (hasVectorPreview()) expensiveScaleTimerNew->stop();
+    viewport()->update();
+    return accepted;
+}
+
+bool QVGraphicsView::hasVectorPreview() const
+{
+    return loadedPixmapItem->hasVectorPreview();
 }
 
 void QVGraphicsView::setDisplayImagePreservingView(const QImage &image)

@@ -54,6 +54,7 @@ set(PROJECT_SOURCES
     src/sr/sr_controller.cpp
     src/sr/gif_export.cpp
     src/vector/vector_controller.cpp
+    src/vector/vector_preview_item.cpp
     src/model3d/glb_document.cpp
     src/model3d/model_view.cpp
 )
@@ -78,6 +79,7 @@ set(PROJECT_HEADERS
     src/sr/sr_controller.h
     src/sr/gif_export.h
     src/vector/vector_controller.h
+    src/vector/vector_preview_item.h
     src/model3d/glb_document.h
     src/model3d/model_view.h
 )

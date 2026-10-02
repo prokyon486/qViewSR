@@ -2,6 +2,7 @@
 #include "qvapplication.h"
 #include "mainwindow.h"
 #include "sr/sr_controller.h"
+#include "sr/color_pipeline.h"
 #include "vector/vector_controller.h"
 #include <QtTest>
 #include <QCheckBox>
@@ -23,6 +24,7 @@
 #include <QSvgRenderer>
 #include <QTemporaryDir>
 #include <QSettings>
+#include <QScrollBar>
 #include <QThreadPool>
 
 class VectorTests : public QObject {
@@ -122,6 +124,50 @@ class VectorTests : public QObject {
         return error / (actual.width() * actual.height() * 4.0);
     }
 
+    static QByteArray curvedSvg() {
+        return QByteArrayLiteral(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='48' viewBox='0 0 64 48'>"
+            "<path d='M 4 36 C 17 2 40 47 60 9' fill='none' stroke='#dd3927' stroke-width='1.15' stroke-linecap='round'/>"
+            "<ellipse cx='32.3' cy='24.2' rx='9.1' ry='6.7' fill='#257dc9' fill-opacity='.65' stroke='#112c17' stroke-width='.8'/>"
+            "</svg>");
+    }
+
+    static QImage rasterizedSvg(const QByteArray& svg, QSize size) {
+        QImage image(size, QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::transparent);
+        image.setColorSpace(QColorSpace::SRgb);
+        QSvgRenderer renderer(svg);
+        QPainter painter(&image);
+        painter.setRenderHint(QPainter::Antialiasing);
+        renderer.render(&painter, QRectF(QPointF(), QSizeF(size)));
+        return image;
+    }
+
+    QImage renderedView(qreal dpr = 1) const {
+        const auto size = view->viewport()->size();
+        QImage image(QSize(qRound(size.width() * dpr), qRound(size.height() * dpr)), QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::transparent); image.setDevicePixelRatio(dpr);
+        QPainter painter(&image);
+        painter.setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform);
+        view->render(&painter, QRectF(QPointF(), QSizeF(size)), view->viewport()->rect());
+        return image;
+    }
+
+    QImage renderedReference(const QByteArray& svg, const QTransform& imageTransform = {},
+                             qreal dpr = 1, const QImage& raster = {}) const {
+        const auto size = view->viewport()->size();
+        QImage image(QSize(qRound(size.width() * dpr), qRound(size.height() * dpr)), QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::transparent); image.setDevicePixelRatio(dpr);
+        QPainter painter(&image);
+        painter.setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform);
+        painter.setWorldTransform(imageTransform * view->viewportTransform());
+        if (raster.isNull()) {
+            QSvgRenderer renderer(svg);
+            renderer.render(&painter, QRectF(0, 0, 64, 48));
+        } else painter.drawImage(QPointF(), raster);
+        return image;
+    }
+
 private slots:
     void initTestCase() {
         QVERIFY(files.isValid());
@@ -189,6 +235,7 @@ private slots:
         panel->move(45, 35); panel->resize(430, panel->height()+20);
         QVERIFY2(generate(), qPrintable(failure));
         QVERIFY(controller->showingResult());
+        QVERIFY(view->hasVectorPreview());
         const auto before = controller->resultImage();
         const auto geometry = panel->geometry();
         panel->close();
@@ -201,9 +248,73 @@ private slots:
         controller->setFullscreen(true); QVERIFY(!panel->isVisible());
         controller->setFullscreen(false); QTRY_VERIFY(panel->isVisible());
         controller->setShowingResult(false); QVERIFY(!controller->showingResult());
+        QVERIFY(!view->hasVectorPreview());
         QCOMPARE(view->getLoadedPixmap().size(), QSize(64, 48));
         controller->setShowingResult(true); QVERIFY(controller->showingResult());
+        QVERIFY(view->hasVectorPreview());
         QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void zoomRendersCurvesAtScreenResolution() {
+        auto* sr = window->findChild<Sr::Controller*>(); QVERIFY(sr);
+        const auto svg = curvedSvg();
+        const auto lowResolution = rasterizedSvg(svg, QSize(64, 48));
+        sr->setExternalVectorPreview(lowResolution, svg);
+        QVERIFY(view->hasVectorPreview());
+        view->originalSize();
+        view->zoom(24);
+        view->horizontalScrollBar()->setValue(view->horizontalScrollBar()->value() + 37);
+        view->verticalScrollBar()->setValue(view->verticalScrollBar()->value() - 21);
+        const auto transform = view->transform();
+        const QPoint scroll(view->horizontalScrollBar()->value(), view->verticalScrollBar()->value());
+
+        for (const qreal dpr : {1.0, 2.0}) {
+            const auto actual = renderedView(dpr);
+            const auto fresh = renderedReference(svg, {}, dpr);
+            const auto enlargedBitmap = renderedReference(svg, {}, dpr, lowResolution);
+            const auto vectorError = imageError(actual, fresh);
+            const auto bitmapError = imageError(actual, enlargedBitmap);
+            QVERIFY2(vectorError < .5, qPrintable(QString("Fresh SVG error at DPR %1: %2").arg(dpr).arg(vectorError)));
+            QVERIFY2(bitmapError > vectorError + 1.0, qPrintable(QString("Vector %1, bitmap %2").arg(vectorError).arg(bitmapError)));
+        }
+        // Painting a new viewport must never rewrite the logical image or the
+        // scene position, including after the old expensive-scaling timer fires.
+        QTest::qWait(80);
+        QCOMPARE(view->transform(), transform);
+        QCOMPARE(QPoint(view->horizontalScrollBar()->value(), view->verticalScrollBar()->value()), scroll);
+        QCOMPARE(view->getLoadedPixmap().size(), QSize(64, 48));
+        QVERIFY(view->hasVectorPreview());
+        sr->clearExternalPreview();
+        QVERIFY(!view->hasVectorPreview());
+    }
+
+    void vectorViewportHonorsRotationMirrorsAndDisplayProfile() {
+        auto* sr = window->findChild<Sr::Controller*>(); QVERIFY(sr);
+        const auto previous = sr->configuration();
+        auto config = previous;
+        config.displayProfile = files.filePath("display-adobe-rgb.icc");
+        const auto destination = QColorSpace(QColorSpace::AdobeRgb).iccProfile();
+        { QFile file(config.displayProfile); QVERIFY(file.open(QIODevice::WriteOnly)); QCOMPARE(file.write(destination), destination.size()); }
+        sr->setConfiguration(config);
+        const auto svg = curvedSvg();
+        sr->setExternalVectorPreview(rasterizedSvg(svg, QSize(64, 48)), svg);
+        QVERIFY(view->hasVectorPreview());
+        window->rotateRight(); window->mirror(); window->flip();
+        view->zoom(16);
+        QVERIFY(view->transform().m11() < 0); QVERIFY(view->transform().m22() < 0);
+        const auto rotation = QImage::trueMatrix(QTransform().rotate(90), 64, 48);
+        const auto fresh = renderedReference(svg, rotation);
+        QString error;
+        const auto reference = Sr::convert(fresh, {Sr::srgbProfile(), "sRGB", {}, false}, destination, &error);
+        QVERIFY2(!reference.isNull(), qPrintable(error));
+        const auto actual = renderedView();
+        QVERIFY2(imageError(actual, reference) < .5, qPrintable(QString("Rotated ICC SVG error: %1").arg(imageError(actual, reference))));
+        QVERIFY(imageError(actual, fresh) > .5);
+        QVERIFY(view->hasVectorPreview());
+        sr->setConfiguration(previous);
+        QVERIFY(view->hasVectorPreview());
+        sr->setExternalPreview(rasterizedSvg(svg, QSize(64, 48)));
+        QVERIFY(!view->hasVectorPreview());
     }
 
     void layerColorsAndTransparentCombinations() {
@@ -341,6 +452,7 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(view->getImageCore().getSourceImage().size(), QSize(31, 25), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(!controller->isBusy(), 5000);
         QVERIFY(!controller->hasResult()); QVERIFY(!controller->showingResult());
+        QVERIFY(!view->hasVectorPreview());
         QCOMPARE(ready.count(), 0);
         QCOMPARE(view->getLoadedPixmap().size(), QSize(31, 25));
         QCOMPARE(digest(sourcePath), sourceDigest);
@@ -376,6 +488,7 @@ private slots:
         QVERIFY2(generate(), qPrintable(failure));
         const auto cached = controller->resultImage();
         QVERIFY(controller->showingResult());
+        QVERIFY(view->hasVectorPreview());
         QSignalSpy vectorReady(controller, &Vector::Controller::resultReady);
         QSignalSpy srReady(sr, &Sr::Controller::resultReady);
         controller->generate(); QVERIFY(controller->isBusy());
@@ -384,15 +497,18 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!controller->isBusy(), 5000);
         QCOMPARE(vectorReady.count(), 0);
         QVERIFY(sr->showingSr()); QVERIFY(!controller->showingResult());
+        QVERIFY(!view->hasVectorPreview());
         QCOMPARE(controller->resultImage(), cached);
         controller->setShowingResult(true);
         QVERIFY(controller->showingResult()); QVERIFY(!sr->showingSr());
+        QVERIFY(view->hasVectorPreview());
         QString error;
         QVERIFY2(controller->savePng(files.filePath("after-sr.png"), 2, &error), qPrintable(error));
         QCOMPARE(QImage(files.filePath("after-sr.png")).size(), QSize(128, 96));
         controller->setShowingResult(false);
         QVERIFY(sr->hasResult());
         sr->toggle(); QVERIFY(sr->showingSr());
+        QVERIFY(!view->hasVectorPreview());
         QCOMPARE(sr->resultImage().size(), QSize(128, 96));
         QCOMPARE(digest(sourcePath), sourceDigest);
         sr->setConfiguration(previous);

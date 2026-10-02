@@ -31,7 +31,7 @@ public slots:
     void setShowingResult(bool showing);
 
 signals:
-    void previewReady(const QImage& sRGBImage);
+    void previewReady(const QImage& sRGBImage, const QByteArray& svg);
     void originalRequested();
     void stateChanged();
     void failed(const QString& message);

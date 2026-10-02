@@ -125,7 +125,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::MainWi
     createModelActions();
 
     vectorController = new Vector::Controller(this, graphicsView);
-    connect(vectorController, &Vector::Controller::previewReady, srController, &Sr::Controller::setExternalPreview);
+    connect(vectorController, &Vector::Controller::previewReady, srController, &Sr::Controller::setExternalVectorPreview);
     connect(vectorController, &Vector::Controller::originalRequested, srController, &Sr::Controller::clearExternalPreview);
     connect(srController, &Sr::Controller::externalPreviewCleared, vectorController, &Vector::Controller::deactivate);
     connect(srController, &Sr::Controller::stateChanged, this, [this] {

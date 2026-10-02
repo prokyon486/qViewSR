@@ -74,6 +74,7 @@ public slots:
     void showSettings();
     void setFullscreen(bool fullscreen);
     void setExternalPreview(const QImage& image);
+    void setExternalVectorPreview(const QImage& image, const QByteArray& svg);
     void clearExternalPreview();
 signals:
     void stateChanged();
@@ -117,6 +118,7 @@ private:
     std::shared_ptr<Job> job_;
     QImage result_;
     QImage externalPreview_;
+    QByteArray externalPreviewSvg_;
     std::shared_ptr<std::atomic_bool> exportCancelled_;
     bool showingSr_ = false, sourceReady_ = false, saving_ = false;
     bool fullscreen_ = false;
