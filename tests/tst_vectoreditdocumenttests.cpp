@@ -46,6 +46,12 @@ private slots:
     void clickedPenSegmentsHaveEditableHandles();
     void sweptEraserIsLayerSpecificAndUndoable();
     void eraserSkipsHoleAndOpenCurveInterior();
+    void partialLineEraserPreservesCurves();
+    void rasterFillBrushSplitsAndPreservesPaintOrder();
+    void rasterFillBrushPreviewAndBudget();
+    void rasterFillErasePreservesWindingCoverage();
+    void rasterFillEraseKeepsCurvedHoleWithExteriorControls();
+    void rasterFillEraseKeepsEvenOddOverlaps();
     void realGeneratedSvg();
 };
 void VectorEditDocumentTests::loadAndHitTest() {
@@ -379,6 +385,135 @@ void VectorEditDocumentTests::eraserSkipsHoleAndOpenCurveInterior() {
     QCOMPARE(document.hitTest({50,50},2,Layer::Lines),-1);
     QCOMPARE(document.erasePaths({20,45},{20,55},2,Layer::Lines),1);
     QVERIFY(!document.path(2).isEmpty()); // independently hidden path remains intact
+}
+void VectorEditDocumentTests::partialLineEraserPreservesCurves() {
+    const QByteArray source = R"(<svg width="100" height="100"><g id="lines" stroke="black" stroke-width="2" fill="none"><path id="curve" d="M0 50C30 10 70 90 100 50"/><path id="other" d="M0 10C30 0 70 0 100 10"/></g></svg>)";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    QPainterPath brush; brush.addEllipse(QPointF(50,50),8,8);
+    QString error;
+    document.beginEdit();
+    QCOMPARE(document.eraseLineSegments(brush,&error),1);
+    QVERIFY2(error.isEmpty(),qPrintable(error));
+    document.commitEdit();
+    QCOMPARE(byId(document.svg(),"curve").attribute("d").count('M'),2);
+    QCOMPARE(byId(document.svg(),"curve").attribute("d").count('C'),2);
+    QCOMPARE(byId(document.svg(),"other").attribute("d"),byId(source,"other").attribute("d"));
+    QCOMPARE(document.hitTest({50,50},0,Layer::Lines),-1);
+    const auto handles = document.handles(0);
+    QCOMPARE(handles.size(),8);
+    QCOMPARE(handles.first().point,QPointF(0,50));
+    QCOMPARE(handles.last().point,QPointF(100,50));
+    QVERIFY(std::any_of(handles.cbegin(),handles.cend(),[](const Handle& h){return h.subpath==1 && h.kind==Handle::Control1;}));
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+    QVERIFY(!document.canUndo());
+    QVERIFY(document.redo());
+    QCOMPARE(document.hitTest({50,50},0,Layer::Lines),-1);
+    QVERIFY(document.setLayerVisible(Layer::Lines,false));
+    const auto hidden = document.svg();
+    QCOMPARE(document.eraseLineSegments(brush,&error),0);
+    QCOMPARE(document.svg(),hidden);
+}
+void VectorEditDocumentTests::rasterFillBrushSplitsAndPreservesPaintOrder() {
+    const QByteArray source = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"><path id="red" fill="red" d="M10 10L90 10L90 90L10 90Z"/><path id="blue" fill="blue" d="M65 65L80 65L80 80L65 80Z"/></g><g id="lines" stroke="black" stroke-width="2" fill="none"><path id="line" d="M0 50L100 50"/></g></svg>)";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    QPainterPath brush; brush.addRect(QRectF(45,0,10,100));
+    QString error;
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error)>0,qPrintable(error));
+    QCOMPARE(document.pathCount(),4); // split red has independently selectable halves
+    const auto pixels = render(document.svg());
+    QCOMPARE(pixels.pixelColor(20,30),QColor(Qt::red));
+    QCOMPARE(pixels.pixelColor(80,30),QColor(Qt::red));
+    QCOMPARE(pixels.pixelColor(50,30).alpha(),0);
+    QCOMPARE(pixels.pixelColor(50,50),QColor(Qt::black));
+    QCOMPARE(pixels.pixelColor(70,70),QColor(Qt::blue));
+    QCOMPARE(document.hitTest({70,70},0,Layer::Fill),1);
+    QVERIFY(document.hitTest({20,30},0,Layer::Fill)!=document.hitTest({80,30},0,Layer::Fill));
+    QCOMPARE(byId(document.svg(),"blue").attribute("d"),byId(source,"blue").attribute("d"));
+    QCOMPARE(byId(document.svg(),"line").attribute("d"),byId(source,"line").attribute("d"));
+    QVERIFY(!document.svg().contains("<image"));
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+}
+void VectorEditDocumentTests::rasterFillBrushPreviewAndBudget() {
+    EditDocument document;
+    const QByteArray source = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"/><g id="lines" stroke="black" stroke-width="2" fill="none"><path d="M0 50L100 50"/></g></svg>)";
+    QVERIFY(document.load(source));
+    QPainterPath brush; brush.addRect(QRectF(10,10,70,70));
+    QString error; QRectF bounds;
+    const auto preview = document.rasterBrushPreview(brush,Qt::red,false,&bounds,&error);
+    QVERIFY2(!preview.isNull(),qPrintable(error));
+    QCOMPARE(preview.pixelColor(20-int(bounds.left()),20-int(bounds.top())),QColor(Qt::red));
+    QCOMPARE(preview.pixelColor(50-int(bounds.left()),50-int(bounds.top())),QColor(Qt::black));
+    QCOMPARE(document.svg(),source);
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::red,false,&error)>0,qPrintable(error));
+    QCOMPARE(render(document.svg()).pixelColor(20,20),QColor(Qt::red));
+    QCOMPARE(render(document.svg()).pixelColor(50,50),QColor(Qt::black));
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+
+    const QByteArray large = R"(<svg width="20000" height="20000"><g id="fill"/></svg>)";
+    QVERIFY(document.load(large));
+    QPainterPath huge; huge.addRect(QRectF(0,0,10000,10000));
+    QCOMPARE(document.applyRasterFillBrush(huge,Qt::red,false,&error),-1);
+    QVERIFY(error.contains("64"));
+    QCOMPARE(document.svg(),large);
+    QVERIFY(!document.canUndo());
+    const auto reduced = document.rasterBrushPreview(huge,Qt::red,false,&bounds,&error);
+    QVERIFY2(!reduced.isNull(),qPrintable(error));
+    QVERIFY(qint64(reduced.width())*reduced.height()<=2*1024*1024);
+    QVERIFY(bounds.width()>10000);
+}
+void VectorEditDocumentTests::rasterFillErasePreservesWindingCoverage() {
+    const QByteArray source = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"><path id="overlap" fill="red" d="M0 0L70 0L70 100L0 100Z M30 0L100 0L100 100L30 100Z"/></g></svg>)";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    QPainterPath brush; brush.addEllipse(QPointF(10,50),4,4);
+    QString error;
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error)>0,qPrintable(error));
+    const auto pixels = render(document.svg());
+    QCOMPARE(pixels.pixelColor(10,50).alpha(),0);
+    QCOMPARE(pixels.pixelColor(50,50),QColor(Qt::red));
+    QCOMPARE(pixels.pixelColor(90,50),QColor(Qt::red));
+    const QByteArray hole = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"><path fill="red" d="M0 0L100 0L100 100L0 100Z M30 30L30 70L70 70L70 30Z"/></g></svg>)";
+    QVERIFY(document.load(hole));
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error)>0,qPrintable(error));
+    QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
+    QCOMPARE(render(document.svg()).pixelColor(90,50),QColor(Qt::red));
+}
+void VectorEditDocumentTests::rasterFillEraseKeepsCurvedHoleWithExteriorControls() {
+    const QByteArray source = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"><path fill="red" fill-rule="evenodd" d="M0 0L100 0L100 100L0 100Z M40 40C-100 5 200 5 60 40L60 60L40 60Z"/></g></svg>)";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
+    QPainterPath brush; brush.addEllipse(QPointF(10,80),2,2);
+    QString error;
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error)>0,qPrintable(error));
+    QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
+    QCOMPARE(render(document.svg()).pixelColor(10,80).alpha(),0);
+    QCOMPARE(render(document.svg()).pixelColor(90,80),QColor(Qt::red));
+    QCOMPARE(document.pathCount(),1);
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+}
+void VectorEditDocumentTests::rasterFillEraseKeepsEvenOddOverlaps() {
+    const QByteArray source = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"><path fill="red" fill-rule="evenodd" d="M0 0L70 0L70 100L0 100Z M30 0L100 0L100 100L30 100Z"/></g></svg>)";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
+    QPainterPath brush; brush.addEllipse(QPointF(10,50),2,2);
+    QString error;
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error)>0,qPrintable(error));
+    const auto pixels = render(document.svg());
+    QCOMPARE(pixels.pixelColor(50,50).alpha(),0);
+    QCOMPARE(pixels.pixelColor(10,50).alpha(),0);
+    QCOMPARE(pixels.pixelColor(10,80),QColor(Qt::red));
+    QCOMPARE(pixels.pixelColor(90,80),QColor(Qt::red));
+    QCOMPARE(document.pathCount(),1);
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
 }
 QTEST_MAIN(VectorEditDocumentTests)
 #include "tst_vectoreditdocumenttests.moc"

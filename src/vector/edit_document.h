@@ -3,6 +3,7 @@
 
 #include <QByteArray>
 #include <QColor>
+#include <QImage>
 #include <QPainterPath>
 #include <QPointF>
 #include <QSize>
@@ -55,6 +56,10 @@ public:
     int addBezierPath(const QVector<BezierAnchor>& anchors, QColor color, double width, bool closed = false);
     // Deletes complete paths intersected by the swept circular brush.
     int erasePaths(QPointF from, QPointF to, double radius, Layer layer);
+    int eraseLineSegments(const QPainterPath& sweptRegion, QString* error = nullptr);
+    int applyRasterFillBrush(const QPainterPath& sweptRegion, QColor color, bool erase, QString* error = nullptr);
+    QImage rasterBrushPreview(const QPainterPath& sweptRegion, QColor color, bool erase,
+                             QRectF* bounds, QString* error = nullptr, double outputScale = 1.) const;
     bool remove(int index);
     bool setColor(int index, QColor color);
     bool deformFill(int index, QPointF center, QPointF delta, double radius, bool smooth);

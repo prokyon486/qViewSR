@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "edit_document.h"
+#include "memory_budget.h"
+#include "raster_contours.h"
 
 #include <QDomDocument>
+#include <QHash>
 #include <QPainterPathStroker>
+#include <QPainter>
 #include <QRegularExpression>
 #include <QStringList>
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <limits>
 
 namespace Vector {
 namespace {
@@ -230,11 +235,200 @@ void clearTouched(QVector<Shape>& shapes) {
         for (auto& segment : sub.segments) segment.touched = false;
     }
 }
+
+bool finitePath(const QPainterPath& path) {
+    if (path.elementCount() > 1000000) return false;
+    for (int i = 0; i < path.elementCount(); ++i)
+        if (!validPoint(QPointF(path.elementAt(i).x, path.elementAt(i).y))) return false;
+    return true;
+}
+int shapeSegments(const Shape& shape) {
+    int count = 0;
+    for (const auto& sub : shape.subpaths) count += 1 + sub.segments.size();
+    return count;
+}
+QRectF segmentBounds(QPointF start, const Segment& segment, QPointF offset) {
+    QPainterPath path(start + offset);
+    if (segment.cubic) path.cubicTo(segment.c1 + offset, segment.c2 + offset, segment.end + offset);
+    else path.lineTo(segment.end + offset);
+    return path.controlPointRect().adjusted(-1.e-7, -1.e-7, 1.e-7, 1.e-7);
+}
+void splitSegmentAt(QPointF from, Segment source, double t, Segment* left, Segment* right) {
+    makeCubic(from, source);
+    const auto interpolate = [t](QPointF first, QPointF last) { return first + (last - first) * t; };
+    const QPointF a = interpolate(from, source.c1);
+    const QPointF b = interpolate(source.c1, source.c2);
+    const QPointF c = interpolate(source.c2, source.end);
+    const QPointF ab = interpolate(a, b);
+    const QPointF bc = interpolate(b, c);
+    const QPointF middle = interpolate(ab, bc);
+    *left = {a, ab, middle, true, false};
+    *right = {bc, c, source.end, true, false};
+}
+void splitSegment(QPointF from, Segment source, Segment* left, Segment* right) {
+    splitSegmentAt(from, source, .5, left, right);
+}
+struct ClippedSegment { QPointF start; Segment segment; bool keep; double begin = 0., end = 1.; };
+bool clipSegment(QPointF from, const Segment& segment, QPointF offset, const QPainterPath& region,
+                 QVector<ClippedSegment>* output, int* work, int depth = 0, double begin = 0., double end = 1.) {
+    if (++*work > 2000000) return false;
+    const QRectF bounds = segmentBounds(from, segment, offset);
+    if (!region.intersects(bounds)) { output->append({from, segment, true, begin, end}); return true; }
+    if (region.contains(bounds)) { output->append({from, segment, false, begin, end}); return true; }
+    if (qMax(bounds.width(), bounds.height()) <= .1 || depth >= 40) {
+        // Only the parameter at the cut is approximate (<= .1 source pixel).
+        // Every retained cubic's coordinates remain an exact de Casteljau subcurve.
+        Segment left, right;
+        splitSegment(from, segment, &left, &right);
+        output->append({from, segment, !region.contains(left.end + offset), begin, end});
+        return true;
+    }
+    Segment left, right;
+    splitSegment(from, segment, &left, &right);
+    const double middle = (begin + end) / 2.;
+    return clipSegment(from, left, offset, region, output, work, depth + 1, begin, middle)
+        && clipSegment(left.end, right, offset, region, output, work, depth + 1, middle, end);
+}
+ClippedSegment retainedInterval(QPointF from, const Segment& source, double begin, double end) {
+    Segment portion = source, discarded;
+    if (end < 1.) splitSegmentAt(from, source, end, &portion, &discarded);
+    QPointF start = from;
+    if (begin > 0.) {
+        Segment prefix;
+        splitSegmentAt(from, portion, begin / end, &prefix, &portion);
+        start = prefix.end;
+    }
+    return {start, portion, true, begin, end};
+}
+
+bool pathToSubpaths(const QPainterPath& path, QPointF offset, QVector<Subpath>* output, QString* error) {
+    if (path.elementCount() > MaxSegments * 3LL) {
+        *error = QStringLiteral("塗りの境界が編集可能な点数を超えています。"); return false;
+    }
+    auto finish = [&] {
+        if (!output->isEmpty() && !output->last().segments.isEmpty())
+            output->last().closed = same(output->last().start, output->last().segments.last().end);
+    };
+    for (int i = 0; i < path.elementCount(); ++i) {
+        const auto element = path.elementAt(i);
+        const QPointF point(element.x - offset.x(), element.y - offset.y());
+        if (!validPoint(point)) { *error = QStringLiteral("塗りの境界座標が範囲外です。"); return false; }
+        if (element.isMoveTo()) {
+            finish();
+            Subpath sub; sub.start = point; output->append(sub);
+        } else if (element.isLineTo()) {
+            if (output->isEmpty()) return false;
+            Segment segment; segment.end = point; output->last().segments.append(segment);
+        } else if (element.type == QPainterPath::CurveToElement && i + 2 < path.elementCount()) {
+            if (output->isEmpty()) return false;
+            const auto c2 = path.elementAt(++i), end = path.elementAt(++i);
+            const QPointF second(c2.x - offset.x(), c2.y - offset.y()), endpoint(end.x - offset.x(), end.y - offset.y());
+            if (!validPoint(second) || !validPoint(endpoint)) { *error = QStringLiteral("塗りの境界座標が範囲外です。"); return false; }
+            output->last().segments.append({point, second, endpoint, true, false});
+        } else { *error = QStringLiteral("塗りの境界を変換できません。"); return false; }
+    }
+    finish();
+    return true;
+}
+QVector<QVector<Subpath>> fillComponents(const QVector<Subpath>& loops, QString* error) {
+    if (loops.size() > 4096) { *error = QStringLiteral("分離した色面が多すぎます。短いストロークに分けてください。"); return {}; }
+    QVector<QPainterPath> paths;
+    QVector<QRectF> boxes;
+    paths.reserve(loops.size()); boxes.reserve(loops.size());
+    for (const auto& loop : loops) {
+        QPainterPath path(loop.start);
+        for (const auto& segment : loop.segments) {
+            if (segment.cubic) path.cubicTo(segment.c1, segment.c2, segment.end);
+            else path.lineTo(segment.end);
+        }
+        path.closeSubpath();
+        // Handles may extend outside an enclosing contour even when the entire
+        // curve lies inside it. Containment must use true curve extrema.
+        boxes.append(path.boundingRect()); paths.append(path);
+    }
+    QVector<int> parents(loops.size(), -1), depths(loops.size(), 0), components(loops.size(), -1);
+    int work = 0;
+    for (int i = 0; i < loops.size(); ++i) {
+        double smallest = std::numeric_limits<double>::max();
+        for (int j = 0; j < loops.size(); ++j) {
+            if (++work > 4000000) { *error = QStringLiteral("色面の分離処理が複雑すぎます。短いストロークに分けてください。"); return {}; }
+            if (i == j || !boxes[j].contains(boxes[i])) continue;
+            const double area = boxes[j].width() * boxes[j].height();
+            const double ownArea = boxes[i].width() * boxes[i].height();
+            if (area > ownArea && area < smallest && paths[j].contains(loops[i].start)) { parents[i] = j; smallest = area; }
+        }
+    }
+    QVector<QVector<Subpath>> result;
+    for (int i = 0; i < loops.size(); ++i) {
+        for (int parent = parents[i]; parent >= 0; parent = parents[parent]) ++depths[i];
+        if (depths[i] % 2 == 0) { components[i] = result.size(); result.append({loops[i]}); }
+    }
+    for (int i = 0; i < loops.size(); ++i)
+        if (depths[i] % 2 && parents[i] >= 0) result[components[parents[i]]].append(loops[i]);
+    return result;
+}
+
+constexpr qint64 MaxRasterBrushPixels = 64LL * 1024 * 1024;
+QRect brushRoi(const QPainterPath& region, QSize size, QString* error, bool final) {
+    if (!finitePath(region)) { *error = QStringLiteral("ブラシの座標または点数が範囲外です。"); return {}; }
+    if (region.isEmpty()) return {};
+    const auto box = region.controlPointRect().adjusted(-2, -2, 2, 2).intersected(QRectF(QPointF(), QSizeF(size)));
+    if (box.isEmpty()) return {};
+    const QRect roi = box.toAlignedRect().intersected(QRect(QPoint(), size));
+    const qint64 pixels = qint64(roi.width()) * roi.height();
+    if (final && pixels > MaxRasterBrushPixels) {
+        *error = QStringLiteral("1回の塗り操作の範囲が64メガピクセルを超えます。短いストロークに分けてください。"); return {};
+    }
+    if (final) {
+        // Mask, contour work, path copies and previews can overlap temporarily.
+        const quint64 required = quint64(pixels) * 96 + 64ULL * 1024 * 1024;
+        const quint64 available = availableMemoryBytes();
+        if ((!available && pixels > 1024 * 1024) || (available && required > (available / 10) * 7)) {
+            *error = QStringLiteral("塗りの境界を再計算する空きメモリーが不足しています。短いストロークに分けてください。"); return {};
+        }
+    }
+    return roi;
+}
+QTransform roiTransform(QRect roi, QSize pixels) {
+    QTransform transform;
+    transform.scale(double(pixels.width()) / roi.width(), double(pixels.height()) / roi.height());
+    transform.translate(-roi.x(), -roi.y());
+    return transform;
+}
+QImage geometryMask(const QPainterPath& path, const QPainterPath& erase, QRect roi) {
+    QImage mask(roi.size(), QImage::Format_ARGB32_Premultiplied);
+    if (mask.isNull()) return {};
+    mask.fill(Qt::transparent);
+    QPainter painter(&mask);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setTransform(roiTransform(roi, roi.size()));
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(Qt::white);
+    painter.drawPath(path);
+    if (!erase.isEmpty()) {
+        painter.setCompositionMode(QPainter::CompositionMode_Clear);
+        painter.drawPath(erase);
+    }
+    return mask;
+}
+double opacityAttribute(QDomElement element, const QString& name) {
+    bool valid = false;
+    const double opacity = inherited(element, name, QStringLiteral("1")).toDouble(&valid);
+    return valid && std::isfinite(opacity) ? qBound(0., opacity, 1.) : 1.;
+}
+QColor paintColor(QDomElement element, const QString& attribute, const QString& fallback) {
+    const QString text = inherited(element, attribute, fallback);
+    QColor color = text == QStringLiteral("none") ? QColor(Qt::transparent) : QColor(text);
+    if (!color.isValid()) color = Qt::transparent;
+    color.setAlphaF(color.alphaF() * opacityAttribute(element, attribute + QStringLiteral("-opacity")));
+    return color;
+}
 }
 
 struct EditDocument::Private {
     QDomDocument document;
     QVector<Shape> shapes;
+    QVector<int> paintOrder;
     QVector<QDomElement> groups[2];
     bool visible[2] = {true, true};
     QSize size;
@@ -302,6 +496,7 @@ struct EditDocument::Private {
                 const double stroke = inherited(element, QStringLiteral("stroke-width"), QStringLiteral("1")).toDouble(&ok);
                 shape.strokeWidth = ok && std::isfinite(stroke) && stroke >= 0 ? stroke : 1.;
                 updateGeometry(shape);
+                paintOrder.append(shapes.size());
                 shapes.append(shape);
             }
             for (auto child = element.firstChildElement(); !child.isNull(); child = child.nextSiblingElement())
@@ -403,7 +598,8 @@ bool EditDocument::setLayerVisible(Layer layer, bool visible) {
 QPainterPath EditDocument::path(int index) const { return d->valid(index) ? d->shapes[index].geometry : QPainterPath(); }
 int EditDocument::hitTest(QPointF point, double tolerance, Layer layer) const {
     if (!layerVisible(layer) || !validPoint(point) || !std::isfinite(tolerance) || tolerance < 0 || tolerance > MaxCoordinate) return -1;
-    for (int i = d->shapes.size() - 1; i >= 0; --i) {
+    for (int order = d->paintOrder.size() - 1; order >= 0; --order) {
+        const int i = d->paintOrder[order];
         const auto& shape = d->shapes[i];
         if (shape.deleted || !shape.visible || shape.layer != layer) continue;
         const double width = qMax(shape.strokeWidth, tolerance * 2);
@@ -614,6 +810,7 @@ int EditDocument::addBezierPath(const QVector<BezierAnchor>& anchors, QColor col
     shape.subpaths.append(sub);
     serialize(shape);
     const int index = d->shapes.size();
+    d->paintOrder.append(index);
     d->shapes.append(shape);
     d->segments += int(requiredSegments);
     d->changed();
@@ -660,6 +857,304 @@ int EditDocument::erasePaths(QPointF from, QPointF to, double radius, Layer laye
     for (int index : matches) remove(index);
     if (automatic) commitEdit();
     return matches.size();
+}
+int EditDocument::eraseLineSegments(const QPainterPath& sweptRegion, QString* error) {
+    QString message;
+    if (error) error->clear();
+    if (!finitePath(sweptRegion)) {
+        if (error) *error = QStringLiteral("消しゴムの座標または点数が範囲外です。"); return -1;
+    }
+    if (!layerVisible(Layer::Lines) || sweptRegion.isEmpty()) return 0;
+    QVector<QPair<int, Shape>> candidates;
+    QHash<double, QPainterPath> expandedRegions;
+    int work = 0;
+    qint64 totalSegments = d->segments;
+    for (int index = 0; index < d->shapes.size(); ++index) {
+        const auto& source = d->shapes[index];
+        if (source.deleted || !source.visible || source.layer != Layer::Lines) continue;
+        const double half = source.strokeWidth / 2.;
+        if (!source.geometry.controlPointRect().adjusted(-half, -half, half, half)
+                .intersects(sweptRegion.controlPointRect())) continue;
+        if (!expandedRegions.contains(source.strokeWidth)) {
+            QPainterPathStroker stroker;
+            stroker.setWidth(qMax(source.strokeWidth, 1.e-6));
+            stroker.setCapStyle(Qt::RoundCap); stroker.setJoinStyle(Qt::RoundJoin);
+            expandedRegions.insert(source.strokeWidth, sweptRegion.united(stroker.createStroke(sweptRegion)));
+        }
+        const auto& region = expandedRegions[source.strokeWidth];
+        Shape result = source;
+        result.subpaths.clear();
+        bool changed = false;
+        for (const auto& sub : source.subpaths) {
+            auto segments = sub.segments;
+            if (sub.closed && !segments.isEmpty() && !same(segments.last().end, sub.start)) {
+                Segment closing; closing.end = sub.start; segments.append(closing);
+            }
+            QVector<ClippedSegment> clipped;
+            QPointF from = sub.start;
+            bool clippedOk = true;
+            for (const auto& segment : segments) {
+                QVector<ClippedSegment> pieces;
+                if (!clipSegment(from, segment, source.offset, region, &pieces, &work)) { clippedOk = false; break; }
+                for (int piece = 0; piece < pieces.size();) {
+                    const int first = piece;
+                    while (piece + 1 < pieces.size() && pieces[piece + 1].keep == pieces[first].keep) ++piece;
+                    if (pieces[first].keep)
+                        clipped.append(retainedInterval(from, segment, pieces[first].begin, pieces[piece].end));
+                    else clipped.append({from, segment, false, pieces[first].begin, pieces[piece].end});
+                    ++piece;
+                }
+                from = segment.end;
+            }
+            if (!clippedOk) {
+                if (error) *error = QStringLiteral("消しゴム処理の点数が多すぎます。短いストロークに分けてください。"); return -1;
+            }
+            const bool removed = std::any_of(clipped.cbegin(), clipped.cend(), [](const ClippedSegment& item) { return !item.keep; });
+            if (!removed) { result.subpaths.append(sub); continue; }
+            changed = true;
+            QVector<Subpath> pieces;
+            bool continuing = false;
+            for (const auto& item : clipped) {
+                if (!item.keep) { continuing = false; continue; }
+                if (!continuing) { Subpath piece; piece.start = item.start; pieces.append(piece); }
+                pieces.last().segments.append(item.segment);
+                continuing = true;
+            }
+            if (sub.closed && pieces.size() > 1
+                && same(pieces.last().segments.last().end, pieces.first().start)) {
+                Subpath joined = pieces.takeLast();
+                joined.segments += pieces.takeFirst().segments;
+                pieces.prepend(joined);
+            }
+            result.subpaths += pieces;
+        }
+        if (!changed) continue;
+        totalSegments += shapeSegments(result) - shapeSegments(source);
+        if (totalSegments > MaxSegments) {
+            if (error) *error = QStringLiteral("消しゴムで分割した線が3200万区間を超えます。"); return -1;
+        }
+        candidates.append({index, std::move(result)});
+    }
+    if (candidates.isEmpty()) return 0;
+    const bool automatic = !d->editing;
+    if (automatic) beginEdit();
+    for (auto& candidate : candidates) {
+        if (candidate.second.subpaths.isEmpty()) remove(candidate.first);
+        else {
+            d->shapes[candidate.first] = std::move(candidate.second);
+            serialize(d->shapes[candidate.first]);
+        }
+    }
+    d->segments = int(totalSegments);
+    d->changed();
+    if (automatic) commitEdit();
+    return candidates.size();
+}
+int EditDocument::applyRasterFillBrush(const QPainterPath& sweptRegion, QColor color, bool erase, QString* error) {
+    if (error) error->clear();
+    if (!layerVisible(Layer::Fill)) return 0;
+    if (!color.isValid()) { if (error) *error = QStringLiteral("塗りの色が不正です。"); return -1; }
+    QString message;
+    const QRect roi = brushRoi(sweptRegion, d->size, &message, true);
+    if (!message.isEmpty()) { if (error) *error = message; return -1; }
+    if (roi.isEmpty()) return 0;
+    QVector<QPair<int, Shape>> candidates;
+    qint64 totalSegments = d->segments;
+    int addedPaths = 0;
+    if (erase) {
+        for (int index = 0; index < d->shapes.size(); ++index) {
+            const auto& source = d->shapes[index];
+            if (source.deleted || !source.visible || source.layer != Layer::Fill
+                || !source.geometry.controlPointRect().intersects(QRectF(roi))
+                || !source.geometry.intersects(sweptRegion)) continue;
+            const QRect pathRoi = roi.intersected(source.geometry.controlPointRect().adjusted(-2, -2, 2, 2).toAlignedRect());
+            QPainterPath clip; clip.addRect(QRectF(pathRoi));
+            const QImage mask = geometryMask(source.geometry, sweptRegion, pathRoi);
+            if (mask.isNull()) { if (error) *error = QStringLiteral("塗り操作の画像領域を確保できません。"); return -1; }
+            auto inside = traceRasterMask(mask, pathRoi.topLeft(), &message);
+            if (!message.isEmpty()) { if (error) *error = message; return -1; }
+            // Only touched paths enter this operation. Keep their area outside
+            // the raster patch; Qt may flatten intersected boundary cubics.
+            QPainterPath outside;
+            const bool internalPatch = source.geometry.fillRule() == Qt::OddEvenFill
+                && source.geometry.contains(QRectF(pathRoi));
+            if (internalPatch) {
+                // Preserve existing outer Beziers for a wholly internal patch.
+                // This shortcut is restricted to evenodd geometry: overlapping
+                // winding subpaths must retain their nonzero winding semantics.
+                const auto eraseMask = geometryMask(sweptRegion, {}, pathRoi);
+                if (eraseMask.isNull()) { if (error) *error = QStringLiteral("塗り操作の画像領域を確保できません。"); return -1; }
+                const auto hole = traceRasterMask(eraseMask, pathRoi.topLeft(), &message);
+                if (!message.isEmpty()) { if (error) *error = message; return -1; }
+                outside = source.geometry;
+                outside.addPath(hole);
+            } else outside = source.geometry.subtracted(clip).united(inside);
+            outside.setFillRule(Qt::OddEvenFill);
+            Shape result = source;
+            result.subpaths.clear();
+            if (!pathToSubpaths(outside, source.offset, &result.subpaths, &message)) {
+                if (error) *error = message.isEmpty() ? QStringLiteral("塗りの境界を復元できません。") : message; return -1;
+            }
+            // An internal erase only introduces a hole and cannot disconnect
+            // the region. Keep the compound shape intact, including any XOR
+            // overlap between its original evenodd subpaths.
+            const auto components = internalPatch ? QVector<QVector<Subpath>>{result.subpaths}
+                                                   : fillComponents(result.subpaths, &message);
+            if (!message.isEmpty()) { if (error) *error = message; return -1; }
+            totalSegments -= shapeSegments(source);
+            if (components.isEmpty()) { result.subpaths.clear(); candidates.append({index, result}); }
+            for (int component = 0; component < components.size(); ++component) {
+                result.subpaths = components[component];
+                totalSegments += shapeSegments(result);
+                candidates.append({component == 0 ? index : -index - 2, result});
+                if (component > 0) ++addedPaths;
+            }
+            if (totalSegments > MaxSegments) { if (error) *error = QStringLiteral("塗りの境界が3200万区間を超えます。"); return -1; }
+            if (d->shapes.size() + addedPaths > MaxPaths) { if (error) *error = QStringLiteral("分割した色面が500万パスを超えます。"); return -1; }
+        }
+        if (candidates.isEmpty()) return 0;
+    } else {
+        if (color.alpha() == 0) return 0;
+        const QImage mask = geometryMask(sweptRegion, {}, roi);
+        if (mask.isNull()) { if (error) *error = QStringLiteral("塗り操作の画像領域を確保できません。"); return -1; }
+        const auto traced = traceRasterMask(mask, roi.topLeft(), &message);
+        if (!message.isEmpty()) { if (error) *error = message; return -1; }
+        if (traced.isEmpty()) return 0;
+        Shape shape;
+        shape.layer = Layer::Fill;
+        if (!d->groups[1].isEmpty() && !translateOnly(d->groups[1].last(), &shape.offset)) {
+            if (error) *error = QStringLiteral("塗りレイヤーの座標変換に対応していません。"); return -1;
+        }
+        if (!pathToSubpaths(traced, shape.offset, &shape.subpaths, &message)) {
+            if (error) *error = message.isEmpty() ? QStringLiteral("塗りの境界を復元できません。") : message; return -1;
+        }
+        totalSegments += shapeSegments(shape);
+        if (totalSegments > MaxSegments || d->shapes.size() >= MaxPaths) {
+            if (error) *error = QStringLiteral("塗りの追加が編集可能な点数・パス数を超えます。"); return -1;
+        }
+        candidates.append({-1, std::move(shape)});
+    }
+    // All masks and contours succeeded before the first DOM mutation. Failure
+    // leaves every layer, path and undo history exactly as it was.
+    const bool automatic = !d->editing;
+    if (automatic) beginEdit();
+    for (auto& candidate : candidates) {
+        if (candidate.first < -1) {
+            const int sourceIndex = -candidate.first - 2;
+            auto& shape = candidate.second;
+            const auto sourceElement = d->shapes[sourceIndex].element;
+            shape.element = sourceElement.cloneNode(true).toElement();
+            shape.element.removeAttribute(QStringLiteral("id"));
+            shape.element.setAttribute(QStringLiteral("fill-rule"), QStringLiteral("evenodd"));
+            sourceElement.parentNode().insertAfter(shape.element, sourceElement);
+            serialize(shape);
+            d->paintOrder.insert(d->paintOrder.indexOf(sourceIndex) + 1, d->shapes.size());
+            d->shapes.append(std::move(shape));
+        } else if (candidate.first == -1) {
+            QDomElement group;
+            if (d->groups[1].isEmpty()) {
+                group = d->document.createElementNS(QString::fromLatin1(SvgNamespace), QStringLiteral("g"));
+                group.setAttribute(QStringLiteral("id"), QStringLiteral("fill"));
+                auto root = d->document.documentElement();
+                QDomNode before;
+                for (auto child = root.firstChildElement(); !child.isNull(); child = child.nextSiblingElement())
+                    if (child.attribute(QStringLiteral("id")) == QStringLiteral("lines")) { before = child; break; }
+                if (before.isNull()) root.appendChild(group); else root.insertBefore(group, before);
+                d->groups[1].append(group);
+            } else group = d->groups[1].last();
+            auto& shape = candidate.second;
+            shape.element = d->document.createElementNS(QString::fromLatin1(SvgNamespace), QStringLiteral("path"));
+            shape.element.setAttribute(QStringLiteral("fill"), color.name(QColor::HexRgb));
+            shape.element.setAttribute(QStringLiteral("fill-opacity"), number(color.alphaF()));
+            shape.element.setAttribute(QStringLiteral("stroke"), QStringLiteral("none"));
+            group.appendChild(shape.element);
+            shape.visible = paintVisible(shape.element);
+            shape.element.setAttribute(QStringLiteral("fill-rule"), QStringLiteral("evenodd"));
+            serialize(shape);
+            d->paintOrder.append(d->shapes.size());
+            d->shapes.append(std::move(shape));
+        } else if (candidate.second.subpaths.isEmpty()) remove(candidate.first);
+        else {
+            d->shapes[candidate.first] = std::move(candidate.second);
+            auto& shape = d->shapes[candidate.first];
+            shape.element.setAttribute(QStringLiteral("fill-rule"), QStringLiteral("evenodd"));
+            serialize(shape);
+        }
+    }
+    d->segments = int(totalSegments);
+    d->changed();
+    if (automatic) commitEdit();
+    return candidates.size();
+}
+QImage EditDocument::rasterBrushPreview(const QPainterPath& sweptRegion, QColor color, bool erase,
+                                       QRectF* bounds, QString* error, double outputScale) const {
+    if (error) error->clear();
+    if (bounds) *bounds = {};
+    if (!color.isValid() || !std::isfinite(outputScale) || outputScale <= 0) {
+        if (error) *error = QStringLiteral("ブラシプレビューの色・倍率が不正です。"); return {};
+    }
+    QString message;
+    const QRect roi = brushRoi(sweptRegion, d->size, &message, false);
+    if (!message.isEmpty()) { if (error) *error = message; return {}; }
+    if (roi.isEmpty()) return {};
+    const double scale = qMin(outputScale, qMin(1., std::sqrt((2. * 1024 * 1024) / (double(roi.width()) * roi.height()))));
+    const QSize pixels(qMax(1, int(std::floor(roi.width() * scale))), qMax(1, int(std::floor(roi.height() * scale))));
+    auto makeImage = [&] { QImage image(pixels, QImage::Format_ARGB32_Premultiplied); image.fill(Qt::transparent); return image; };
+    QImage result = makeImage(), fill = makeImage(), lines = makeImage();
+    if (result.isNull() || fill.isNull() || lines.isNull()) {
+        if (error) *error = QStringLiteral("ブラシプレビューの画像領域を確保できません。"); return {};
+    }
+    const auto transform = roiTransform(roi, pixels);
+    auto paintLayer = [&](QImage& destination, Layer layer) {
+        if (!layerVisible(layer)) return;
+        QPainter painter(&destination);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setTransform(transform);
+        for (int index : d->paintOrder) {
+            const auto& shape = d->shapes[index];
+            if (shape.deleted || !shape.visible || shape.layer != layer
+                || !shape.geometry.controlPointRect().adjusted(-shape.strokeWidth, -shape.strokeWidth,
+                        shape.strokeWidth, shape.strokeWidth).intersects(QRectF(roi))) continue;
+            bool valid = false;
+            const double ownOpacity = shape.element.attribute(QStringLiteral("opacity"), QStringLiteral("1")).toDouble(&valid);
+            painter.setOpacity(valid ? qBound(0., ownOpacity, 1.) : 1.);
+            if (layer == Layer::Fill) {
+                painter.setPen(Qt::NoPen);
+                painter.setBrush(paintColor(shape.element, QStringLiteral("fill"), QStringLiteral("black")));
+            } else {
+                QPen pen(paintColor(shape.element, QStringLiteral("stroke"), QStringLiteral("none")), shape.strokeWidth);
+                pen.setCapStyle(Qt::RoundCap); pen.setJoinStyle(Qt::RoundJoin);
+                painter.setPen(pen); painter.setBrush(Qt::NoBrush);
+            }
+            painter.drawPath(shape.geometry);
+        }
+    };
+    paintLayer(fill, Layer::Fill);
+    if (layerVisible(Layer::Fill)) {
+        QPainter painter(&fill);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setTransform(transform);
+        painter.setPen(Qt::NoPen); painter.setBrush(color);
+        if (erase) painter.setCompositionMode(QPainter::CompositionMode_Clear);
+        painter.drawPath(sweptRegion);
+    }
+    paintLayer(lines, Layer::Lines);
+    QPainter painter(&result);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setTransform(transform);
+    for (auto child = d->document.documentElement().firstChildElement(); !child.isNull(); child = child.nextSiblingElement()) {
+        if (child.attribute(QStringLiteral("id")) != QStringLiteral("background") || !paintVisible(child)) continue;
+        painter.fillRect(QRectF(QPointF(), QSizeF(d->size)), paintColor(child, QStringLiteral("fill"), QStringLiteral("black")));
+    }
+    painter.resetTransform();
+    const auto layerOpacity = [&](int layer) {
+        return d->groups[layer].isEmpty() ? 1. : opacityAttribute(d->groups[layer].first(), QStringLiteral("opacity"));
+    };
+    painter.setOpacity(layerOpacity(1)); painter.drawImage(QPoint(), fill);
+    painter.setOpacity(layerOpacity(0)); painter.drawImage(QPoint(), lines);
+    painter.end();
+    if (bounds) *bounds = QRectF(roi);
+    return result;
 }
 bool EditDocument::remove(int index) {
     if (!d->valid(index)) return false;

@@ -35,6 +35,9 @@
 #include <QScopeGuard>
 #include <QThreadPool>
 #include <QToolButton>
+#include <QContextMenuEvent>
+#include <QMenu>
+#include <cmath>
 #include <limits>
 
 class VectorTests : public QObject {
@@ -111,6 +114,15 @@ class VectorTests : public QObject {
         QMouseEvent move(QEvent::MouseMove, to, viewport->mapToGlobal(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
         QApplication::sendEvent(viewport, &move);
         QTest::mouseRelease(viewport, Qt::LeftButton, Qt::NoModifier, to);
+    }
+
+    bool setEditorPixels(const char* name, double value) {
+        auto* slider = panel->findChild<QSlider*>(name);
+        if (!slider) return false;
+        const double minimum = slider->property("minimumPixels").toDouble();
+        const double maximum = slider->property("maximumPixels").toDouble();
+        slider->setValue(qRound(1000. * std::log(value / minimum) / std::log(maximum / minimum)));
+        return qAbs(slider->property("pixelValue").toDouble() - value) <= qMax(.11, value * .01);
     }
 
     QPoint editorPoint(QPointF point) const {
@@ -1300,7 +1312,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
         auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
         QVERIFY(select("vectorEditLayer", "fill"));
-        panel->findChild<QDoubleSpinBox*>("vectorBrushRadius")->setValue(12);
+        QVERIFY(setEditorPixels("vectorBrushRadius", 12));
         int fill = -1;
         for(int i=0; i<editor->document().pathCount(); ++i)
             if(editor->document().layer(i)==Vector::EditDocument::Layer::Fill) fill=i;
@@ -1490,7 +1502,7 @@ private slots:
         QCOMPARE(digest(sourcePath), sourceDigest);
     }
 
-    void editEraserSweepsSelectedVisibleLayerAsOneUndo() {
+    void editWholePathDeleteSweepsSelectedVisibleLayerAsOneUndo() {
         QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
         QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
         auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
@@ -1502,8 +1514,8 @@ private slots:
         QVERIFY2(editor->begin(svg, &error), qPrintable(error));
         editor->setBrushRadius(1);
         controller->showPanel(); QCoreApplication::processEvents();
-        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolEraser"), Qt::LeftButton);
-        QCOMPARE(editor->tool(), Vector::Editor::Tool::Eraser);
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolDeletePaths"), Qt::LeftButton);
+        QCOMPARE(editor->tool(), Vector::Editor::Tool::DeletePaths);
         dragAt(editorPoint({8,24}), editorPoint({56,24})); QVERIFY(waitIdle());
         QVERIFY(!editor->document().path(0).isEmpty());
         QVERIFY(editor->document().path(1).isEmpty()); QVERIFY(editor->document().path(2).isEmpty());
@@ -1517,6 +1529,184 @@ private slots:
         QVERIFY(!editor->document().path(1).isEmpty()); QVERIFY(!editor->document().path(2).isEmpty());
         editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), hidden);
         QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void editRightClickFinishesAtLastAnchorWithoutContextMenu() {
+        QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        editor->setTool(Vector::Editor::Tool::Pen);
+        const int before = editor->document().pathCount();
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({8,3}));
+        dragAt(editorPoint({30,4}), editorPoint({34,7}));
+        QTest::mouseClick(view->viewport(), Qt::RightButton, Qt::NoModifier, editorPoint({60,44}));
+        QVERIFY(waitIdle()); QVERIFY(!editor->hasPendingPen());
+        QCOMPARE(editor->document().pathCount(), before+1);
+        const auto handles = editor->document().handles(editor->selectedPath());
+        int anchors = 0;
+        for (const auto& handle : handles) anchors += handle.kind == Vector::Handle::Anchor;
+        QCOMPARE(anchors,2);
+        QVERIFY(QLineF(handles.last().point,QPointF(30,4)).length()<.3);
+        for (QWidget* target : {view->viewport(), static_cast<QWidget*>(window.data()), static_cast<QWidget*>(panel)}) {
+            for (const auto reason : {QContextMenuEvent::Mouse, QContextMenuEvent::Keyboard}) {
+                QContextMenuEvent event(reason, QPoint(15,15), target->mapToGlobal(QPoint(15,15)));
+                QApplication::sendEvent(target, &event); QCoreApplication::processEvents();
+                auto* popup = QApplication::activePopupWidget();
+                if (popup) popup->close();
+                QVERIFY2(!popup, "Context menu must stay hidden throughout editing");
+            }
+        }
+        QTest::keyClick(view->viewport(), Qt::Key_Menu);
+        QTest::keyClick(view->viewport(), Qt::Key_F10, Qt::ShiftModifier);
+        QVERIFY(!QApplication::activePopupWidget());
+        QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void editPartialLineEraserRetainsSidesAndUndo() {
+        QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='48' viewBox='0 0 64 48'>"
+            "<g id='fill'><path fill='#ff8000' d='M5 8 L58 8 L58 40 L5 40 Z'/></g>"
+            "<g id='lines' fill='none' stroke='black' stroke-width='2'>"
+            "<path d='M3 24 C20 5 44 43 61 24'/></g></svg>";
+        QString error; QVERIFY2(editor->begin(svg, &error), qPrintable(error));
+        editor->setTool(Vector::Editor::Tool::Eraser);
+        QVERIFY(setEditorPixels("vectorBrushRadius", 3));
+        dragAt(editorPoint({32,1}), editorPoint({32,47})); QVERIFY(waitIdle());
+        const auto cutSvg = editor->svg(); QVERIFY(cutSvg != svg);
+        Vector::EditDocument cut; QVERIFY(cut.load(cutSvg, &error));
+        QVERIFY(!cut.path(1).isEmpty());
+        int moves = 0; for (int i=0;i<cut.path(1).elementCount();++i) moves += cut.path(1).elementAt(i).isMoveTo();
+        QVERIFY(moves >= 2);
+        const auto handles = cut.handles(1); QVERIFY(handles.size() >= 8);
+        QVERIFY(cut.hitTest({32,24}, .1, Vector::Layer::Lines) < 0);
+        QVERIFY(cut.hitTest({3,24}, .1, Vector::Layer::Lines) >= 0);
+        QVERIFY(cut.hitTest({61,24}, .1, Vector::Layer::Lines) >= 0);
+        QCOMPARE(cut.path(0), editor->document().path(0));
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), svg);
+        editor->redo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), cutSvg);
+        editor->setLayerVisible(Vector::Layer::Lines, false); QVERIFY(waitIdle());
+        const auto hidden = editor->svg();
+        dragAt(editorPoint({12,1}), editorPoint({12,47})); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), hidden);
+        QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void editFillRasterPenAndEraserExportVectorContours() {
+        QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='48' viewBox='0 0 64 48'>"
+            "<g id='fill'><path fill='#2080c0' d='M4 6 L60 6 L60 42 L4 42 Z'/></g>"
+            "<g id='lines' fill='none' stroke='black' stroke-width='2'><path d='M8 12 L56 12'/></g></svg>";
+        QString error; QVERIFY2(editor->begin(svg, &error), qPrintable(error));
+        // Publish this known fixture through the same controller change path.
+        editor->setLayerVisible(Vector::Layer::Lines, false); QVERIFY(waitIdle());
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), svg);
+        QVERIFY(select("vectorEditLayer", "fill"));
+        controller->showPanel(); QCoreApplication::processEvents();
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolPen"), Qt::LeftButton);
+        QCOMPARE(editor->tool(), Vector::Editor::Tool::Pen); QCOMPARE(editor->layer(), Vector::Layer::Fill);
+        editor->setColor(Qt::red); QVERIFY(setEditorPixels("vectorBrushRadius", 3));
+        const auto baseline = editor->svg();
+        const auto from = editorPoint({12,24}), to = editorPoint({50,24});
+        QTest::mousePress(view->viewport(), Qt::LeftButton, Qt::NoModifier, from);
+        QMouseEvent move(QEvent::MouseMove, to, view->viewport()->mapToGlobal(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(view->viewport(), &move); QTest::qWait(100);
+        QCOMPARE(editor->svg(), baseline); // Contours are committed only on release.
+        const auto live = view->viewport()->grab().toImage();
+        const auto sample = live.pixelColor(editorPoint({30,24}));
+        QVERIFY(sample.red()>240 && sample.green()<15 && sample.blue()<15);
+        const auto artifacts = qEnvironmentVariable("ARTIFACTS");
+        if (!artifacts.isEmpty()) QVERIFY(window->grab().save(artifacts+"/raster-fill-live.png"));
+        QTest::mouseRelease(view->viewport(), Qt::LeftButton, Qt::NoModifier, to); QVERIFY(waitIdle());
+        QVERIFY(!editor->hasPendingPen()); QVERIFY(editor->svg()!=baseline);
+        auto painted = Vector::rasterizeSvg(editor->svg(), QSize(64,48), &error);
+        QVERIFY2(!painted.isNull(),qPrintable(error)); QCOMPARE(painted.pixelColor(30,24),QColor(Qt::red));
+        QCOMPARE(painted.pixelColor(30,36),QColor("#2080c0"));
+        QCOMPARE(painted.pixelColor(30,12),QColor(Qt::black));
+        const auto paintedSvg = editor->svg();
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolEraser"), Qt::LeftButton);
+        dragAt(editorPoint({32,1}), editorPoint({32,47})); QVERIFY(waitIdle());
+        const auto erasedSvg = editor->svg(); QVERIFY(erasedSvg != paintedSvg);
+        const auto pngPath = files.filePath("raster-edited.png");
+        QVERIFY2(controller->savePng(pngPath,1,&error),qPrintable(error));
+        const QImage erased(pngPath);
+        QCOMPARE(erased.pixelColor(32,24).alpha(),0);
+        QCOMPARE(erased.pixelColor(32,36).alpha(),0);
+        QCOMPARE(erased.pixelColor(32,12),QColor(Qt::black)); // Fill eraser preserves lines.
+        QCOMPARE(erased.pixelColor(15,24),QColor(Qt::red)); QCOMPARE(erased.pixelColor(48,36),QColor("#2080c0"));
+        QVERIFY(!erasedSvg.contains("<image")); QVERIFY(!erasedSvg.contains("data:image"));
+        Vector::EditDocument reloaded; QVERIFY(reloaded.load(savedSvg().toByteArray(-1), &error));
+        QVERIFY(reloaded.hitTest({15,36},0,Vector::Layer::Fill)>=0);
+        QVERIFY(reloaded.hitTest({48,36},0,Vector::Layer::Fill)>=0);
+        QCOMPARE(reloaded.hitTest({32,36},0,Vector::Layer::Fill),-1);
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(),paintedSvg);
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(),baseline);
+        editor->redo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(),paintedSvg);
+        editor->redo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(),erasedSvg);
+        QCOMPARE(digest(sourcePath),sourceDigest);
+    }
+
+    void editEyedropperReplacesPaletteAndUsesPixelSliders() {
+        QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='48' viewBox='0 0 64 48'>"
+            "<g id='fill'><path fill='#aa2233' d='M4 6 L60 6 L60 42 L4 42 Z'/></g>"
+            "<g id='lines' fill='none' stroke='#2255aa' stroke-width='4'><path d='M8 24 L56 24'/></g></svg>";
+        QString error; QVERIFY2(editor->begin(svg,&error),qPrintable(error));
+        controller->showPanel(); QCoreApplication::processEvents();
+        QVERIFY(panel->findChild<QSlider*>("vectorBrushRadius")); QVERIFY(panel->findChild<QSlider*>("vectorEditLineWidth"));
+        QVERIFY(!panel->findChild<QDoubleSpinBox*>("vectorBrushRadius")); QVERIFY(!panel->findChild<QDoubleSpinBox*>("vectorEditLineWidth"));
+        QVERIFY(setEditorPixels("vectorBrushRadius", 5)); QVERIFY(setEditorPixels("vectorEditLineWidth", 2.6));
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolEraser"), Qt::LeftButton);
+        auto* radius = panel->findChild<QSlider*>("vectorBrushRadius");
+        radius->setFocus(); const int previous = radius->value();
+        QTest::keyClick(radius, Qt::Key_Right); QCOMPARE(radius->value(), previous+1);
+        QTest::keyClick(radius, Qt::Key_Left); QCOMPARE(radius->value(), previous);
+        QCOMPARE(view->getCurrentFileDetails().fileInfo.absoluteFilePath(), sourcePath);
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolEyedropper"), Qt::LeftButton);
+        QSignalSpy picked(editor,&Vector::Editor::colorPicked);
+        QTest::mouseClick(view->viewport(),Qt::LeftButton,Qt::NoModifier,editorPoint({30,24}));
+        QTRY_COMPARE(picked.count(),1); QVERIFY(waitIdle());
+        QCOMPARE(picked.last()[0].value<QColor>(),QColor("#2255aa")); QCOMPARE(editor->svg(),svg);
+        auto* swatch=panel->findChild<QToolButton*>("vectorPalette0");
+        QTest::mouseClick(swatch,Qt::LeftButton); QCOMPARE(swatch->property("color").value<QColor>(),QColor("#2255aa"));
+        QCOMPARE(QSettings().value("vector/editPalette").toStringList()[0],QString("#ff2255aa"));
+        editor->setLayerVisible(Vector::Layer::Lines,false); QVERIFY(waitIdle());
+        const auto hidden=editor->svg();
+        QTest::mouseClick(view->viewport(),Qt::LeftButton,Qt::NoModifier,editorPoint({30,24}));
+        QTRY_COMPARE(picked.count(),2); QVERIFY(waitIdle());
+        QCOMPARE(picked.last()[0].value<QColor>(),QColor("#aa2233")); QCOMPARE(editor->svg(),hidden);
+        QTest::mouseClick(swatch,Qt::LeftButton); QCOMPARE(swatch->property("color").value<QColor>(),QColor("#aa2233"));
+        if (!qEnvironmentVariable("ARTIFACTS").isEmpty()) QVERIFY(panel->grab().save(qEnvironmentVariable("ARTIFACTS")+"/brush-tools-panel.png"));
+        QCOMPARE(digest(sourcePath),sourceDigest);
+    }
+
+    void largePartialEraseRunsAsynchronouslyAndCancelsOnSourceChange() {
+        QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        editor->setAddLine(true); dragAt(editorPoint({8,3}),editorPoint({55,3})); QVERIFY(waitIdle());
+        auto padded=editor->svg(); const auto at=padded.lastIndexOf("</svg>"); QVERIFY(at>0);
+        padded.insert(at,QByteArray("<!--")+QByteArray(9*1024*1024,'x')+"-->");
+        QString error; QVERIFY2(editor->begin(padded,&error),qPrintable(error));
+        editor->setTool(Vector::Editor::Tool::Eraser); editor->setBrushRadius(1);
+        dragAt(editorPoint({30,1}),editorPoint({30,5}));
+        QVERIFY(editor->isBusy()); QVERIFY(controller->isBusy());
+        QVERIFY(!panel->findChild<QPushButton*>("vectorSaveSvg")->isEnabled());
+        bool responsive=false; QTimer::singleShot(0,[&]{responsive=true;});
+        QTRY_VERIFY(responsive); QVERIFY(waitIdle(30000)); QVERIFY(editor->svg()!=padded);
+        editor->undo(); QVERIFY(waitIdle(30000)); QCOMPARE(editor->svg(),padded);
+        dragAt(editorPoint({30,1}),editorPoint({30,5})); QVERIFY(editor->isBusy());
+        const auto other=files.filePath("brush-cancel-source.png"); QVERIFY(fixture().save(other));
+        window->openFile(other);
+        QTRY_COMPARE(view->getCurrentFileDetails().fileInfo.absoluteFilePath(),other);
+        QThreadPool::globalInstance()->waitForDone(); QCoreApplication::processEvents();
+        QVERIFY(!editor->active()); QVERIFY(!editor->isBusy());
+        QVERIFY(!controller->hasResult()); QVERIFY(!controller->hasEdits());
+        QCOMPARE(digest(sourcePath),sourceDigest);
     }
 
     void largeEditUndoRunsAsynchronouslyAndCancelsOnReset() {

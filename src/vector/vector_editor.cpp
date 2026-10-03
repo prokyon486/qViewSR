@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vector_editor.h"
 #include "memory_budget.h"
+#include "generated_svg_renderer.h"
 #include "qvgraphicsview.h"
+#include "sr/color_pipeline.h"
 
 #include <QAbstractSpinBox>
+#include <QAbstractSlider>
 #include <QApplication>
 #include <QComboBox>
+#include <QColorSpace>
 #include <QKeyEvent>
 #include <QHash>
 #include <QFutureWatcher>
 #include <QLineEdit>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPathStroker>
 #include <QPlainTextEdit>
 #include <QScrollBar>
 #include <QTextEdit>
@@ -27,6 +32,25 @@ struct HistoryResult {
     bool changed = false;
     QString error;
 };
+
+struct PickedColor {
+    QColor color;
+    QString error;
+};
+
+PickedColor sampleSvgColor(const QByteArray& svg, const QPointF& point)
+{
+    PickedColor result;
+    GeneratedSvgRenderer renderer(svg);
+    if (!renderer.isValid()) { result.error = renderer.errorString(); return result; }
+    QImage pixel(3, 3, QImage::Format_ARGB32_Premultiplied);
+    pixel.setColorSpace(QColorSpace::SRgb);
+    pixel.fill(Qt::transparent);
+    // Sample the composited source SVG, never monitor-profile screenshot RGB.
+    if (!renderer.render(pixel, QTransform::fromTranslate(1.5 - point.x(), 1.5 - point.y()), &result.error)) return result;
+    result.color = pixel.pixelColor(1, 1);
+    return result;
+}
 
 QPointF position(const QMouseEvent* event)
 {
@@ -56,6 +80,9 @@ Editor::Editor(QVGraphicsView* view) : QObject(view), view_(view)
     connect(view, &QVGraphicsView::vectorEditorOverlay, this, &Editor::paint,
             Qt::DirectConnection);
     connect(&view->getImageCore(), &QVImageCore::sourceChanging, this, &Editor::end);
+    brushPreviewTimer_.setSingleShot(true);
+    brushPreviewTimer_.setInterval(75);
+    connect(&brushPreviewTimer_, &QTimer::timeout, this, &Editor::updateBrushPreview);
 }
 
 Editor::~Editor()
@@ -154,10 +181,7 @@ void Editor::setLayer(EditDocument::Layer layer)
     cancelPen(true);
     layer_ = layer;
     selected_ = -1;
-    if (layer != EditDocument::Layer::Lines) {
-        addLine_ = false;
-        if (tool_ == Tool::Pen) tool_ = Tool::Select;
-    }
+    if (layer != EditDocument::Layer::Lines) addLine_ = false;
     updateCursor();
     if (view_) view_->viewport()->update();
     emit stateChanged();
@@ -171,7 +195,6 @@ void Editor::setTool(Tool tool)
     tool_ = tool;
     addLine_ = false;
     selected_ = -1;
-    if (tool == Tool::Pen) layer_ = EditDocument::Layer::Lines;
     updateCursor();
     if (view_) view_->viewport()->update();
     emit stateChanged();
@@ -370,6 +393,157 @@ void Editor::changeHistory(bool redo)
     }));
 }
 
+QPainterPath Editor::brushRegion() const
+{
+    QPainterPathStroker stroker;
+    stroker.setWidth(strokeRadius_ * 2.);
+    stroker.setCapStyle(Qt::RoundCap);
+    stroker.setJoinStyle(Qt::RoundJoin);
+    QPainterPath region = stroker.createStroke(eraserTrace_);
+    region.setFillRule(Qt::WindingFill);
+    // A click has no segments for QPainterPathStroker to expand.
+    if (eraserTrace_.elementCount() <= 1)
+        region.addEllipse(pressDocument_, strokeRadius_, strokeRadius_);
+    return region;
+}
+
+void Editor::updateBrushPreview()
+{
+    if (!active_ || historyBusy_ || gesture_ != Gesture::Brush || strokeLayer_ != EditDocument::Layer::Fill) return;
+    QString error;
+    QRectF bounds;
+    // Source resolution is sufficient when zoomed in. Zoomed-out previews need
+    // only viewport resolution; the model additionally caps this at two MP.
+    const double scale = qMin(1., 1. / sourceTolerance(1.));
+    QImage preview = document_.rasterBrushPreview(brushRegion(), strokeColor_, strokeErase_, &bounds, &error, scale);
+    if (!preview.isNull() && !brushDisplayIcc_.isEmpty() && brushDisplayIcc_ != Sr::srgbProfile())
+        preview = Sr::convert(preview, Sr::Profile{Sr::srgbProfile(), QStringLiteral("sRGB"), {}, false}, brushDisplayIcc_, &error);
+    if (!preview.isNull()) {
+        brushPreview_ = preview;
+        brushPreviewBounds_ = bounds;
+    } else if (!error.isEmpty() && !previewErrorShown_) {
+        previewErrorShown_ = true;
+        emit message(error);
+    }
+    if (view_) view_->viewport()->update();
+}
+
+void Editor::finishBrushStroke()
+{
+    if (gesture_ != Gesture::Brush) return;
+    brushPreviewTimer_.stop();
+    const auto region = brushRegion();
+    const auto layer = strokeLayer_;
+    const auto color = strokeColor_;
+    const bool erase = strokeErase_;
+    gesture_ = Gesture::None;
+    eraserTrace_ = {};
+    brushPreview_ = {};
+    brushPreviewBounds_ = {};
+    selected_ = -1;
+    const auto currentSvg = document_.svg();
+    const auto memoryError = EditDocument::memoryError(quint64(currentSvg.size()), availableMemoryBytes());
+    if (!memoryError.isEmpty()) {
+        emit message(memoryError);
+        if (view_) view_->viewport()->update();
+        return;
+    }
+    const auto apply = [region, layer, color, erase](EditDocument& model) {
+        HistoryResult result;
+        model.beginEdit();
+        const int changes = layer == EditDocument::Layer::Lines
+            ? model.eraseLineSegments(region, &result.error)
+            : model.applyRasterFillBrush(region, color, erase, &result.error);
+        if (changes < 0) model.cancelEdit();
+        else {
+            model.commitEdit();
+            result.changed = changes > 0;
+        }
+        return result;
+    };
+    const QRectF bounds = region.boundingRect().intersected(document_.viewBox());
+    const bool asynchronous = currentSvg.size() > AsyncHistoryThreshold || bounds.width() * bounds.height() > 1000000.;
+    if (!asynchronous) {
+        HistoryResult result;
+        try { result = apply(document_); }
+        catch (...) {
+            try { document_.cancelEdit(); } catch (...) {}
+            result.error = QStringLiteral("ブラシ処理中にエラーが発生しました。直前の編集結果を保持しています。");
+        }
+        updateCursor();
+        if (result.changed) notifyChanged();
+        else { if (view_) view_->viewport()->update(); emit stateChanged(); }
+        if (!result.error.isEmpty()) emit message(result.error);
+        return;
+    }
+
+    historyLinesVisible_ = document_.layerVisible(EditDocument::Layer::Lines);
+    historyFillVisible_ = document_.layerVisible(EditDocument::Layer::Fill);
+    auto model = std::make_shared<EditDocument>(std::move(document_));
+    document_ = EditDocument();
+    historySvg_ = currentSvg;
+    historyBusy_ = true;
+    const auto revision = ++historyRevision_;
+    updateCursor();
+    if (view_) view_->viewport()->update();
+    emit stateChanged();
+    emit message(layer == EditDocument::Layer::Lines ? QStringLiteral("主線の消しゴム処理を確定しています…")
+                                                    : QStringLiteral("色面の境界をベクターへ戻しています…"));
+    auto* watcher = new QFutureWatcher<HistoryResult>(this);
+    connect(watcher, &QFutureWatcher<HistoryResult>::finished, this, [this, watcher, model, revision] {
+        const auto result = watcher->result(); watcher->deleteLater();
+        if (revision != historyRevision_ || !historyBusy_) return;
+        document_ = std::move(*model); *model = EditDocument();
+        historyBusy_ = false; historySvg_.clear();
+        updateCursor();
+        if (view_) view_->viewport()->update();
+        if (result.changed) notifyChanged(); else emit stateChanged();
+        if (!result.error.isEmpty()) emit message(result.error);
+    });
+    watcher->setFuture(QtConcurrent::run([model, apply] {
+        try { return apply(*model); }
+        catch (...) {
+            try { model->cancelEdit(); } catch (...) {}
+            return HistoryResult{false, QStringLiteral("ブラシ処理中にエラーが発生しました。直前の編集結果を保持しています。")};
+        }
+    }));
+}
+
+void Editor::pickColor(const QPointF& point)
+{
+    if (!active_ || historyBusy_) return;
+    const auto bytes = document_.svg();
+    const auto accept = [this](const PickedColor& result) {
+        if (!result.error.isEmpty()) emit message(result.error);
+        if (!result.color.isValid()) return;
+        color_ = result.color;
+        emit colorPicked(color_);
+        emit stateChanged();
+        if (view_) view_->viewport()->update();
+    };
+    if (bytes.size() <= AsyncHistoryThreshold) { accept(sampleSvgColor(bytes, point)); return; }
+    const auto memoryError = svgMemoryError(quint64(bytes.size()));
+    if (!memoryError.isEmpty()) { emit message(memoryError); return; }
+    historySvg_ = bytes;
+    historyLinesVisible_ = document_.layerVisible(EditDocument::Layer::Lines);
+    historyFillVisible_ = document_.layerVisible(EditDocument::Layer::Fill);
+    historyBusy_ = true;
+    const auto revision = ++historyRevision_;
+    updateCursor(); emit stateChanged();
+    emit message(QStringLiteral("表示中のSVGから色を取得しています…"));
+    auto* watcher = new QFutureWatcher<PickedColor>(this);
+    connect(watcher, &QFutureWatcher<PickedColor>::finished, this, [this, watcher, revision, accept] {
+        const auto result = watcher->result(); watcher->deleteLater();
+        if (revision != historyRevision_ || !historyBusy_) return;
+        historyBusy_ = false; historySvg_.clear();
+        updateCursor(); emit stateChanged(); accept(result);
+    });
+    watcher->setFuture(QtConcurrent::run([bytes, point] {
+        try { return sampleSvgColor(bytes, point); }
+        catch (...) { return PickedColor{{}, QStringLiteral("SVGから色を取得できませんでした。")}; }
+    }));
+}
+
 QTransform Editor::mapping() const
 {
     return view_ ? view_->vectorToViewportTransform(document_.viewBox()) : QTransform();
@@ -402,7 +576,7 @@ bool Editor::textInput(QObject* object) const
     for (; widget; widget = widget->parentWidget()) {
         if (qobject_cast<QLineEdit*>(widget) || qobject_cast<QAbstractSpinBox*>(widget)
             || qobject_cast<QTextEdit*>(widget) || qobject_cast<QPlainTextEdit*>(widget)
-            || qobject_cast<QComboBox*>(widget)) return true;
+            || qobject_cast<QComboBox*>(widget) || qobject_cast<QAbstractSlider*>(widget)) return true;
         if (widget->isWindow()) break;
     }
     return false;
@@ -499,6 +673,10 @@ bool Editor::handleAt(const QPointF& point, EditDocument::Handle* result, QPoint
 
 bool Editor::mousePress(QMouseEvent* event)
 {
+    if (event->button() == Qt::RightButton) {
+        if (tool_ == Tool::Pen && layer_ == EditDocument::Layer::Lines) finishPen();
+        return true;
+    }
     if (event->button() != Qt::LeftButton) return true;
     cancelGesture();
     view_->setFocus(Qt::MouseFocusReason);
@@ -510,20 +688,35 @@ bool Editor::mousePress(QMouseEvent* event)
         updateCursor();
         return true;
     }
+    if (tool_ == Tool::Eyedropper) {
+        pickColor(lastDocument_);
+        return true;
+    }
     if (!document_.layerVisible(layer_)) {
         selected_ = -1;
         emit message(QStringLiteral("編集するレイヤーを表示してください。"));
         emit stateChanged();
         return true;
     }
-    if (tool_ == Tool::Pen) {
+    if (tool_ == Tool::Pen && layer_ == EditDocument::Layer::Lines) {
         selected_ = -1;
         penAnchors_.append({lastDocument_, lastDocument_, lastDocument_});
         gesture_ = Gesture::PenAnchor;
-    } else if (tool_ == Tool::Eraser) {
+    } else if (tool_ == Tool::Eraser || (tool_ == Tool::Pen && layer_ == EditDocument::Layer::Fill)) {
+        selected_ = -1;
+        gesture_ = Gesture::Brush;
+        eraserTrace_ = QPainterPath(lastDocument_);
+        strokeLayer_ = layer_; strokeErase_ = tool_ == Tool::Eraser;
+        strokeRadius_ = brushRadius_; strokeColor_ = color_;
+        brushPreview_ = {}; brushPreviewBounds_ = {}; previewErrorShown_ = false;
+        if (strokeLayer_ == EditDocument::Layer::Fill) {
+            brushDisplayIcc_ = view_->getLoadedPixmap().toImage().colorSpace().iccProfile();
+            brushPreviewTimer_.start(0);
+        }
+    } else if (tool_ == Tool::DeletePaths) {
         selected_ = -1;
         document_.beginEdit();
-        gesture_ = Gesture::Erase;
+        gesture_ = Gesture::DeletePaths;
         eraserTrace_ = QPainterPath(lastDocument_);
         dirtyGesture_ = document_.erasePaths(lastDocument_, lastDocument_, brushRadius_, layer_) > 0;
     } else if (addLine_ && layer_ == EditDocument::Layer::Lines) {
@@ -588,11 +781,17 @@ bool Editor::mouseMove(QMouseEvent* event)
         lastDocument_ = toDocument(current);
     } else if (gesture_ == Gesture::PenAnchor) {
         updatePenTangent(current);
-    } else if (gesture_ == Gesture::Erase) {
+    } else if (gesture_ == Gesture::DeletePaths) {
         const auto target = toDocument(current);
         dirtyGesture_ |= document_.erasePaths(lastDocument_, target, brushRadius_, layer_) > 0;
         eraserTrace_.lineTo(target);
         lastDocument_ = target;
+    } else if (gesture_ == Gesture::Brush) {
+        const auto target = toDocument(current);
+        // Reduce duplicate hover samples while retaining the swept segment.
+        if (QLineF(target, lastDocument_).length() > .00001) eraserTrace_.lineTo(target);
+        lastDocument_ = target;
+        if (strokeLayer_ == EditDocument::Layer::Fill && !brushPreviewTimer_.isActive()) brushPreviewTimer_.start(75);
     }
     lastViewport_ = current;
     view_->viewport()->update();
@@ -612,9 +811,14 @@ bool Editor::mouseRelease(QMouseEvent* event)
         lastDocument_ = target;
     } else if (gesture_ == Gesture::PenAnchor) {
         updatePenTangent(position(event));
-    } else if (gesture_ == Gesture::Erase) {
+    } else if (gesture_ == Gesture::DeletePaths) {
         dirtyGesture_ |= document_.erasePaths(lastDocument_, target, brushRadius_, layer_) > 0;
         lastDocument_ = target;
+    } else if (gesture_ == Gesture::Brush) {
+        if (QLineF(target, lastDocument_).length() > .00001) eraserTrace_.lineTo(target);
+        lastDocument_ = target;
+        finishBrushStroke();
+        return true;
     } else if (gesture_ == Gesture::AddLine) {
         lastDocument_ = toDocument(position(event));
         if (QLineF(mapping().map(pressDocument_), position(event)).length() >= 2.) {
@@ -629,13 +833,15 @@ bool Editor::mouseRelease(QMouseEvent* event)
 
 void Editor::cancelGesture()
 {
+    brushPreviewTimer_.stop();
     if (gesture_ == Gesture::PenAnchor && !penAnchors_.isEmpty()) {
         penAnchors_.removeLast();
         emit stateChanged();
-    } else if (gesture_ != Gesture::None && gesture_ != Gesture::Pan) document_.cancelEdit();
+    } else if (gesture_ != Gesture::None && gesture_ != Gesture::Pan && gesture_ != Gesture::Brush) document_.cancelEdit();
     gesture_ = Gesture::None;
     controlDisplayOffset_ = {};
     eraserTrace_ = {};
+    brushPreview_ = {}; brushPreviewBounds_ = {};
     dirtyGesture_ = false;
     updateCursor();
     if (view_) view_->viewport()->update();
@@ -646,7 +852,7 @@ void Editor::finishGesture()
     const bool changedDocument = dirtyGesture_;
     if (gesture_ == Gesture::Fill && changedDocument)
         document_.deformFill(selected_, lastDocument_, {}, brushRadius_, true);
-    if (gesture_ != Gesture::None && gesture_ != Gesture::Pan && gesture_ != Gesture::PenAnchor) {
+    if (gesture_ != Gesture::None && gesture_ != Gesture::Pan && gesture_ != Gesture::PenAnchor && gesture_ != Gesture::Brush) {
         if (changedDocument) document_.commitEdit();
         else document_.cancelEdit();
     }
@@ -673,6 +879,7 @@ void Editor::updateCursor()
     view_->viewport()->setCursor(historyBusy_ ? Qt::BusyCursor
         : gesture_ == Gesture::Pan ? Qt::ClosedHandCursor
         : spaceDown_ ? Qt::OpenHandCursor
+        : tool_ == Tool::Eyedropper ? Qt::CrossCursor
         : !document_.layerVisible(layer_) ? Qt::ForbiddenCursor
         : addLine_ || tool_ != Tool::Select || layer_ == EditDocument::Layer::Fill ? Qt::CrossCursor : Qt::ArrowCursor);
 }
@@ -680,6 +887,9 @@ void Editor::updateCursor()
 bool Editor::eventFilter(QObject* object, QEvent* event)
 {
     if (!active_ || !view_) return false;
+    // MainWindow owns the context-menu popup, so intercept before the event
+    // propagates from the viewport, including keyboard-triggered menus.
+    if (event->type() == QEvent::ContextMenu && inScope(object)) { event->accept(); return true; }
     if (object == view_->viewport()) {
         if (historyBusy_ && (event->type() == QEvent::MouseButtonPress
             || event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonRelease
@@ -689,7 +899,8 @@ bool Editor::eventFilter(QObject* object, QEvent* event)
         case QEvent::MouseMove: return mouseMove(static_cast<QMouseEvent*>(event));
         case QEvent::MouseButtonRelease: return mouseRelease(static_cast<QMouseEvent*>(event));
         case QEvent::MouseButtonDblClick:
-            if (tool_ == Tool::Pen && !spaceDown_ && document_.layerVisible(EditDocument::Layer::Lines)) {
+            if (tool_ == Tool::Pen && layer_ == EditDocument::Layer::Lines && !spaceDown_
+                && document_.layerVisible(EditDocument::Layer::Lines)) {
                 const auto* mouse = static_cast<QMouseEvent*>(event);
                 if (mouse->button() == Qt::LeftButton) {
                     const auto point = position(mouse);
@@ -718,6 +929,26 @@ bool Editor::eventFilter(QObject* object, QEvent* event)
     if (event->type() != QEvent::ShortcutOverride && event->type() != QEvent::KeyPress
         && event->type() != QEvent::KeyRelease) return false;
     auto* key = static_cast<QKeyEvent*>(event);
+    if (key->key() == Qt::Key_Menu || (key->key() == Qt::Key_F10 && key->modifiers().testFlag(Qt::ShiftModifier))) {
+        key->accept(); return true;
+    }
+    if (qobject_cast<QAbstractSlider*>(object)) {
+        const int code = key->key();
+        const bool navigation = code == Qt::Key_Left || code == Qt::Key_Right
+            || code == Qt::Key_Up || code == Qt::Key_Down || code == Qt::Key_Home
+            || code == Qt::Key_End || code == Qt::Key_PageUp || code == Qt::Key_PageDown;
+        if (navigation) {
+            // Reserve these keys for the focused slider, ahead of the viewer's
+            // window shortcuts, then let QAbstractSlider handle its KeyPress.
+            if (event->type() == QEvent::ShortcutOverride) { key->accept(); return true; }
+            return false;
+        }
+    }
+    // Space belongs to canvas panning while the canvas has focus. On a slider
+    // it must not start panning or fall through to the slideshow shortcut.
+    if (key->key() == Qt::Key_Space && qobject_cast<QAbstractSlider*>(QApplication::focusWidget())) {
+        key->accept(); return true;
+    }
     if (textInput(object) || !editingKey(key)) return false;
     if ((key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) && !hasPendingPen()) return false;
     if (historyBusy_) { key->accept(); return true; }
@@ -759,6 +990,16 @@ void Editor::paint(QPainter* painter)
     painter->setRenderHint(QPainter::Antialiasing);
     const QTransform transform = mapping();
     const QColor highlight(0, 140, 255);
+    if (gesture_ == Gesture::Brush && strokeLayer_ == EditDocument::Layer::Fill && !brushPreview_.isNull()) {
+        painter->save();
+        painter->setTransform(transform);
+        // A transparent SVG patch replaces old fill pixels. First repaint the
+        // canvas underneath; CompositionMode_Source would punch an alpha hole
+        // through an opaque QWidget backing store and can appear black.
+        painter->fillRect(brushPreviewBounds_, view_->viewport()->palette().brush(QPalette::Window));
+        painter->drawImage(brushPreviewBounds_, brushPreview_);
+        painter->restore();
+    }
     if (selected_ >= 0 && document_.layerVisible(layer_)) {
         painter->setPen(QPen(highlight, 1.5));
         painter->setBrush(layer_ == EditDocument::Layer::Fill ? QColor(0, 140, 255, 45) : Qt::transparent);
@@ -817,13 +1058,14 @@ void Editor::paint(QPainter* painter)
             painter->drawRect(QRectF(point - QPointF(3.5, 3.5), QSizeF(7, 7)));
         }
     }
-    if (gesture_ == Gesture::Erase) {
+    if (gesture_ == Gesture::DeletePaths || (gesture_ == Gesture::Brush && strokeLayer_ == EditDocument::Layer::Lines)) {
         painter->setBrush(Qt::NoBrush);
         painter->setPen(QPen(QColor(230, 45, 35, 70), 2. * brushRadius_ / sourceTolerance(1.),
                             Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         painter->drawPath(transform.map(eraserTrace_));
     }
-    if ((layer_ == EditDocument::Layer::Fill || tool_ == Tool::Eraser) && pointerInside_
+    if (tool_ != Tool::Eyedropper
+        && (layer_ == EditDocument::Layer::Fill || tool_ == Tool::Eraser || tool_ == Tool::DeletePaths) && pointerInside_
         && !spaceDown_ && document_.layerVisible(layer_)) {
         const QPointF source = toDocument(pointerViewport_);
         QPainterPath brush;
@@ -831,7 +1073,7 @@ void Editor::paint(QPainter* painter)
         painter->setPen(QPen(QColor(255, 255, 255, 210), 3.));
         painter->setBrush(Qt::NoBrush);
         painter->drawPath(transform.map(brush));
-        painter->setPen(QPen(tool_ == Tool::Eraser ? QColor(230, 45, 35) : highlight, 1., Qt::DashLine));
+        painter->setPen(QPen(tool_ == Tool::Eraser || tool_ == Tool::DeletePaths ? QColor(230, 45, 35) : highlight, 1., Qt::DashLine));
         painter->drawPath(transform.map(brush));
     }
     painter->restore();

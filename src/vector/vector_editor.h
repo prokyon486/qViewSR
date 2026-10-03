@@ -6,6 +6,7 @@
 #include <QPointer>
 #include <QColor>
 #include <QGraphicsView>
+#include <QTimer>
 
 class QVGraphicsView;
 class QPainter;
@@ -18,7 +19,7 @@ namespace Vector {
 class Editor : public QObject {
     Q_OBJECT
 public:
-    enum class Tool { Select, Pen, Eraser };
+    enum class Tool { Select, Pen, Eraser, DeletePaths, Eyedropper };
     Q_ENUM(Tool)
     explicit Editor(QVGraphicsView* view);
     ~Editor() override;
@@ -47,6 +48,7 @@ public:
     void finishPen();
     void setAddLine(bool enabled);
     void setColor(const QColor& color);
+    QColor currentColor() const { return color_; }
     void setBrushRadius(double radius);
     void setLineWidth(double width);
     void deleteSelection();
@@ -57,12 +59,13 @@ signals:
     void changed(const QByteArray& svg);
     void stateChanged();
     void message(const QString& text);
+    void colorPicked(const QColor& color);
 
 protected:
     bool eventFilter(QObject* object, QEvent* event) override;
 
 private:
-    enum class Gesture { None, Pan, Handle, AddLine, Fill, PenAnchor, Erase };
+    enum class Gesture { None, Pan, Handle, AddLine, Fill, PenAnchor, DeletePaths, Brush };
     struct DisplayHandle {
         EditDocument::Handle handle;
         QPointF point;
@@ -84,6 +87,10 @@ private:
     void finishGesture();
     void notifyChanged();
     void changeHistory(bool redo);
+    QPainterPath brushRegion() const;
+    void updateBrushPreview();
+    void finishBrushStroke();
+    void pickColor(const QPointF& point);
     void cancelPen(bool explain = false);
     void updatePenTangent(const QPointF& viewportPoint);
     void removeLastPenAnchor();
@@ -97,6 +104,14 @@ private:
     Tool tool_ = Tool::Select;
     QVector<EditDocument::BezierAnchor> penAnchors_;
     QPainterPath eraserTrace_;
+    QTimer brushPreviewTimer_;
+    QImage brushPreview_;
+    QRectF brushPreviewBounds_;
+    QByteArray brushDisplayIcc_;
+    QColor strokeColor_;
+    EditDocument::Layer strokeLayer_ = EditDocument::Layer::Lines;
+    double strokeRadius_ = 24.;
+    bool strokeErase_ = false, previewErrorShown_ = false;
     EditDocument::Handle handle_;
     bool active_ = false;
     bool historyBusy_ = false;

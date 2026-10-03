@@ -277,11 +277,12 @@ struct Controller::Private {
     Editor* editor;
     QCheckBox *editMode, *editShowLines, *editShowFill;
     QButtonGroup* editTools;
-    QPushButton *editSelect, *editPen, *editEraser, *editFinish;
-    QLabel *editRadiusLabel, *editColorSample, *explanation, *generationNote;
+    QPushButton *editSelect, *editPen, *editEraser, *editErasePaths, *editEyedropper, *editFinish;
+    QLabel *editRadiusLabel, *editColorSample, *editHelp, *explanation, *generationNote;
     QVector<QToolButton*> paletteButtons;
     QComboBox* editLayer;
-    QDoubleSpinBox *brushRadius, *editLineWidth;
+    QSlider *brushRadius, *editLineWidth;
+    bool hasPickedColor = false;
     QPushButton *editColor, *editDelete, *editUndo, *editRedo, *editDiscard;
     QWidget *editControls, *generationControls;
     QColor selectedEditColor = Qt::black;
@@ -428,28 +429,33 @@ struct Controller::Private {
         auto* edits = new QFormLayout(editControls); edits->setContentsMargins(0, 0, 0, 0);
         editLayer = new QComboBox(editControls); editLayer->setObjectName("vectorEditLayer");
         editLayer->addItem(QStringLiteral("主線（ベジエ編集）"), "lines");
-        editLayer->addItem(QStringLiteral("色面（ドラッグで境界を変形）"), "fill");
+        editLayer->addItem(QStringLiteral("色面（塗り・消去・境界の変形）"), "fill");
         edits->addRow(QStringLiteral("編集するレイヤー"), editLayer);
         auto* visibility = new QHBoxLayout;
         editShowLines = new QCheckBox(QStringLiteral("主線を表示"), editControls); editShowLines->setObjectName("vectorEditShowLines");
         editShowFill = new QCheckBox(QStringLiteral("色面を表示"), editControls); editShowFill->setObjectName("vectorEditShowFill");
         visibility->addWidget(editShowLines); visibility->addWidget(editShowFill);
         edits->addRow(QStringLiteral("レイヤーの表示"), visibility);
-        auto* toolbox = new QHBoxLayout;
+        auto* toolbox = new QGridLayout;
         editTools = new QButtonGroup(editControls); editTools->setExclusive(true);
         auto toolButton = [&](const QString& text, const char* name, Editor::Tool tool) {
             auto* button = new QPushButton(text, editControls); button->setObjectName(name); button->setCheckable(true);
             button->setStyleSheet("QPushButton:checked { background: #d5e9ff; color: #103f71; border: 2px solid #3484e4; border-radius: 3px; padding: 4px; }");
-            editTools->addButton(button, int(tool)); toolbox->addWidget(button); return button;
+            const int index = editTools->buttons().size();
+            editTools->addButton(button, int(tool)); toolbox->addWidget(button, index / 3, index % 3); return button;
         };
         editSelect = toolButton(QStringLiteral("選択・変形"), "vectorToolSelect", Editor::Tool::Select);
         editPen = toolButton(QStringLiteral("ペン"), "vectorToolPen", Editor::Tool::Pen);
         editEraser = toolButton(QStringLiteral("消しゴム"), "vectorToolEraser", Editor::Tool::Eraser);
+        editErasePaths = toolButton(QStringLiteral("消去"), "vectorToolDeletePaths", Editor::Tool::DeletePaths);
+        editEyedropper = toolButton(QStringLiteral("スポイト"), "vectorToolEyedropper", Editor::Tool::Eyedropper);
         editSelect->setChecked(true);
-        editPen->setToolTip(QStringLiteral("クリックで節点を追加、ドラッグでハンドルを調整。Enter／ダブルクリックで確定、Escで中止します。"));
-        editEraser->setToolTip(QStringLiteral("選択中のレイヤーで、触れたパス全体を削除します。非表示の図形は対象外です。"));
+        editPen->setToolTip(QStringLiteral("主線: 節点を追加し、右クリックで最後の節点まで確定。色面: 選択色で塗り、離すと輪郭をベクター化します。"));
+        editEraser->setToolTip(QStringLiteral("主線: ブラシに重なる区間を切断。色面: 部分消去し、離すと輪郭を作り直します。"));
+        editErasePaths->setToolTip(QStringLiteral("従来の消しゴム。選択レイヤーの触れたパス全体を削除します。"));
+        editEyedropper->setToolTip(QStringLiteral("表示中の画像から色を採取します。採取後にパレットをクリックすると、その枠の色を置き換えます。"));
         edits->addRow(QStringLiteral("ツールボックス"), toolbox);
-        editFinish = new QPushButton(QStringLiteral("線を確定（Enter）"), editControls); editFinish->setObjectName("vectorPenFinish");
+        editFinish = new QPushButton(QStringLiteral("線を確定（右クリック／Enter）"), editControls); editFinish->setObjectName("vectorPenFinish");
         edits->addRow(editFinish);
         auto* palette = new QWidget(editControls); palette->setObjectName("vectorPalette");
         auto* paletteLayout = new QGridLayout(palette); paletteLayout->setContentsMargins(0, 0, 0, 0);
@@ -459,22 +465,41 @@ struct Controller::Private {
             const QColor swatch(colors[i]);
             auto* button = new QToolButton(palette); button->setObjectName(QStringLiteral("vectorPalette%1").arg(i));
             button->setFixedSize(32, 28); button->setCheckable(true); button->setProperty("color", swatch);
-            button->setToolTip(colors[i]); button->setAccessibleName(QStringLiteral("色 %1").arg(colors[i]));
-            button->setStyleSheet(QStringLiteral("QToolButton { background: %1; border: 1px solid #888; border-radius: 3px; } QToolButton:checked { border: 3px solid #3484e4; }").arg(colors[i]));
+            styleSwatch(button);
             paletteLayout->addWidget(button, i/6, i%6); paletteButtons.append(button);
-            QObject::connect(button, &QToolButton::clicked, owner, [this, swatch] { chooseEditColor(swatch); });
+            QObject::connect(button, &QToolButton::clicked, owner, [this, button] {
+                if (editor->tool() == Editor::Tool::Eyedropper) {
+                    if (hasPickedColor) {
+                        button->setProperty("color", selectedEditColor); styleSwatch(button); saveSettings();
+                        setStatus(QStringLiteral("パレットの色をスポイト色に置き換えました。"));
+                    } else setStatus(QStringLiteral("先に画像をクリックして、色を採取してください。"));
+                    updateControls(false);
+                } else chooseEditColor(button->property("color").value<QColor>());
+            });
         }
         edits->addRow(QStringLiteral("色パレット"), palette);
         editColorSample = new QLabel(editControls); editColorSample->setObjectName("vectorEditColorSample");
         editColorSample->setAlignment(Qt::AlignCenter); editColorSample->setMinimumHeight(24);
         edits->addRow(QStringLiteral("描画／変更する色"), editColorSample);
-        brushRadius = new QDoubleSpinBox(editControls); brushRadius->setObjectName("vectorBrushRadius");
-        brushRadius->setRange(1, 10000); brushRadius->setValue(40); brushRadius->setSuffix(" px");
+        auto pixelSlider = [this, edits](const char* name, QLabel* label, double minimum, double maximum, double initial) {
+            auto* row = new QWidget(editControls); auto* controls = new QHBoxLayout(row); controls->setContentsMargins(0, 0, 0, 0);
+            auto* slider = new QSlider(Qt::Horizontal, row); slider->setObjectName(name); slider->setRange(0, 1000);
+            slider->setProperty("minimumPixels", minimum); slider->setProperty("maximumPixels", maximum);
+            slider->setAccessibleName(label->text()); slider->setPageStep(25);
+            auto* value = new QLabel(row); value->setObjectName(QString::fromLatin1(name)+"Value");
+            value->setAlignment(Qt::AlignRight | Qt::AlignVCenter); value->setMinimumWidth(value->fontMetrics().horizontalAdvance("10000.0 px"));
+            QObject::connect(slider, &QSlider::valueChanged, row, [slider, value] {
+                const double pixels = pixelValue(slider);
+                slider->setProperty("pixelValue", pixels); value->setText(QStringLiteral("%1 px").arg(pixels, 0, 'f', 1));
+            });
+            setPixelValue(slider, initial);
+            controls->addWidget(slider, 1); controls->addWidget(value); edits->addRow(label, row);
+            slider->setToolTip(QStringLiteral("入力画像のピクセル単位。細い範囲を調整しやすい対数スライダーです。"));
+            return slider;
+        };
         editRadiusLabel = new QLabel(QStringLiteral("境界変形の範囲"), editControls);
-        edits->addRow(editRadiusLabel, brushRadius);
-        editLineWidth = new QDoubleSpinBox(editControls); editLineWidth->setObjectName("vectorEditLineWidth");
-        editLineWidth->setRange(.1, 1000); editLineWidth->setValue(2.6); editLineWidth->setSuffix(" px");
-        edits->addRow(QStringLiteral("追加する線の幅"), editLineWidth);
+        brushRadius = pixelSlider("vectorBrushRadius", editRadiusLabel, 1, 10000, 40);
+        editLineWidth = pixelSlider("vectorEditLineWidth", new QLabel(QStringLiteral("追加する線の幅"), editControls), .1, 1000, 2.6);
         auto* editButtons = new QHBoxLayout;
         auto button = [&](const QString& text, const char* name) {
             auto* b = new QPushButton(text, editControls); b->setObjectName(name); editButtons->addWidget(b); return b;
@@ -484,8 +509,8 @@ struct Controller::Private {
         editUndo = button(QStringLiteral("戻す"), "vectorEditUndo");
         editRedo = button(QStringLiteral("やり直す"), "vectorEditRedo");
         edits->addRow(editButtons);
-        auto* help = new QLabel(QStringLiteral("ペン: 節点を順にクリック。ドラッグで曲線にし、Enterまたはダブルクリックで確定します。Escで未確定の線を中止。\n選択・変形: 節点やハンドル、色面の境界をドラッグ。消しゴム: 選択中のレイヤーのパス全体を削除。\nSpace＋ドラッグで画像移動、Ctrl＋Zで取り消し。非表示のレイヤーはPNGにも出力しません。"), editControls);
-        help->setWordWrap(true); edits->addRow(help);
+        editHelp = new QLabel(editControls); editHelp->setObjectName("vectorEditHelp");
+        editHelp->setWordWrap(true); edits->addRow(editHelp);
         editDiscard = new QPushButton(QStringLiteral("手編集を破棄して生成結果へ戻す"), panel);
         editDiscard->setObjectName("vectorEditDiscard"); parameterLayout->addWidget(editDiscard); parameterLayout->addStretch();
         generationNote = new QLabel(QStringLiteral("透明背景は塗りの白い部分を消しません。主線を透明にしても塗り側の元線は残ります。"), panel);
@@ -550,10 +575,14 @@ struct Controller::Private {
         QObject::connect(editFinish, &QPushButton::clicked, owner, [this] { editor->finishPen(); view->setFocus(); });
         QObject::connect(editShowLines, &QCheckBox::toggled, owner, [this](bool visible) { editor->setLayerVisible(EditDocument::Layer::Lines, visible); });
         QObject::connect(editShowFill, &QCheckBox::toggled, owner, [this](bool visible) { editor->setLayerVisible(EditDocument::Layer::Fill, visible); });
-        QObject::connect(brushRadius, &QDoubleSpinBox::valueChanged, editor, &Editor::setBrushRadius);
-        QObject::connect(editLineWidth, &QDoubleSpinBox::valueChanged, editor, &Editor::setLineWidth);
+        QObject::connect(brushRadius, &QSlider::valueChanged, owner, [this] { editor->setBrushRadius(pixelValue(brushRadius)); saveSettings(); });
+        QObject::connect(editLineWidth, &QSlider::valueChanged, owner, [this] { editor->setLineWidth(pixelValue(editLineWidth)); saveSettings(); });
+        QObject::connect(editor, &Editor::colorPicked, owner, [this](const QColor& picked) {
+            selectedEditColor = picked; hasPickedColor = true; updateControls(false);
+            setStatus(QStringLiteral("色を採取しました。パレットをクリックすると、その枠を採取色に置き換えます。"));
+        });
         QObject::connect(editColor, &QPushButton::clicked, owner, [this] {
-            const auto chosen = QColorDialog::getColor(selectedEditColor, panel, QStringLiteral("選択した図形／追加する線の色"));
+            const auto chosen = QColorDialog::getColor(selectedEditColor, panel, QStringLiteral("描画色／選択した図形の色"), QColorDialog::ShowAlphaChannel);
             if (chosen.isValid()) chooseEditColor(chosen);
         });
         QObject::connect(editDelete, &QPushButton::clicked, editor, &Editor::deleteSelection);
@@ -613,6 +642,13 @@ struct Controller::Private {
         shapeTolerance->setValue(settings.value("vector/shapeTolerance", 2.).toDouble());
         scale->setValue(settings.value("vector/exportScale", 4.0).toDouble());
         previewScale->setValue(settings.value("vector/previewScale", 4.0).toDouble());
+        setPixelValue(brushRadius, settings.value("vector/editBrushRadius", 40.).toDouble());
+        setPixelValue(editLineWidth, settings.value("vector/editLineWidth", 2.6).toDouble());
+        const auto savedPalette = settings.value("vector/editPalette").toStringList();
+        for (int i=0; i<qMin(savedPalette.size(), paletteButtons.size()); ++i) {
+            const QColor saved(savedPalette[i]);
+            if (saved.isValid()) { paletteButtons[i]->setProperty("color", saved); styleSwatch(paletteButtons[i]); }
+        }
         panel->restoreGeometry(settings.value("vector/panelGeometry").toByteArray());
     }
 
@@ -635,6 +671,11 @@ struct Controller::Private {
         settings.setValue("vector/joinDistance", joinDistance->value());
         settings.setValue("vector/branchStrength", branchStrength->value());
         settings.setValue("vector/shapeTolerance", shapeTolerance->value());
+        settings.setValue("vector/editBrushRadius", pixelValue(brushRadius));
+        settings.setValue("vector/editLineWidth", pixelValue(editLineWidth));
+        QStringList savedPalette;
+        for (auto* button : paletteButtons) savedPalette.append(button->property("color").value<QColor>().name(QColor::HexArgb));
+        settings.setValue("vector/editPalette", savedPalette);
     }
 
     struct Input {
@@ -718,7 +759,29 @@ struct Controller::Private {
         return bytes;
     }
 
+    static double pixelValue(const QSlider* slider) {
+        const double minimum = slider->property("minimumPixels").toDouble();
+        const double maximum = slider->property("maximumPixels").toDouble();
+        return qRound64(minimum * std::pow(maximum / minimum, slider->value() / 1000.) * 10.) / 10.;
+    }
+
+    static void setPixelValue(QSlider* slider, double pixels) {
+        const double minimum = slider->property("minimumPixels").toDouble();
+        const double maximum = slider->property("maximumPixels").toDouble();
+        if (!std::isfinite(pixels)) pixels = minimum;
+        slider->setValue(qRound(1000. * std::log(qBound(minimum, pixels, maximum) / minimum) / std::log(maximum / minimum)));
+    }
+
+    static void styleSwatch(QToolButton* button) {
+        const auto color = button->property("color").value<QColor>();
+        const auto name = color.name(color.alpha() == 255 ? QColor::HexRgb : QColor::HexArgb);
+        button->setToolTip(name); button->setAccessibleName(QStringLiteral("色 %1").arg(name));
+        button->setStyleSheet(QStringLiteral("QToolButton { background: rgba(%1,%2,%3,%4); border: 1px solid #888; border-radius: 3px; } QToolButton:checked { border: 3px solid #3484e4; }")
+            .arg(color.red()).arg(color.green()).arg(color.blue()).arg(color.alpha()));
+    }
+
     void chooseEditColor(const QColor& chosen) {
+        hasPickedColor = false;
         selectedEditColor = chosen;
         editor->setColor(chosen);
         updateControls(false);
@@ -758,12 +821,28 @@ struct Controller::Private {
             editLayer->setCurrentIndex(editLayer->findData(editor->layer() == EditDocument::Layer::Lines ? "lines" : "fill"));
         }
         const bool lineLayer = editLayer->currentData() == "lines";
-        const bool erasing = editor->tool() == Editor::Tool::Eraser;
-        editPen->setEnabled(lineLayer); editLineWidth->setEnabled(lineLayer && !erasing);
-        brushRadius->setEnabled(erasing || !lineLayer);
-        editRadiusLabel->setText(erasing ? QStringLiteral("消しゴムの半径") : QStringLiteral("境界変形の範囲"));
+        const auto tool = editor->tool();
+        const bool erasing = tool == Editor::Tool::Eraser;
+        const bool deleting = tool == Editor::Tool::DeletePaths;
+        editPen->setEnabled(true); editLineWidth->setEnabled(lineLayer && tool == Editor::Tool::Pen);
+        brushRadius->setEnabled(tool != Editor::Tool::Eyedropper && (erasing || deleting || !lineLayer));
+        editRadiusLabel->setText(erasing ? QStringLiteral("消しゴムの半径") : deleting ? QStringLiteral("消去の半径")
+            : tool == Editor::Tool::Pen ? QStringLiteral("ペンの半径") : QStringLiteral("境界変形の範囲"));
+        brushRadius->setAccessibleName(editRadiusLabel->text());
+        QString help;
+        if (tool == Editor::Tool::Pen) help = lineLayer
+            ? QStringLiteral("クリックで節点、ドラッグで曲線を作ります。右クリックで最後の節点まで確定。Enter／ダブルクリックでも確定できます。Escで中止。")
+            : QStringLiteral("選択色で色面を塗ります。マウスを離すと輪郭を計算してベクターへ戻します。");
+        else if (erasing) help = lineLayer
+            ? QStringLiteral("ブラシに重なる線の区間を切断します。残った曲線の形を保持し、切断点にも節点とハンドルを作ります。")
+            : QStringLiteral("色面を部分消去し、マウスを離すと輪郭を作り直します。面を横切って消すと分断できます。");
+        else if (deleting) help = QStringLiteral("触れたパス全体を消去します。非表示のレイヤーは対象外です。");
+        else if (tool == Editor::Tool::Eyedropper) help = QStringLiteral("画像をクリックして色を採取します。そのままパレットの枠をクリックすると、採取色で置き換えます。");
+        else help = lineLayer ? QStringLiteral("線を選び、節点や丸いハンドルをドラッグします。パレットで選択した線の色を変更できます。")
+                              : QStringLiteral("色面の境界付近からドラッグすると、境界を変形できます。パレットで選択した面の色を変更できます。");
+        editHelp->setText(help + QStringLiteral("\nSpace＋ドラッグで画像移動。Ctrl＋Zで取り消し。"));
         if (auto* button = editTools->button(int(editor->tool()))) button->setChecked(true);
-        editFinish->setVisible(editor->tool() == Editor::Tool::Pen);
+        editFinish->setVisible(lineLayer && editor->tool() == Editor::Tool::Pen);
         editFinish->setEnabled(editor->hasPendingPen());
         if (editor->active() && !editor->isBusy()) {
             QSignalBlocker linesBlock(editShowLines), fillBlock(editShowFill);
@@ -771,7 +850,7 @@ struct Controller::Private {
             editShowFill->setChecked(editor->layerVisible(EditDocument::Layer::Fill));
         }
         for (auto* button : paletteButtons) button->setChecked(button->property("color").value<QColor>() == selectedEditColor);
-        editColorSample->setText(selectedEditColor.name());
+        editColorSample->setText(selectedEditColor.name(selectedEditColor.alpha() == 255 ? QColor::HexRgb : QColor::HexArgb));
         editColorSample->setStyleSheet(QStringLiteral("background: %1; color: %2; border: 1px solid #888; border-radius: 3px;")
             .arg(selectedEditColor.name(), selectedEditColor.lightnessF() > .5 ? "black" : "white"));
         editDelete->setEnabled(editor->selectedPath() >= 0);
@@ -849,8 +928,8 @@ struct Controller::Private {
             if (!edited) editInitialSvg = editor->svg();
             composedSvg = result.svg; image = result.image;
             editor->setLayer(editLayer->currentData() == "fill" ? EditDocument::Layer::Fill : EditDocument::Layer::Lines);
-            editor->setBrushRadius(brushRadius->value());
-            editor->setLineWidth(editLineWidth->value());
+            editor->setBrushRadius(pixelValue(brushRadius));
+            editor->setLineWidth(pixelValue(editLineWidth));
             owner->setShowingResult(true);
             window->cancelSlideshow();
             updateControls(false);

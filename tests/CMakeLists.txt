@@ -30,8 +30,15 @@ add_test(NAME GlbTests COMMAND glbtests)
 add_test(NAME VectorTests COMMAND vectortests)
 set_tests_properties(ActionManagerTests SrTests NavigationTests GlbTests VectorTests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 180)
 
-add_executable(vectoreditdocumenttests tst_vectoreditdocumenttests.cpp ../src/vector/edit_document.cpp)
+add_executable(vectoreditdocumenttests tst_vectoreditdocumenttests.cpp ../src/vector/edit_document.cpp
+    ../src/vector/raster_contours.cpp ../src/vector/memory_budget.cpp)
 target_include_directories(vectoreditdocumenttests PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(vectoreditdocumenttests PRIVATE Qt6::Core Qt6::Gui Qt6::Xml Qt6::Svg Qt6::Test)
 add_test(NAME VectorEditDocumentTests COMMAND vectoreditdocumenttests)
 set_tests_properties(VectorEditDocumentTests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
+
+add_executable(rastercontourtests tst_rastercontourtests.cpp ../src/vector/raster_contours.cpp)
+target_include_directories(rastercontourtests PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(rastercontourtests PRIVATE Qt6::Core Qt6::Gui Qt6::Test)
+add_test(NAME RasterContourTests COMMAND rastercontourtests)
+set_tests_properties(RasterContourTests PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)
