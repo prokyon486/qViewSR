@@ -32,6 +32,14 @@ QString inherited(QDomElement e, const QString& attribute, const QString& fallba
         if (e.hasAttribute(attribute)) return e.attribute(attribute);
     return fallback;
 }
+int layerIndex(Layer layer) { return layer == Layer::Lines ? 0 : 1; }
+bool paintVisible(QDomElement element) {
+    const QString visibility = inherited(element, QStringLiteral("visibility"), QStringLiteral("visible")).trimmed().toLower();
+    if (visibility == QStringLiteral("hidden") || visibility == QStringLiteral("collapse")) return false;
+    for (; !element.isNull(); element = element.parentNode().toElement())
+        if (element.attribute(QStringLiteral("display")).trimmed().toLower() == QStringLiteral("none")) return false;
+    return true;
+}
 
 struct Segment {
     QPointF c1, c2, end;
@@ -52,6 +60,7 @@ struct Shape {
     QPainterPath geometry;
     double strokeWidth = 1.;
     bool deleted = false;
+    bool visible = true;
 };
 
 class Scanner {
@@ -226,6 +235,8 @@ void clearTouched(QVector<Shape>& shapes) {
 struct EditDocument::Private {
     QDomDocument document;
     QVector<Shape> shapes;
+    QVector<QDomElement> groups[2];
+    bool visible[2] = {true, true};
     QSize size;
     mutable QByteArray bytes;
     QByteArray before;
@@ -263,11 +274,15 @@ struct EditDocument::Private {
             const QString id = element.attribute(QStringLiteral("id"));
             if (id == QStringLiteral("lines")) currentLayer = 0;
             else if (id == QStringLiteral("fill")) currentLayer = 1;
+            if (tag(element) == QStringLiteral("g")
+                && (id == QStringLiteral("lines") || id == QStringLiteral("fill")))
+                groups[currentLayer].append(element);
             if (currentLayer >= 0 && tag(element) == QStringLiteral("path")) {
                 if (shapes.size() >= MaxPaths) { *error = QStringLiteral("編集可能なパス数（500万）を超えています。"); return false; }
                 Shape shape;
                 shape.element = element;
                 shape.layer = currentLayer == 0 ? Layer::Lines : Layer::Fill;
+                shape.visible = paintVisible(element);
                 if (!translateOnly(element, &shape.offset)) {
                     *error = QStringLiteral("移動以外の座標変換を含むSVGは編集できません。"); return false;
                 }
@@ -294,6 +309,10 @@ struct EditDocument::Private {
             return true;
         };
         if (!visit(root, -1, 0)) return false;
+        for (int layer = 0; layer < 2; ++layer) {
+            if (groups[layer].isEmpty()) continue;
+            visible[layer] = std::any_of(groups[layer].cbegin(), groups[layer].cend(), paintVisible);
+        }
         bytes = input;
         return true;
     }
@@ -346,12 +365,47 @@ QSize EditDocument::size() const { return d->size; }
 QRectF EditDocument::viewBox() const { return QRectF(QPointF(), QSizeF(d->size)); }
 int EditDocument::pathCount() const { return d->shapes.size(); }
 Layer EditDocument::layer(int index) const { return d->valid(index) ? d->shapes[index].layer : Layer::Lines; }
+bool EditDocument::layerVisible(Layer layer) const { return d->visible[layerIndex(layer)]; }
+bool EditDocument::setLayerVisible(Layer layer, bool visible) {
+    const int slot = layerIndex(layer);
+    if (d->visible[slot] == visible || d->document.documentElement().isNull()) return false;
+    const bool automatic = !d->editing;
+    if (automatic) beginEdit();
+    if (d->groups[slot].isEmpty()) {
+        // Keep an empty hidden layer in the document so newly added paths and
+        // undo/redo retain the selected visibility state.
+        auto group = d->document.createElementNS(QString::fromLatin1(SvgNamespace), QStringLiteral("g"));
+        group.setAttribute(QStringLiteral("id"), layer == Layer::Lines ? QStringLiteral("lines") : QStringLiteral("fill"));
+        auto root = d->document.documentElement();
+        QDomElement before;
+        if (layer == Layer::Fill) {
+            for (auto child = root.firstChildElement(); !child.isNull(); child = child.nextSiblingElement())
+                if (child.attribute(QStringLiteral("id")) == QStringLiteral("lines")) { before = child; break; }
+        }
+        if (before.isNull()) root.appendChild(group); else root.insertBefore(group, before);
+        d->groups[slot].append(group);
+    }
+    for (auto& group : d->groups[slot]) {
+        if (visible) {
+            group.removeAttribute(QStringLiteral("display"));
+            if (group.attribute(QStringLiteral("visibility")) == QStringLiteral("hidden")
+                || group.attribute(QStringLiteral("visibility")) == QStringLiteral("collapse"))
+                group.setAttribute(QStringLiteral("visibility"), QStringLiteral("visible"));
+        } else group.setAttribute(QStringLiteral("display"), QStringLiteral("none"));
+    }
+    d->visible[slot] = visible;
+    for (auto& shape : d->shapes)
+        if (!shape.deleted && shape.layer == layer) shape.visible = paintVisible(shape.element);
+    d->changed();
+    if (automatic) commitEdit();
+    return true;
+}
 QPainterPath EditDocument::path(int index) const { return d->valid(index) ? d->shapes[index].geometry : QPainterPath(); }
 int EditDocument::hitTest(QPointF point, double tolerance, Layer layer) const {
-    if (!validPoint(point) || !std::isfinite(tolerance) || tolerance < 0 || tolerance > MaxCoordinate) return -1;
+    if (!layerVisible(layer) || !validPoint(point) || !std::isfinite(tolerance) || tolerance < 0 || tolerance > MaxCoordinate) return -1;
     for (int i = d->shapes.size() - 1; i >= 0; --i) {
         const auto& shape = d->shapes[i];
-        if (shape.deleted || shape.layer != layer) continue;
+        if (shape.deleted || !shape.visible || shape.layer != layer) continue;
         const double width = qMax(shape.strokeWidth, tolerance * 2);
         if (!shape.geometry.controlPointRect().adjusted(-width, -width, width, width).contains(point)) continue;
         if (layer == Layer::Fill && shape.geometry.contains(point)) return i;
@@ -500,26 +554,35 @@ bool EditDocument::moveHandle(int index, Handle handle, QPointF point) {
     return true;
 }
 int EditDocument::addLine(QPointF from, QPointF to, QColor color, double width) {
-    if (!validPoint(from) || !validPoint(to) || !color.isValid() || !std::isfinite(width) || width <= 0 || width > 10000
-        || d->shapes.size() >= MaxPaths || d->segments + 2 > MaxSegments || d->document.documentElement().isNull()) return -1;
-    QDomElement group;
-    const auto groups = d->document.elementsByTagName(QStringLiteral("g"));
-    for (int i = 0; i < groups.size(); ++i)
-        if (groups.at(i).toElement().attribute(QStringLiteral("id")) == QStringLiteral("lines")) { group = groups.at(i).toElement(); break; }
+    return addBezierPath({{from, from, from + (to - from) / 3.},
+                          {to, from + (to - from) * (2. / 3.), to}}, color, width);
+}
+int EditDocument::addBezierPath(const QVector<BezierAnchor>& anchors, QColor color, double width, bool closed) {
+    const qsizetype requiredSegments = anchors.size() + (closed ? 1 : 0);
+    if (anchors.size() < 2 || !color.isValid() || !std::isfinite(width) || width <= 0 || width > 10000
+        || d->shapes.size() >= MaxPaths || requiredSegments > MaxSegments - d->segments
+        || d->document.documentElement().isNull()) return -1;
+    QDomElement group = d->groups[0].isEmpty() ? QDomElement() : d->groups[0].last();
     QPointF offset;
-    if ((!group.isNull() && !translateOnly(group, &offset))
-        || !validPoint(from - offset) || !validPoint(to - offset)) return -1;
+    if (!group.isNull() && !translateOnly(group, &offset)) return -1;
+    for (const auto& anchor : anchors) {
+        if (!validPoint(anchor.point) || !validPoint(anchor.incoming) || !validPoint(anchor.outgoing)
+            || !validPoint(anchor.point - offset) || !validPoint(anchor.incoming - offset)
+            || !validPoint(anchor.outgoing - offset)) return -1;
+    }
     const bool automatic = !d->editing;
     if (automatic) beginEdit();
     if (group.isNull()) {
         group = d->document.createElementNS(QString::fromLatin1(SvgNamespace), QStringLiteral("g"));
         group.setAttribute(QStringLiteral("id"), QStringLiteral("lines"));
         d->document.documentElement().appendChild(group);
+        d->groups[0].append(group);
     }
     Shape shape;
     shape.element = d->document.createElementNS(QString::fromLatin1(SvgNamespace), QStringLiteral("path"));
     group.appendChild(shape.element);
     shape.layer = Layer::Lines;
+    shape.visible = paintVisible(shape.element);
     shape.offset = offset;
     shape.strokeWidth = width;
     shape.element.setAttribute(QStringLiteral("fill"), QStringLiteral("none"));
@@ -527,20 +590,76 @@ int EditDocument::addLine(QPointF from, QPointF to, QColor color, double width) 
     shape.element.setAttribute(QStringLiteral("stroke-opacity"), number(color.alphaF()));
     shape.element.setAttribute(QStringLiteral("stroke-width"), number(width));
     shape.element.setAttribute(QStringLiteral("stroke-linecap"), QStringLiteral("round"));
+    shape.element.setAttribute(QStringLiteral("stroke-linejoin"), QStringLiteral("round"));
     Subpath sub;
-    sub.start = from - shape.offset;
-    Segment segment;
-    segment.end = to - shape.offset;
-    makeCubic(sub.start, segment);
-    sub.segments.append(segment);
+    sub.start = anchors[0].point - offset;
+    sub.closed = closed;
+    const int segmentCount = int(anchors.size()) - (closed ? 0 : 1);
+    sub.segments.reserve(segmentCount);
+    for (int i = 0; i < segmentCount; ++i) {
+        const int next = (i + 1) % int(anchors.size());
+        Segment segment{anchors[i].outgoing - offset, anchors[next].incoming - offset,
+                        anchors[next].point - offset, true, false};
+        if (same(anchors[i].outgoing, anchors[i].point)
+            && same(anchors[next].incoming, anchors[next].point)) {
+            // Two clicked anchors describe an exact straight segment. Give it
+            // visible handles instead of hiding both under higher-priority
+            // anchor hit targets, so the user can bend it after finishing.
+            const auto from = anchors[i].point - offset;
+            segment.c1 = from + (segment.end - from) / 3.;
+            segment.c2 = from + (segment.end - from) * (2. / 3.);
+        }
+        sub.segments.append(segment);
+    }
     shape.subpaths.append(sub);
     serialize(shape);
     const int index = d->shapes.size();
     d->shapes.append(shape);
-    d->segments += 2;
+    d->segments += int(requiredSegments);
     d->changed();
     if (automatic) commitEdit();
     return index;
+}
+int EditDocument::erasePaths(QPointF from, QPointF to, double radius, Layer layer) {
+    if (!layerVisible(layer) || !validPoint(from) || !validPoint(to)
+        || !std::isfinite(radius) || radius <= 0 || radius > MaxCoordinate) return 0;
+    QPainterPath brush;
+    if (same(from, to)) brush.addEllipse(from, radius, radius);
+    else {
+        QPainterPath sweep;
+        sweep.moveTo(from);
+        sweep.lineTo(to);
+        QPainterPathStroker stroke;
+        stroke.setWidth(radius * 2.);
+        stroke.setCapStyle(Qt::RoundCap);
+        brush = stroke.createStroke(sweep);
+    }
+    const QRectF brushBounds = brush.controlPointRect();
+    QVector<int> matches;
+    for (int i = 0; i < d->shapes.size(); ++i) {
+        const auto& shape = d->shapes[i];
+        if (shape.deleted || !shape.visible || shape.layer != layer) continue;
+        const double halfWidth = layer == Layer::Lines ? shape.strokeWidth / 2. : 0.;
+        const QRectF bounds = shape.geometry.controlPointRect().adjusted(-halfWidth, -halfWidth, halfWidth, halfWidth);
+        if (!bounds.intersects(brushBounds)) continue;
+        QPainterPath painted = shape.geometry;
+        if (layer == Layer::Lines) {
+            // Intersect a stroke, not the implicitly closed interior of an open
+            // bezier: an eraser inside a U-shaped line must not erase its rim.
+            QPainterPathStroker stroke;
+            stroke.setWidth(qMax(shape.strokeWidth, 1.e-6));
+            stroke.setCapStyle(Qt::RoundCap);
+            stroke.setJoinStyle(Qt::RoundJoin);
+            painted = stroke.createStroke(shape.geometry);
+        }
+        if (painted.intersects(brush)) matches.append(i);
+    }
+    if (matches.isEmpty()) return 0;
+    const bool automatic = !d->editing;
+    if (automatic) beginEdit();
+    for (int index : matches) remove(index);
+    if (automatic) commitEdit();
+    return matches.size();
 }
 bool EditDocument::remove(int index) {
     if (!d->valid(index)) return false;

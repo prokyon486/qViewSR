@@ -18,6 +18,11 @@ struct Handle {
     Kind kind = Anchor;
     QPointF point;
 };
+struct BezierAnchor {
+    QPointF point;
+    QPointF incoming;
+    QPointF outgoing;
+};
 
 // Edits the generated SVG without flattening its layers or replacing other paths.
 // All public points and lengths are in the SVG's source-image coordinates.
@@ -25,6 +30,7 @@ class EditDocument {
 public:
     using Layer = Vector::Layer;
     using Handle = Vector::Handle;
+    using BezierAnchor = Vector::BezierAnchor;
     EditDocument();
     ~EditDocument();
     EditDocument(EditDocument&&) noexcept;
@@ -38,12 +44,17 @@ public:
     QRectF viewBox() const;
     int pathCount() const;
     Layer layer(int index) const;
+    bool layerVisible(Layer layer) const;
+    bool setLayerVisible(Layer layer, bool visible);
     int hitTest(QPointF point, double tolerance, Layer layer) const;
     QPainterPath path(int index) const;
     QVector<Handle> handles(int index) const;
     QColor color(int index) const;
     bool moveHandle(int index, Handle handle, QPointF point);
     int addLine(QPointF from, QPointF to, QColor color, double width);
+    int addBezierPath(const QVector<BezierAnchor>& anchors, QColor color, double width, bool closed = false);
+    // Deletes complete paths intersected by the swept circular brush.
+    int erasePaths(QPointF from, QPointF to, double radius, Layer layer);
     bool remove(int index);
     bool setColor(int index, QColor color);
     bool deformFill(int index, QPointF center, QPointF delta, double radius, bool smooth);

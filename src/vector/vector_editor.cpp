@@ -41,7 +41,8 @@ bool editingKey(const QKeyEvent* event)
 {
     const int key = event->key();
     if (key == Qt::Key_Left || key == Qt::Key_Right || key == Qt::Key_Space
-        || key == Qt::Key_Delete || key == Qt::Key_Backspace || key == Qt::Key_Escape)
+        || key == Qt::Key_Delete || key == Qt::Key_Backspace || key == Qt::Key_Escape
+        || key == Qt::Key_Return || key == Qt::Key_Enter)
         return true;
     return (event->modifiers() & Qt::ControlModifier)
         && (key == Qt::Key_Z || key == Qt::Key_Y);
@@ -118,6 +119,7 @@ void Editor::end()
     historySvg_.clear();
     if (!active_) return;
     cancelGesture();
+    cancelPen();
     active_ = false;
     spaceDown_ = false;
     selected_ = -1;
@@ -149,18 +151,108 @@ void Editor::setLayer(EditDocument::Layer layer)
     if (historyBusy_) return;
     if (layer_ == layer) return;
     cancelGesture();
+    cancelPen(true);
     layer_ = layer;
     selected_ = -1;
-    if (layer != EditDocument::Layer::Lines) addLine_ = false;
+    if (layer != EditDocument::Layer::Lines) {
+        addLine_ = false;
+        if (tool_ == Tool::Pen) tool_ = Tool::Select;
+    }
     updateCursor();
     if (view_) view_->viewport()->update();
     emit stateChanged();
+}
+
+void Editor::setTool(Tool tool)
+{
+    if (historyBusy_ || (tool_ == tool && !addLine_)) return;
+    cancelGesture();
+    cancelPen(true);
+    tool_ = tool;
+    addLine_ = false;
+    selected_ = -1;
+    if (tool == Tool::Pen) layer_ = EditDocument::Layer::Lines;
+    updateCursor();
+    if (view_) view_->viewport()->update();
+    emit stateChanged();
+}
+
+bool Editor::layerVisible(EditDocument::Layer layer) const
+{
+    if (historyBusy_) return layer == EditDocument::Layer::Lines ? historyLinesVisible_ : historyFillVisible_;
+    return document_.layerVisible(layer);
+}
+
+void Editor::setLayerVisible(EditDocument::Layer layer, bool visible)
+{
+    if (!active_ || historyBusy_ || document_.layerVisible(layer) == visible) return;
+    cancelGesture();
+    if (!visible && layer == EditDocument::Layer::Lines) cancelPen(true);
+    if (layer == layer_) selected_ = -1;
+    document_.beginEdit();
+    if (document_.setLayerVisible(layer, visible)) {
+        document_.commitEdit();
+        notifyChanged();
+    } else document_.cancelEdit();
+}
+
+void Editor::cancelPen(bool explain)
+{
+    if (penAnchors_.isEmpty()) return;
+    penAnchors_.clear();
+    if (view_) view_->viewport()->update();
+    emit stateChanged();
+    if (explain) emit message(QStringLiteral("未確定の線を取り消しました。"));
+}
+
+void Editor::removeLastPenAnchor()
+{
+    if (penAnchors_.isEmpty()) return;
+    if (gesture_ == Gesture::PenAnchor) gesture_ = Gesture::None;
+    penAnchors_.removeLast();
+    if (view_) view_->viewport()->update();
+    emit stateChanged();
+}
+
+void Editor::updatePenTangent(const QPointF& viewportPoint)
+{
+    if (penAnchors_.isEmpty()) return;
+    auto& anchor = penAnchors_.last();
+    const QPointF delta = QLineF(mapping().map(anchor.point), viewportPoint).length() >= 2.
+        ? toDocument(viewportPoint) - anchor.point : QPointF();
+    anchor.incoming = anchor.point - delta;
+    anchor.outgoing = anchor.point + delta;
+}
+
+void Editor::finishPen()
+{
+    if (!active_ || historyBusy_ || penAnchors_.isEmpty()) return;
+    if (penAnchors_.size() < 2) {
+        emit message(QStringLiteral("線を確定するには、2点以上を置いてください。"));
+        return;
+    }
+    if (!document_.layerVisible(EditDocument::Layer::Lines)) return;
+    if (gesture_ == Gesture::PenAnchor) gesture_ = Gesture::None;
+    document_.beginEdit();
+    const int path = document_.addBezierPath(penAnchors_, color_, lineWidth_);
+    if (path < 0) {
+        document_.cancelEdit();
+        emit message(QStringLiteral("線を追加できませんでした。点の数や座標の範囲を確認してください。"));
+        return;
+    }
+    selected_ = path;
+    penAnchors_.clear();
+    document_.commitEdit();
+    notifyChanged();
+    emit message(QStringLiteral("線を確定しました。選択ツールで各点やベジエハンドルを調整できます。"));
 }
 
 void Editor::setAddLine(bool enabled)
 {
     if (historyBusy_) return;
     cancelGesture();
+    cancelPen(true);
+    tool_ = Tool::Select;
     addLine_ = enabled;
     if (enabled) {
         layer_ = EditDocument::Layer::Lines;
@@ -175,7 +267,7 @@ void Editor::setColor(const QColor& color)
 {
     if (historyBusy_ || !color.isValid()) return;
     color_ = color;
-    if (!active_ || selected_ < 0) return;
+    if (!active_ || selected_ < 0 || tool_ != Tool::Select) { if (view_) view_->viewport()->update(); return; }
     cancelGesture();
     document_.beginEdit();
     if (document_.setColor(selected_, color)) {
@@ -220,6 +312,11 @@ void Editor::redo()
 void Editor::changeHistory(bool redo)
 {
     if (!active_ || historyBusy_) return;
+    if (hasPendingPen()) {
+        if (!redo) removeLastPenAnchor();
+        else emit message(QStringLiteral("線を確定するか、Escapeで取り消してから履歴を操作してください。"));
+        return;
+    }
     cancelGesture();
     if (redo ? !document_.canRedo() : !document_.canUndo()) return;
     const auto currentSvg = document_.svg();
@@ -233,6 +330,8 @@ void Editor::changeHistory(bool redo)
 
     // The history operation reparses a snapshot. Move sole ownership of all
     // DOM/geometry state to the worker so no GUI read races with that parser.
+    historyLinesVisible_ = document_.layerVisible(EditDocument::Layer::Lines);
+    historyFillVisible_ = document_.layerVisible(EditDocument::Layer::Fill);
     auto model = std::make_shared<EditDocument>(std::move(document_));
     document_ = EditDocument();
     historySvg_ = currentSvg;
@@ -309,20 +408,89 @@ bool Editor::textInput(QObject* object) const
     return false;
 }
 
-bool Editor::handleAt(const QPointF& point, EditDocument::Handle* result) const
+QVector<Editor::DisplayHandle> Editor::displayHandles() const
 {
-    if (selected_ < 0 || layer_ != EditDocument::Layer::Lines) return false;
+    QVector<DisplayHandle> result;
+    if (selected_ < 0 || layer_ != EditDocument::Layer::Lines || !document_.layerVisible(layer_)) return result;
+    const auto handles = document_.handles(selected_);
     const auto transform = mapping();
+    const auto key = [](int subpath, int index) {
+        return (quint64(quint32(subpath)) << 32) | quint32(index);
+    };
+    QHash<quint64, QPointF> anchors;
+    for (const auto& handle : handles)
+        if (handle.kind == EditDocument::Handle::Anchor)
+            anchors.insert(key(handle.subpath, handle.index), transform.map(handle.point));
+
+    struct CoincidentPair { int first = -1; int second = -1; };
+    QHash<quint64, CoincidentPair> coincident;
+    result.reserve(handles.size());
+    for (const auto& handle : handles) {
+        DisplayHandle display{handle, transform.map(handle.point), {}, false};
+        if (handle.kind != EditDocument::Handle::Anchor) {
+            const int startIndex = handle.index;
+            // A closed subpath omits its duplicate final anchor in handles().
+            const int endIndex = anchors.contains(key(handle.subpath, handle.index + 1)) ? handle.index + 1 : 0;
+            const int anchorIndex = handle.kind == EditDocument::Handle::Control1 ? startIndex : endIndex;
+            const int neighborIndex = handle.kind == EditDocument::Handle::Control1 ? endIndex : startIndex;
+            const auto anchorKey = key(handle.subpath, anchorIndex);
+            display.anchor = anchors.value(anchorKey, display.point);
+            if (QLineF(display.anchor, display.point).length() < .5) {
+                QPointF direction = anchors.value(key(handle.subpath, neighborIndex), display.anchor) - display.anchor;
+                double length = std::hypot(direction.x(), direction.y());
+                if (length < .00001) {
+                    direction = handle.kind == EditDocument::Handle::Control1 ? QPointF(1, -1) : QPointF(-1, -1);
+                    length = std::sqrt(2.);
+                }
+                display.point = display.anchor + direction * (14. / length);
+                display.offset = true;
+                auto& pair = coincident[anchorKey];
+                if (pair.first < 0) pair.first = result.size();
+                else pair.second = result.size();
+            }
+        }
+        result.append(display);
+    }
+    // At a cusp both neighboring segments can point in the same direction.
+    // Separate their two proxy controls without scanning other handles.
+    for (auto it = coincident.cbegin(); it != coincident.cend(); ++it) {
+        const auto pair = it.value();
+        if (pair.first < 0 || pair.second < 0) continue;
+        auto& first = result[pair.first];
+        auto& second = result[pair.second];
+        if (QLineF(first.point, second.point).length() >= 10.) continue;
+        for (auto* display : {&first, &second}) {
+            const QPointF direction = display->point - display->anchor;
+            const double sine = display->handle.kind == EditDocument::Handle::Control1 ? -.5 : .5;
+            constexpr double cosine = .8660254037844386;
+            display->point = display->anchor + QPointF(direction.x() * cosine - direction.y() * sine,
+                                                      direction.x() * sine + direction.y() * cosine);
+        }
+    }
+    // Keep a proxy under the pointer during its drag. The actual SVG handle
+    // moves by the pointer delta, with no geometry jump when the drag starts.
+    if (gesture_ == Gesture::Handle && !controlDisplayOffset_.isNull()) {
+        for (auto& display : result) {
+            if (display.handle.kind != handle_.kind || display.handle.index != handle_.index
+                || display.handle.subpath != handle_.subpath) continue;
+            display.point = transform.map(display.handle.point + controlDisplayOffset_);
+            display.offset = true;
+        }
+    }
+    return result;
+}
+
+bool Editor::handleAt(const QPointF& point, EditDocument::Handle* result, QPointF* displayOffset) const
+{
+    if (selected_ < 0 || layer_ != EditDocument::Layer::Lines || !document_.layerVisible(layer_)) return false;
     double distance = 8.;
     bool found = false;
-    // Anchors win coincident handles, so the default straight cubic remains
-    // easy to select even when one of its control handles is collapsed.
-    const auto handles = document_.handles(selected_);
-    for (const auto& handle : handles) {
-        const double next = QLineF(point, transform.map(handle.point)).length();
-        if (next < distance || (next == distance && handle.kind == EditDocument::Handle::Anchor)) {
+    for (const auto& display : displayHandles()) {
+        const double next = QLineF(point, display.point).length();
+        if (next < distance || (next == distance && display.handle.kind == EditDocument::Handle::Anchor)) {
             distance = next;
-            *result = handle;
+            *result = display.handle;
+            if (displayOffset) *displayOffset = display.offset ? toDocument(display.point) - display.handle.point : QPointF();
             found = true;
         }
     }
@@ -342,14 +510,30 @@ bool Editor::mousePress(QMouseEvent* event)
         updateCursor();
         return true;
     }
-    if (addLine_ && layer_ == EditDocument::Layer::Lines) {
+    if (!document_.layerVisible(layer_)) {
+        selected_ = -1;
+        emit message(QStringLiteral("編集するレイヤーを表示してください。"));
+        emit stateChanged();
+        return true;
+    }
+    if (tool_ == Tool::Pen) {
+        selected_ = -1;
+        penAnchors_.append({lastDocument_, lastDocument_, lastDocument_});
+        gesture_ = Gesture::PenAnchor;
+    } else if (tool_ == Tool::Eraser) {
+        selected_ = -1;
+        document_.beginEdit();
+        gesture_ = Gesture::Erase;
+        eraserTrace_ = QPainterPath(lastDocument_);
+        dirtyGesture_ = document_.erasePaths(lastDocument_, lastDocument_, brushRadius_, layer_) > 0;
+    } else if (addLine_ && layer_ == EditDocument::Layer::Lines) {
         document_.beginEdit();
         gesture_ = Gesture::AddLine;
         selected_ = -1;
     } else if (layer_ == EditDocument::Layer::Lines) {
-        if (!handleAt(lastViewport_, &handle_)) {
+        if (!handleAt(lastViewport_, &handle_, &controlDisplayOffset_)) {
             selected_ = document_.hitTest(lastDocument_, sourceTolerance(7.), layer_);
-            if (selected_ >= 0 && !handleAt(lastViewport_, &handle_)) {
+            if (selected_ >= 0 && !handleAt(lastViewport_, &handle_, &controlDisplayOffset_)) {
                 view_->viewport()->update();
                 emit stateChanged();
                 return true;
@@ -402,6 +586,13 @@ bool Editor::mouseMove(QMouseEvent* event)
         lastDocument_ = target;
     } else if (gesture_ == Gesture::AddLine) {
         lastDocument_ = toDocument(current);
+    } else if (gesture_ == Gesture::PenAnchor) {
+        updatePenTangent(current);
+    } else if (gesture_ == Gesture::Erase) {
+        const auto target = toDocument(current);
+        dirtyGesture_ |= document_.erasePaths(lastDocument_, target, brushRadius_, layer_) > 0;
+        eraserTrace_.lineTo(target);
+        lastDocument_ = target;
     }
     lastViewport_ = current;
     view_->viewport()->update();
@@ -419,6 +610,11 @@ bool Editor::mouseRelease(QMouseEvent* event)
     } else if (gesture_ == Gesture::Fill && QLineF(target, lastDocument_).length() > 0.00001) {
         dirtyGesture_ |= document_.deformFill(selected_, lastDocument_, target - lastDocument_, brushRadius_, false);
         lastDocument_ = target;
+    } else if (gesture_ == Gesture::PenAnchor) {
+        updatePenTangent(position(event));
+    } else if (gesture_ == Gesture::Erase) {
+        dirtyGesture_ |= document_.erasePaths(lastDocument_, target, brushRadius_, layer_) > 0;
+        lastDocument_ = target;
     } else if (gesture_ == Gesture::AddLine) {
         lastDocument_ = toDocument(position(event));
         if (QLineF(mapping().map(pressDocument_), position(event)).length() >= 2.) {
@@ -433,8 +629,13 @@ bool Editor::mouseRelease(QMouseEvent* event)
 
 void Editor::cancelGesture()
 {
-    if (gesture_ != Gesture::None && gesture_ != Gesture::Pan) document_.cancelEdit();
+    if (gesture_ == Gesture::PenAnchor && !penAnchors_.isEmpty()) {
+        penAnchors_.removeLast();
+        emit stateChanged();
+    } else if (gesture_ != Gesture::None && gesture_ != Gesture::Pan) document_.cancelEdit();
     gesture_ = Gesture::None;
+    controlDisplayOffset_ = {};
+    eraserTrace_ = {};
     dirtyGesture_ = false;
     updateCursor();
     if (view_) view_->viewport()->update();
@@ -445,11 +646,13 @@ void Editor::finishGesture()
     const bool changedDocument = dirtyGesture_;
     if (gesture_ == Gesture::Fill && changedDocument)
         document_.deformFill(selected_, lastDocument_, {}, brushRadius_, true);
-    if (gesture_ != Gesture::None && gesture_ != Gesture::Pan) {
+    if (gesture_ != Gesture::None && gesture_ != Gesture::Pan && gesture_ != Gesture::PenAnchor) {
         if (changedDocument) document_.commitEdit();
         else document_.cancelEdit();
     }
     gesture_ = Gesture::None;
+    controlDisplayOffset_ = {};
+    eraserTrace_ = {};
     dirtyGesture_ = false;
     updateCursor();
     if (changedDocument) notifyChanged();
@@ -458,6 +661,7 @@ void Editor::finishGesture()
 
 void Editor::notifyChanged()
 {
+    updateCursor();
     if (view_) view_->viewport()->update();
     emit changed(document_.svg());
     emit stateChanged();
@@ -469,7 +673,8 @@ void Editor::updateCursor()
     view_->viewport()->setCursor(historyBusy_ ? Qt::BusyCursor
         : gesture_ == Gesture::Pan ? Qt::ClosedHandCursor
         : spaceDown_ ? Qt::OpenHandCursor
-        : addLine_ || layer_ == EditDocument::Layer::Fill ? Qt::CrossCursor : Qt::ArrowCursor);
+        : !document_.layerVisible(layer_) ? Qt::ForbiddenCursor
+        : addLine_ || tool_ != Tool::Select || layer_ == EditDocument::Layer::Fill ? Qt::CrossCursor : Qt::ArrowCursor);
 }
 
 bool Editor::eventFilter(QObject* object, QEvent* event)
@@ -483,7 +688,21 @@ bool Editor::eventFilter(QObject* object, QEvent* event)
         case QEvent::MouseButtonPress: return mousePress(static_cast<QMouseEvent*>(event));
         case QEvent::MouseMove: return mouseMove(static_cast<QMouseEvent*>(event));
         case QEvent::MouseButtonRelease: return mouseRelease(static_cast<QMouseEvent*>(event));
-        case QEvent::MouseButtonDblClick: return true;
+        case QEvent::MouseButtonDblClick:
+            if (tool_ == Tool::Pen && !spaceDown_ && document_.layerVisible(EditDocument::Layer::Lines)) {
+                const auto* mouse = static_cast<QMouseEvent*>(event);
+                if (mouse->button() == Qt::LeftButton) {
+                    const auto point = position(mouse);
+                    // The first click of a native double click already added
+                    // this anchor. Directly delivered double clicks still work.
+                    if (penAnchors_.isEmpty() || QLineF(mapping().map(penAnchors_.last().point), point).length() > 2.) {
+                        const auto source = toDocument(point);
+                        penAnchors_.append({source, source, source});
+                    }
+                    finishPen();
+                }
+            }
+            return true;
         case QEvent::Wheel: if (gesture_ != Gesture::None) return true; break;
         case QEvent::Enter: pointerInside_ = true; updateCursor(); break;
         case QEvent::Leave: pointerInside_ = false; view_->viewport()->update(); break;
@@ -500,6 +719,7 @@ bool Editor::eventFilter(QObject* object, QEvent* event)
         && event->type() != QEvent::KeyRelease) return false;
     auto* key = static_cast<QKeyEvent*>(event);
     if (textInput(object) || !editingKey(key)) return false;
+    if ((key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) && !hasPendingPen()) return false;
     if (historyBusy_) { key->accept(); return true; }
     if (event->type() == QEvent::ShortcutOverride) {
         key->accept();
@@ -512,13 +732,18 @@ bool Editor::eventFilter(QObject* object, QEvent* event)
             updateCursor();
         }
     } else if (event->type() == QEvent::KeyPress) {
-        if (key->key() == Qt::Key_Delete || key->key() == Qt::Key_Backspace) deleteSelection();
+        if (key->key() == Qt::Key_Delete || key->key() == Qt::Key_Backspace) {
+            if (hasPendingPen()) removeLastPenAnchor();
+            else deleteSelection();
+        }
         else if (key->key() == Qt::Key_Escape) {
             cancelGesture();
+            cancelPen();
             selected_ = -1;
             view_->viewport()->update();
             emit stateChanged();
-        } else if (key->key() == Qt::Key_Z) {
+        } else if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) finishPen();
+        else if (key->key() == Qt::Key_Z) {
             if (key->modifiers() & Qt::ShiftModifier) redo();
             else undo();
         } else if (key->key() == Qt::Key_Y) redo();
@@ -534,37 +759,23 @@ void Editor::paint(QPainter* painter)
     painter->setRenderHint(QPainter::Antialiasing);
     const QTransform transform = mapping();
     const QColor highlight(0, 140, 255);
-    if (selected_ >= 0) {
+    if (selected_ >= 0 && document_.layerVisible(layer_)) {
         painter->setPen(QPen(highlight, 1.5));
         painter->setBrush(layer_ == EditDocument::Layer::Fill ? QColor(0, 140, 255, 45) : Qt::transparent);
         painter->drawPath(transform.map(document_.path(selected_)));
         if (layer_ == EditDocument::Layer::Lines) {
-            const auto handles = document_.handles(selected_);
-            // Control1 belongs to the segment's starting anchor; Control2 to
-            // its end anchor. Match within each subpath (compound paths may
-            // reuse the same index).
-            painter->setPen(QPen(QColor(50, 110, 160, 190), 1.));
-            const auto anchorKey = [](int subpath, int index) {
-                return (quint64(quint32(subpath)) << 32) | quint32(index);
-            };
-            QHash<quint64, QPointF> anchors;
-            for (const auto& handle : handles)
-                if (handle.kind == EditDocument::Handle::Anchor)
-                    anchors.insert(anchorKey(handle.subpath, handle.index), handle.point);
+            const auto handles = displayHandles();
             for (const auto& control : handles) {
-                if (control.kind == EditDocument::Handle::Anchor) continue;
-                const int anchorIndex = control.index
-                    + (control.kind == EditDocument::Handle::Control2 ? 1 : 0);
-                const auto anchor = anchors.constFind(anchorKey(control.subpath, anchorIndex));
-                if (anchor != anchors.constEnd())
-                    painter->drawLine(transform.map(anchor.value()), transform.map(control.point));
+                if (control.handle.kind == EditDocument::Handle::Anchor) continue;
+                painter->setPen(QPen(QColor(50, 110, 160, 190), 1., control.offset ? Qt::DashLine : Qt::SolidLine));
+                painter->drawLine(control.anchor, control.point);
             }
             // Draw controls before anchors so an overlapping anchor stays visible.
             for (int anchorPass = 0; anchorPass < 2; ++anchorPass) {
                 for (const auto& handle : handles) {
-                    const bool anchor = handle.kind == EditDocument::Handle::Anchor;
+                    const bool anchor = handle.handle.kind == EditDocument::Handle::Anchor;
                     if (anchor != bool(anchorPass)) continue;
-                    const QPointF point = transform.map(handle.point);
+                    const QPointF point = handle.point;
                     if (!QRectF(view_->viewport()->rect()).adjusted(-8, -8, 8, 8).contains(point)) continue;
                     painter->setPen(QPen(highlight, 1.3));
                     painter->setBrush(anchor ? highlight : QColor(Qt::white));
@@ -579,14 +790,48 @@ void Editor::paint(QPainter* painter)
         painter->setBrush(Qt::NoBrush);
         painter->drawLine(transform.map(pressDocument_), transform.map(lastDocument_));
     }
-    if (layer_ == EditDocument::Layer::Fill && pointerInside_ && !spaceDown_) {
+    if (!penAnchors_.isEmpty()) {
+        QPainterPath pending(penAnchors_.first().point);
+        for (int i = 1; i < penAnchors_.size(); ++i)
+            pending.cubicTo(penAnchors_[i-1].outgoing, penAnchors_[i].incoming, penAnchors_[i].point);
+        if (gesture_ == Gesture::None && pointerInside_ && !spaceDown_) {
+            const auto next = toDocument(pointerViewport_);
+            pending.cubicTo(penAnchors_.last().outgoing, next, next);
+        }
+        painter->setBrush(Qt::NoBrush);
+        painter->setPen(QPen(color_, qMax(.5, lineWidth_ / sourceTolerance(1.)), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter->drawPath(transform.map(pending));
+        painter->setPen(QPen(highlight, 1., Qt::DashLine));
+        painter->drawPath(transform.map(pending));
+        for (const auto& anchor : penAnchors_) {
+            const auto point = transform.map(anchor.point);
+            for (const auto& control : {anchor.incoming, anchor.outgoing}) {
+                if (QLineF(control, anchor.point).length() < .00001) continue;
+                painter->setPen(QPen(highlight, 1.));
+                painter->drawLine(point, transform.map(control));
+                painter->setBrush(Qt::white);
+                painter->drawEllipse(transform.map(control), 3.5, 3.5);
+            }
+            painter->setBrush(highlight);
+            painter->setPen(QPen(Qt::white, 1.));
+            painter->drawRect(QRectF(point - QPointF(3.5, 3.5), QSizeF(7, 7)));
+        }
+    }
+    if (gesture_ == Gesture::Erase) {
+        painter->setBrush(Qt::NoBrush);
+        painter->setPen(QPen(QColor(230, 45, 35, 70), 2. * brushRadius_ / sourceTolerance(1.),
+                            Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter->drawPath(transform.map(eraserTrace_));
+    }
+    if ((layer_ == EditDocument::Layer::Fill || tool_ == Tool::Eraser) && pointerInside_
+        && !spaceDown_ && document_.layerVisible(layer_)) {
         const QPointF source = toDocument(pointerViewport_);
         QPainterPath brush;
         brush.addEllipse(source, brushRadius_, brushRadius_);
         painter->setPen(QPen(QColor(255, 255, 255, 210), 3.));
         painter->setBrush(Qt::NoBrush);
         painter->drawPath(transform.map(brush));
-        painter->setPen(QPen(highlight, 1., Qt::DashLine));
+        painter->setPen(QPen(tool_ == Tool::Eraser ? QColor(230, 45, 35) : highlight, 1., Qt::DashLine));
         painter->drawPath(transform.map(brush));
     }
     painter->restore();

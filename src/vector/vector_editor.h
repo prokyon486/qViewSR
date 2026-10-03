@@ -18,6 +18,8 @@ namespace Vector {
 class Editor : public QObject {
     Q_OBJECT
 public:
+    enum class Tool { Select, Pen, Eraser };
+    Q_ENUM(Tool)
     explicit Editor(QVGraphicsView* view);
     ~Editor() override;
     bool begin(const QByteArray& svg, QString* error = nullptr);
@@ -36,6 +38,13 @@ public:
     int selectedPath() const { return selected_; }
     void setPanelWidget(QWidget* panel) { panel_ = panel; }
     void setLayer(EditDocument::Layer layer);
+    EditDocument::Layer layer() const { return layer_; }
+    void setTool(Tool tool);
+    Tool tool() const { return tool_; }
+    void setLayerVisible(EditDocument::Layer layer, bool visible);
+    bool layerVisible(EditDocument::Layer layer) const;
+    bool hasPendingPen() const { return !penAnchors_.isEmpty(); }
+    void finishPen();
     void setAddLine(bool enabled);
     void setColor(const QColor& color);
     void setBrushRadius(double radius);
@@ -53,13 +62,21 @@ protected:
     bool eventFilter(QObject* object, QEvent* event) override;
 
 private:
-    enum class Gesture { None, Pan, Handle, AddLine, Fill };
+    enum class Gesture { None, Pan, Handle, AddLine, Fill, PenAnchor, Erase };
+    struct DisplayHandle {
+        EditDocument::Handle handle;
+        QPointF point;
+        QPointF anchor;
+        bool offset = false;
+    };
     QTransform mapping() const;
     QPointF toDocument(const QPointF& viewportPoint) const;
     double sourceTolerance(double pixels) const;
     bool inScope(QObject* object) const;
     bool textInput(QObject* object) const;
-    bool handleAt(const QPointF& viewportPoint, EditDocument::Handle* result) const;
+    QVector<DisplayHandle> displayHandles() const;
+    bool handleAt(const QPointF& viewportPoint, EditDocument::Handle* result,
+                  QPointF* displayOffset = nullptr) const;
     bool mousePress(QMouseEvent* event);
     bool mouseMove(QMouseEvent* event);
     bool mouseRelease(QMouseEvent* event);
@@ -67,6 +84,9 @@ private:
     void finishGesture();
     void notifyChanged();
     void changeHistory(bool redo);
+    void cancelPen(bool explain = false);
+    void updatePenTangent(const QPointF& viewportPoint);
+    void removeLastPenAnchor();
     void updateCursor();
     void paint(QPainter* painter);
 
@@ -74,11 +94,15 @@ private:
     QPointer<QWidget> panel_;
     EditDocument document_;
     EditDocument::Layer layer_ = EditDocument::Layer::Lines;
+    Tool tool_ = Tool::Select;
+    QVector<EditDocument::BezierAnchor> penAnchors_;
+    QPainterPath eraserTrace_;
     EditDocument::Handle handle_;
     bool active_ = false;
     bool historyBusy_ = false;
     quint64 historyRevision_ = 0;
     QByteArray historySvg_;
+    bool historyLinesVisible_ = true, historyFillVisible_ = true;
     bool addLine_ = false;
     bool spaceDown_ = false;
     bool dirtyGesture_ = false;
@@ -94,6 +118,7 @@ private:
     QPointF lastDocument_;
     QPointF pressDocument_;
     QPointF handleOffset_;
+    QPointF controlDisplayOffset_;
     QPointF pointerViewport_;
 };
 }

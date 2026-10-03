@@ -11,6 +11,9 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QButtonGroup>
+#include <QGridLayout>
+#include <QToolButton>
 #include <QColorSpace>
 #include <QColorDialog>
 #include <QComboBox>
@@ -272,11 +275,15 @@ struct Controller::Private {
     QVGraphicsView* view;
     Sr::Controller* sr;
     Editor* editor;
-    QCheckBox *editMode, *addLine;
+    QCheckBox *editMode, *editShowLines, *editShowFill;
+    QButtonGroup* editTools;
+    QPushButton *editSelect, *editPen, *editEraser, *editFinish;
+    QLabel *editRadiusLabel, *editColorSample, *explanation, *generationNote;
+    QVector<QToolButton*> paletteButtons;
     QComboBox* editLayer;
     QDoubleSpinBox *brushRadius, *editLineWidth;
     QPushButton *editColor, *editDelete, *editUndo, *editRedo, *editDiscard;
-    QWidget* editControls;
+    QWidget *editControls, *generationControls;
     QColor selectedEditColor = Qt::black;
     QByteArray editBaseSvg, editInitialSvg;
     QImage editBaseImage;
@@ -311,7 +318,7 @@ struct Controller::Private {
         panel->setAttribute(Qt::WA_DeleteOnClose, false);
         panel->installEventFilter(owner);
         auto* layout = new QVBoxLayout(panel);
-        auto* explanation = new QLabel(QStringLiteral("塗りと主線を別々にベクター化します。入力を下で選びます。既定はノイズ低減を含む超解像結果です。"), panel);
+        explanation = new QLabel(QStringLiteral("塗りと主線を別々にベクター化します。入力を下で選びます。既定はノイズ低減を含む超解像結果です。"), panel);
         explanation->setWordWrap(true);
         layout->addWidget(explanation);
         inputStatus = new QLabel(panel); inputStatus->setObjectName("vectorInputStatus");
@@ -321,7 +328,11 @@ struct Controller::Private {
         scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame);
         scroll->setMinimumHeight(280);
         auto* parameters = new QWidget(scroll);
-        auto* form = new QFormLayout(parameters);
+        auto* parameterLayout = new QVBoxLayout(parameters);
+        parameterLayout->setContentsMargins(0, 0, 0, 0);
+        generationControls = new QWidget(parameters); generationControls->setObjectName("vectorGenerationControls");
+        auto* form = new QFormLayout(generationControls);
+        parameterLayout->addWidget(generationControls);
         scroll->setWidget(parameters);
         layout->addWidget(scroll, 1);
         auto combo = [this, form](const QString& name, const QString& text,
@@ -412,16 +423,55 @@ struct Controller::Private {
         editor->setPanelWidget(panel);
         editMode = new QCheckBox(QStringLiteral("編集モード（Space＋ドラッグで画像移動）"), panel);
         editMode->setObjectName("vectorEditMode"); layout->insertWidget(2, editMode);
-        editControls = new QWidget(panel);
+        editControls = new QWidget(parameters); editControls->setObjectName("vectorEditControls");
+        parameterLayout->addWidget(editControls);
         auto* edits = new QFormLayout(editControls); edits->setContentsMargins(0, 0, 0, 0);
         editLayer = new QComboBox(editControls); editLayer->setObjectName("vectorEditLayer");
         editLayer->addItem(QStringLiteral("主線（ベジエ編集）"), "lines");
         editLayer->addItem(QStringLiteral("色面（ドラッグで境界を変形）"), "fill");
         edits->addRow(QStringLiteral("編集するレイヤー"), editLayer);
-        addLine = new QCheckBox(QStringLiteral("ドラッグで線を追加"), editControls); addLine->setObjectName("vectorAddLine"); edits->addRow(addLine);
+        auto* visibility = new QHBoxLayout;
+        editShowLines = new QCheckBox(QStringLiteral("主線を表示"), editControls); editShowLines->setObjectName("vectorEditShowLines");
+        editShowFill = new QCheckBox(QStringLiteral("色面を表示"), editControls); editShowFill->setObjectName("vectorEditShowFill");
+        visibility->addWidget(editShowLines); visibility->addWidget(editShowFill);
+        edits->addRow(QStringLiteral("レイヤーの表示"), visibility);
+        auto* toolbox = new QHBoxLayout;
+        editTools = new QButtonGroup(editControls); editTools->setExclusive(true);
+        auto toolButton = [&](const QString& text, const char* name, Editor::Tool tool) {
+            auto* button = new QPushButton(text, editControls); button->setObjectName(name); button->setCheckable(true);
+            button->setStyleSheet("QPushButton:checked { background: #d5e9ff; color: #103f71; border: 2px solid #3484e4; border-radius: 3px; padding: 4px; }");
+            editTools->addButton(button, int(tool)); toolbox->addWidget(button); return button;
+        };
+        editSelect = toolButton(QStringLiteral("選択・変形"), "vectorToolSelect", Editor::Tool::Select);
+        editPen = toolButton(QStringLiteral("ペン"), "vectorToolPen", Editor::Tool::Pen);
+        editEraser = toolButton(QStringLiteral("消しゴム"), "vectorToolEraser", Editor::Tool::Eraser);
+        editSelect->setChecked(true);
+        editPen->setToolTip(QStringLiteral("クリックで節点を追加、ドラッグでハンドルを調整。Enter／ダブルクリックで確定、Escで中止します。"));
+        editEraser->setToolTip(QStringLiteral("選択中のレイヤーで、触れたパス全体を削除します。非表示の図形は対象外です。"));
+        edits->addRow(QStringLiteral("ツールボックス"), toolbox);
+        editFinish = new QPushButton(QStringLiteral("線を確定（Enter）"), editControls); editFinish->setObjectName("vectorPenFinish");
+        edits->addRow(editFinish);
+        auto* palette = new QWidget(editControls); palette->setObjectName("vectorPalette");
+        auto* paletteLayout = new QGridLayout(palette); paletteLayout->setContentsMargins(0, 0, 0, 0);
+        const QStringList colors{"#000000", "#ffffff", "#808080", "#804020", "#e53935", "#fb8c00",
+                                 "#fdd835", "#43a047", "#00acc1", "#1e88e5", "#8e24aa", "#ec407a"};
+        for (int i=0; i<colors.size(); ++i) {
+            const QColor swatch(colors[i]);
+            auto* button = new QToolButton(palette); button->setObjectName(QStringLiteral("vectorPalette%1").arg(i));
+            button->setFixedSize(32, 28); button->setCheckable(true); button->setProperty("color", swatch);
+            button->setToolTip(colors[i]); button->setAccessibleName(QStringLiteral("色 %1").arg(colors[i]));
+            button->setStyleSheet(QStringLiteral("QToolButton { background: %1; border: 1px solid #888; border-radius: 3px; } QToolButton:checked { border: 3px solid #3484e4; }").arg(colors[i]));
+            paletteLayout->addWidget(button, i/6, i%6); paletteButtons.append(button);
+            QObject::connect(button, &QToolButton::clicked, owner, [this, swatch] { chooseEditColor(swatch); });
+        }
+        edits->addRow(QStringLiteral("色パレット"), palette);
+        editColorSample = new QLabel(editControls); editColorSample->setObjectName("vectorEditColorSample");
+        editColorSample->setAlignment(Qt::AlignCenter); editColorSample->setMinimumHeight(24);
+        edits->addRow(QStringLiteral("描画／変更する色"), editColorSample);
         brushRadius = new QDoubleSpinBox(editControls); brushRadius->setObjectName("vectorBrushRadius");
         brushRadius->setRange(1, 10000); brushRadius->setValue(40); brushRadius->setSuffix(" px");
-        edits->addRow(QStringLiteral("境界変形の範囲"), brushRadius);
+        editRadiusLabel = new QLabel(QStringLiteral("境界変形の範囲"), editControls);
+        edits->addRow(editRadiusLabel, brushRadius);
         editLineWidth = new QDoubleSpinBox(editControls); editLineWidth->setObjectName("vectorEditLineWidth");
         editLineWidth->setRange(.1, 1000); editLineWidth->setValue(2.6); editLineWidth->setSuffix(" px");
         edits->addRow(QStringLiteral("追加する線の幅"), editLineWidth);
@@ -429,17 +479,17 @@ struct Controller::Private {
         auto button = [&](const QString& text, const char* name) {
             auto* b = new QPushButton(text, editControls); b->setObjectName(name); editButtons->addWidget(b); return b;
         };
-        editColor = button(QStringLiteral("色…"), "vectorEditColor");
+        editColor = button(QStringLiteral("その他の色…"), "vectorEditColor");
         editDelete = button(QStringLiteral("削除"), "vectorEditDelete");
         editUndo = button(QStringLiteral("戻す"), "vectorEditUndo");
         editRedo = button(QStringLiteral("やり直す"), "vectorEditRedo");
         edits->addRow(editButtons);
-        auto* help = new QLabel(QStringLiteral("線を選択し、節点やハンドルをドラッグします。色面は境界付近からドラッグし、離すと滑らかに整えます。Deleteで削除、Ctrl＋Zで取り消し。"), editControls);
-        help->setWordWrap(true); edits->addRow(help); form->insertRow(0, editControls);
+        auto* help = new QLabel(QStringLiteral("ペン: 節点を順にクリック。ドラッグで曲線にし、Enterまたはダブルクリックで確定します。Escで未確定の線を中止。\n選択・変形: 節点やハンドル、色面の境界をドラッグ。消しゴム: 選択中のレイヤーのパス全体を削除。\nSpace＋ドラッグで画像移動、Ctrl＋Zで取り消し。非表示のレイヤーはPNGにも出力しません。"), editControls);
+        help->setWordWrap(true); edits->addRow(help);
         editDiscard = new QPushButton(QStringLiteral("手編集を破棄して生成結果へ戻す"), panel);
-        editDiscard->setObjectName("vectorEditDiscard"); form->insertRow(1, editDiscard);
-        auto* note = new QLabel(QStringLiteral("透明背景は塗りの白い部分を消しません。主線を透明にしても塗り側の元線は残ります。"), panel);
-        note->setWordWrap(true); layout->addWidget(note);
+        editDiscard->setObjectName("vectorEditDiscard"); parameterLayout->addWidget(editDiscard); parameterLayout->addStretch();
+        generationNote = new QLabel(QStringLiteral("透明背景は塗りの白い部分を消しません。主線を透明にしても塗り側の元線は残ります。"), panel);
+        generationNote->setWordWrap(true); layout->addWidget(generationNote);
         showResult = new QCheckBox(QStringLiteral("変換結果を表示（オフで元画像）"), panel);
         showResult->setObjectName("vectorShowResult"); layout->addWidget(showResult);
         auto* actions = new QHBoxLayout;
@@ -493,16 +543,18 @@ struct Controller::Private {
         QObject::connect(pngSave, &QPushButton::clicked, owner, [this] { exportPng(); });
         QObject::connect(editMode, &QCheckBox::toggled, owner, &Controller::setEditing);
         QObject::connect(editLayer, &QComboBox::currentIndexChanged, owner, [this] {
-            if (editLayer->currentData() == "fill") addLine->setChecked(false);
             editor->setLayer(editLayer->currentData() == "fill" ? EditDocument::Layer::Fill : EditDocument::Layer::Lines);
             updateControls(false);
         });
-        QObject::connect(addLine, &QCheckBox::toggled, editor, &Editor::setAddLine);
+        QObject::connect(editTools, &QButtonGroup::idClicked, owner, [this](int id) { editor->setTool(Editor::Tool(id)); });
+        QObject::connect(editFinish, &QPushButton::clicked, owner, [this] { editor->finishPen(); view->setFocus(); });
+        QObject::connect(editShowLines, &QCheckBox::toggled, owner, [this](bool visible) { editor->setLayerVisible(EditDocument::Layer::Lines, visible); });
+        QObject::connect(editShowFill, &QCheckBox::toggled, owner, [this](bool visible) { editor->setLayerVisible(EditDocument::Layer::Fill, visible); });
         QObject::connect(brushRadius, &QDoubleSpinBox::valueChanged, editor, &Editor::setBrushRadius);
         QObject::connect(editLineWidth, &QDoubleSpinBox::valueChanged, editor, &Editor::setLineWidth);
         QObject::connect(editColor, &QPushButton::clicked, owner, [this] {
             const auto chosen = QColorDialog::getColor(selectedEditColor, panel, QStringLiteral("選択した図形／追加する線の色"));
-            if (chosen.isValid()) { selectedEditColor = chosen; editor->setColor(chosen); }
+            if (chosen.isValid()) chooseEditColor(chosen);
         });
         QObject::connect(editDelete, &QPushButton::clicked, editor, &Editor::deleteSelection);
         QObject::connect(editUndo, &QPushButton::clicked, editor, &Editor::undo);
@@ -635,6 +687,7 @@ struct Controller::Private {
     }
 
     QByteArray exportDocument(QSize* outputSize, QString* error) const {
+        if (editor->hasPendingPen()) { if (error) *error = QStringLiteral("描画中の線をEnterで確定するか、Escで中止してから保存してください。"); return {}; }
         if (composedSvg.isEmpty()) { if (error) *error = QStringLiteral("保存する変換結果がありません。"); return {}; }
         const auto memoryError = svgMemoryError(quint64(composedSvg.size()));
         if (!memoryError.isEmpty()) { if (error) *error = memoryError; return {}; }
@@ -665,6 +718,12 @@ struct Controller::Private {
         return bytes;
     }
 
+    void chooseEditColor(const QColor& chosen) {
+        selectedEditColor = chosen;
+        editor->setColor(chosen);
+        updateControls(false);
+    }
+
     void updateControls(bool updateMessage = true) {
         const QString unavailable = eligibilityError();
         const bool manual = edited || editor->active() || startingEditor;
@@ -672,8 +731,8 @@ struct Controller::Private {
         run->setEnabled(unavailable.isEmpty() && !workerBusy() && !saving && !manual);
         stop->setEnabled(workerBusy() || rendering || debounce.isActive());
         showResult->setEnabled(!image.isNull() && !externalBusy);
-        svgSave->setEnabled(!composedSvg.isEmpty() && !busy());
-        pngSave->setEnabled(!composedSvg.isEmpty() && !busy());
+        svgSave->setEnabled(!composedSvg.isEmpty() && !busy() && !editor->hasPendingPen());
+        pngSave->setEnabled(!composedSvg.isEmpty() && !busy() && !editor->hasPendingPen());
         for (auto* control : {strength, detail, color, background, lineMode, inputSource}) control->setEnabled(canGenerate);
         maskGap->setEnabled(canGenerate && lineMode->currentData().toString() == "dark");
         showFill->setEnabled(canGenerate); previewScale->setEnabled(!externalBusy && !startingEditor); scale->setEnabled(!externalBusy);
@@ -688,12 +747,36 @@ struct Controller::Private {
         width->setEnabled(canGenerate && linesVisible); opacity->parentWidget()->setEnabled(canGenerate && linesVisible);
         editMode->setEnabled(!externalBusy && !startingEditor && !editor->isBusy() && ((!image.isNull() && !busy()) || editor->active()));
         { QSignalBlocker block(editMode); editMode->setChecked(editor->active() || startingEditor); }
-        editControls->setVisible(editor->active());
+        const bool editingPanel = editor->active() || startingEditor;
+        editControls->setVisible(editingPanel);
+        generationControls->setVisible(!editingPanel);
+        explanation->setVisible(!editingPanel); inputStatus->setVisible(!editingPanel); generationNote->setVisible(!editingPanel);
+        run->setVisible(!editingPanel); stop->setVisible(!editingPanel);
+        panel->setWindowTitle(editingPanel ? QStringLiteral("ベクター編集") : QStringLiteral("ベクター変換"));
+        if (editor->active()) {
+            QSignalBlocker block(editLayer);
+            editLayer->setCurrentIndex(editLayer->findData(editor->layer() == EditDocument::Layer::Lines ? "lines" : "fill"));
+        }
         const bool lineLayer = editLayer->currentData() == "lines";
-        addLine->setEnabled(lineLayer); editLineWidth->setEnabled(lineLayer); brushRadius->setEnabled(!lineLayer);
+        const bool erasing = editor->tool() == Editor::Tool::Eraser;
+        editPen->setEnabled(lineLayer); editLineWidth->setEnabled(lineLayer && !erasing);
+        brushRadius->setEnabled(erasing || !lineLayer);
+        editRadiusLabel->setText(erasing ? QStringLiteral("消しゴムの半径") : QStringLiteral("境界変形の範囲"));
+        if (auto* button = editTools->button(int(editor->tool()))) button->setChecked(true);
+        editFinish->setVisible(editor->tool() == Editor::Tool::Pen);
+        editFinish->setEnabled(editor->hasPendingPen());
+        if (editor->active() && !editor->isBusy()) {
+            QSignalBlocker linesBlock(editShowLines), fillBlock(editShowFill);
+            editShowLines->setChecked(editor->layerVisible(EditDocument::Layer::Lines));
+            editShowFill->setChecked(editor->layerVisible(EditDocument::Layer::Fill));
+        }
+        for (auto* button : paletteButtons) button->setChecked(button->property("color").value<QColor>() == selectedEditColor);
+        editColorSample->setText(selectedEditColor.name());
+        editColorSample->setStyleSheet(QStringLiteral("background: %1; color: %2; border: 1px solid #888; border-radius: 3px;")
+            .arg(selectedEditColor.name(), selectedEditColor.lightnessF() > .5 ? "black" : "white"));
         editDelete->setEnabled(editor->selectedPath() >= 0);
-        editControls->setEnabled(!editor->isBusy());
-        editUndo->setEnabled(editor->document().canUndo() && !editor->isBusy()); editRedo->setEnabled(editor->document().canRedo() && !editor->isBusy());
+        editControls->setEnabled(editor->active() && !editor->isBusy());
+        editUndo->setEnabled((editor->document().canUndo() || editor->hasPendingPen()) && !editor->isBusy()); editRedo->setEnabled(editor->document().canRedo() && !editor->isBusy());
         editDiscard->setVisible(edited); editDiscard->setEnabled(edited && !busy() && !externalBusy);
         if (updateMessage && !unavailable.isEmpty()) setStatus(unavailable);
         else if (updateMessage && image.isNull() && !busy()) setStatus(QStringLiteral("「生成・更新」で変換を開始します。設定の変更は生成後に自動反映します。"));
@@ -766,13 +849,13 @@ struct Controller::Private {
             if (!edited) editInitialSvg = editor->svg();
             composedSvg = result.svg; image = result.image;
             editor->setLayer(editLayer->currentData() == "fill" ? EditDocument::Layer::Fill : EditDocument::Layer::Lines);
-            editor->setAddLine(addLine->isChecked()); editor->setBrushRadius(brushRadius->value());
+            editor->setBrushRadius(brushRadius->value());
             editor->setLineWidth(editLineWidth->value());
             owner->setShowingResult(true);
             window->cancelSlideshow();
             updateControls(false);
             if (auto* scroll = panel->findChild<QScrollArea*>("vectorParameters")) scroll->verticalScrollBar()->setValue(0);
-            setStatus(QStringLiteral("編集モード: 主線と色面を表示しています。Space＋ドラッグで移動、左右キーのファイル移動は停止中です。"));
+            setStatus(QStringLiteral("編集モード: パレットとツールで編集できます。Space＋ドラッグで移動、左右キーのファイル移動は停止中です。"));
             view->setFocus(); emit owner->resultReady();
         });
         watcher->setFuture(QtConcurrent::run([fill, lines, svg, size, look, requestedScale, existing] {
@@ -819,8 +902,11 @@ struct Controller::Private {
                 else {
                     image = result.image; composedSvg = result.svg;
                     if (showResult->isChecked()) { showing = true; emit owner->previewReady(image, composedSvg, previewScale->value()); }
-                    setStatus(QStringLiteral("SVG: %1×%2px。拡大時もベクターから描画します。\n変換に使った画像: %3\n%4")
-                              .arg(sourceSize.width()).arg(sourceSize.height()).arg(inputDescription, correctionSummary));
+                    if (editor->active())
+                        setStatus(QStringLiteral("編集結果: %1×%2px。表示中のレイヤーをPNGに保存します。\nSVGは非表示の図形も含めて保持します。Space＋ドラッグで画像移動。")
+                                  .arg(sourceSize.width()).arg(sourceSize.height()));
+                    else setStatus(QStringLiteral("SVG: %1×%2px。拡大時もベクターから描画します。\n変換に使った画像: %3\n%4")
+                                   .arg(sourceSize.width()).arg(sourceSize.height()).arg(inputDescription, correctionSummary));
                     emit owner->resultReady();
                 }
             }

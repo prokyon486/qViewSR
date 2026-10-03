@@ -2,6 +2,8 @@
 #include <QtTest>
 #include <QDomDocument>
 #include <QFile>
+#include <QImage>
+#include <QPainter>
 #include <QSvgRenderer>
 #include "vector/edit_document.h"
 #include <limits>
@@ -15,6 +17,14 @@ QDomElement byId(const QByteArray& svg, const QString& id) {
     const auto nodes = doc.elementsByTagName(QStringLiteral("path"));
     for (int i = 0; i < nodes.size(); ++i) if (nodes.at(i).toElement().attribute("id") == id) return nodes.at(i).toElement();
     return {};
+}
+QImage render(const QByteArray& svg) {
+    QImage image(100,100,QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::transparent);
+    QSvgRenderer renderer(svg);
+    QPainter painter(&image);
+    renderer.render(&painter);
+    return image;
 }
 }
 class VectorEditDocumentTests : public QObject {
@@ -30,6 +40,12 @@ private slots:
     void fillLongEdgeSubdivides();
     void unsupportedAndBounds();
     void editMemoryBoundaries();
+    void layerVisibilityRendersAndUndoes();
+    void hiddenEmptyLayerRemainsHiddenOnAddition();
+    void multiAnchorBezierPath();
+    void clickedPenSegmentsHaveEditableHandles();
+    void sweptEraserIsLayerSpecificAndUndoable();
+    void eraserSkipsHoleAndOpenCurveInterior();
     void realGeneratedSvg();
 };
 void VectorEditDocumentTests::loadAndHitTest() {
@@ -219,6 +235,150 @@ void VectorEditDocumentTests::editMemoryBoundaries() {
     QVERIFY(!EditDocument::memoryError(64 * MiB + 1, 0).isEmpty());
     QVERIFY(EditDocument::memoryError(bytes, std::numeric_limits<quint64>::max()).isEmpty());
     QVERIFY(!EditDocument::memoryError(std::numeric_limits<quint64>::max(), std::numeric_limits<quint64>::max()).isEmpty());
+}
+void VectorEditDocumentTests::layerVisibilityRendersAndUndoes() {
+    const QByteArray source = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"><path id="face" fill="red" d="M0 0L100 0L100 100L0 100Z"/></g><g id="lines"><path id="stroke" fill="none" stroke="blue" stroke-width="10" d="M0 50L100 50"/></g></svg>)";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    QVERIFY(document.layerVisible(Layer::Lines));
+    QVERIFY(document.layerVisible(Layer::Fill));
+    QCOMPARE(render(document.svg()).pixelColor(50,50),QColor(Qt::blue));
+    QVERIFY(document.setLayerVisible(Layer::Lines,false));
+    QVERIFY(!document.layerVisible(Layer::Lines));
+    QCOMPARE(document.hitTest({50,50},5,Layer::Lines),-1);
+    QCOMPARE(document.hitTest({50,50},0,Layer::Fill),0);
+    QCOMPARE(render(document.svg()).pixelColor(50,50),QColor(Qt::red));
+    const QByteArray linesHidden = document.svg();
+    QVERIFY(!byId(linesHidden,"stroke").isNull());
+    QVERIFY(!document.setLayerVisible(Layer::Lines,false));
+    QVERIFY(document.setLayerVisible(Layer::Fill,false));
+    QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
+    QCOMPARE(document.hitTest({50,50},0,Layer::Fill),-1);
+    EditDocument reopened;
+    QVERIFY(reopened.load(document.svg()));
+    QVERIFY(!reopened.layerVisible(Layer::Fill));
+    QVERIFY(!reopened.layerVisible(Layer::Lines));
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),linesHidden);
+    QVERIFY(document.layerVisible(Layer::Fill));
+    QVERIFY(!document.layerVisible(Layer::Lines));
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+    QVERIFY(!document.canUndo());
+    QVERIFY(document.redo());
+    QCOMPARE(render(document.svg()).pixelColor(50,50),QColor(Qt::red));
+}
+void VectorEditDocumentTests::hiddenEmptyLayerRemainsHiddenOnAddition() {
+    EditDocument document;
+    const QByteArray source = R"svg(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"/></svg>)svg";
+    QVERIFY(document.load(source));
+    QVERIFY(document.setLayerVisible(Layer::Lines,false));
+    QCOMPARE(document.addLine({0,50},{100,50},Qt::blue,10),0);
+    QVERIFY(!document.layerVisible(Layer::Lines));
+    QCOMPARE(document.hitTest({50,50},5,Layer::Lines),-1);
+    QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
+    QVERIFY(document.setLayerVisible(Layer::Lines,true));
+    QCOMPARE(document.hitTest({50,50},5,Layer::Lines),0);
+    QCOMPARE(render(document.svg()).pixelColor(50,50),QColor(Qt::blue));
+    QVERIFY(document.undo());
+    QVERIFY(!document.layerVisible(Layer::Lines));
+    QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
+    QVERIFY(document.undo());
+    QCOMPARE(document.pathCount(),0);
+    QVERIFY(!document.layerVisible(Layer::Lines));
+}
+void VectorEditDocumentTests::multiAnchorBezierPath() {
+    const QByteArray source = R"svg(<svg width="100" height="100"><g id="lines" transform="translate(10,20)"/></svg>)svg";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    const QVector<BezierAnchor> anchors = {{{10,50},{0,50},{25,50}},
+                                           {{50,20},{40,20},{60,20}},
+                                           {{90,50},{75,50},{100,50}}};
+    QCOMPARE(document.addBezierPath(anchors,Qt::magenta,3),0);
+    const auto handles = document.handles(0);
+    QCOMPARE(handles.size(),7);
+    QCOMPARE(handles[0].point,anchors[0].point);
+    QCOMPARE(handles[1].point,anchors[0].outgoing);
+    QCOMPARE(handles[2].point,anchors[1].incoming);
+    QCOMPARE(handles[3].point,anchors[1].point);
+    QCOMPARE(handles[4].point,anchors[1].outgoing);
+    QCOMPARE(handles[5].point,anchors[2].incoming);
+    QCOMPARE(handles[6].point,anchors[2].point);
+    QCOMPARE(document.color(0),QColor(Qt::magenta));
+    QDomDocument xml;
+    QVERIFY(xml.setContent(document.svg()));
+    const auto path = xml.elementsByTagName("path").at(0).toElement();
+    QCOMPARE(path.attribute("d").count('C'),2);
+    QVERIFY(path.attribute("d").startsWith("M0 30"));
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+    QVERIFY(!document.canUndo());
+    QCOMPARE(document.addBezierPath(anchors,Qt::black,2,true),0);
+    QCOMPARE(document.handles(0).size(),9);
+    QCOMPARE(document.path(0).currentPosition(),anchors[0].point);
+    const auto saved = document.svg();
+    auto invalid = anchors;
+    invalid[1].outgoing.setX(std::numeric_limits<double>::infinity());
+    QCOMPARE(document.addBezierPath(invalid,Qt::black,2),-1);
+    QCOMPARE(document.addBezierPath({anchors[0]},Qt::black,2),-1);
+    QCOMPARE(document.svg(),saved);
+}
+void VectorEditDocumentTests::sweptEraserIsLayerSpecificAndUndoable() {
+    const QByteArray source = R"(<svg width="100" height="100"><g id="fill"><path fill="red" d="M0 0L100 0L100 100L0 100Z"/></g><g id="lines" fill="none" stroke="black" stroke-width="2"><path d="M20 10L20 90"/><path d="M50 10L50 90"/><path d="M80 10L80 90"/></g></svg>)";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    document.beginEdit();
+    // Endpoints miss the strokes; the swept area still catches both crossings.
+    QCOMPARE(document.erasePaths({10,50},{60,50},2,Layer::Lines),2);
+    QCOMPARE(document.erasePaths({60,50},{90,50},2,Layer::Lines),1);
+    document.commitEdit();
+    QVERIFY(document.path(1).isEmpty());
+    QVERIFY(document.path(2).isEmpty());
+    QVERIFY(document.path(3).isEmpty());
+    QVERIFY(!document.path(0).isEmpty());
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+    QVERIFY(!document.canUndo());
+    QVERIFY(document.setLayerVisible(Layer::Lines,false));
+    QCOMPARE(document.erasePaths({0,50},{100,50},4,Layer::Lines),0);
+    QVERIFY(!document.path(1).isEmpty());
+    QCOMPARE(document.erasePaths({50,50},{50,50},4,Layer::Fill),1);
+    QVERIFY(document.path(0).isEmpty());
+    QVERIFY(!document.path(1).isEmpty());
+}
+void VectorEditDocumentTests::clickedPenSegmentsHaveEditableHandles() {
+    EditDocument document;
+    const QByteArray source = R"(<svg width="100" height="100"><g id="lines"/></svg>)";
+    QVERIFY(document.load(source));
+    const QVector<BezierAnchor> anchors = {{{10,50},{10,50},{10,50}},
+                                           {{40,50},{40,50},{40,50}},
+                                           {{40,80},{40,80},{40,80}}};
+    QCOMPARE(document.addBezierPath(anchors,Qt::black,2),0);
+    const auto handles = document.handles(0);
+    QCOMPARE(handles[1].point,QPointF(20,50));
+    QCOMPARE(handles[2].point,QPointF(30,50));
+    QCOMPARE(handles[4].point,QPointF(40,60));
+    QCOMPARE(handles[5].point,QPointF(40,70));
+    // The expanded controls stay on the exact original polyline.
+    QCOMPARE(document.path(0).boundingRect(),QRectF(10,50,30,30));
+    QVERIFY(document.moveHandle(0,handles[1],{20,20}));
+    QVERIFY(document.path(0).boundingRect().top()<50);
+    QVERIFY(document.undo());
+    QCOMPARE(document.path(0).boundingRect(),QRectF(10,50,30,30));
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+}
+void VectorEditDocumentTests::eraserSkipsHoleAndOpenCurveInterior() {
+    EditDocument document;
+    QVERIFY(document.load(R"(<svg width="100" height="100"><g id="fill"><path fill="red" fill-rule="evenodd" d="M0 0L100 0L100 100L0 100Z M30 30L70 30L70 70L30 70Z"/></g><g id="lines" stroke="black" fill="none" stroke-width="2"><path d="M20 20L20 80L80 80L80 20"/><path display="none" d="M0 50L100 50"/></g></svg>)"));
+    const auto source = document.svg();
+    QCOMPARE(document.erasePaths({50,50},{50,50},5,Layer::Fill),0);
+    QCOMPARE(document.erasePaths({40,50},{60,50},5,Layer::Lines),0);
+    QCOMPARE(document.svg(),source);
+    QVERIFY(!document.canUndo());
+    QCOMPARE(document.hitTest({50,50},2,Layer::Lines),-1);
+    QCOMPARE(document.erasePaths({20,45},{20,55},2,Layer::Lines),1);
+    QVERIFY(!document.path(2).isEmpty()); // independently hidden path remains intact
 }
 QTEST_MAIN(VectorEditDocumentTests)
 #include "tst_vectoreditdocumenttests.moc"

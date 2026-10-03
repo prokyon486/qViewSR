@@ -34,6 +34,7 @@
 #include <QScrollBar>
 #include <QScopeGuard>
 #include <QThreadPool>
+#include <QToolButton>
 #include <limits>
 
 class VectorTests : public QObject {
@@ -290,6 +291,26 @@ private slots:
         QImage tooWide(32768, 1, QImage::Format_ARGB32_Premultiplied);
         QVERIFY(!renderer.render(tooWide, QTransform(), &error));
         QVERIFY(error.contains("32767"));
+    }
+
+    void generatedSvgHiddenLongLayerKeepsOtherLayers() {
+        auto svg = longCurveSvg();
+        svg.replace("<g transform=", "<g id='fill' display='none' transform=");
+        svg.replace("</svg>", "<g id='lines' opacity='.5'><path fill='none' stroke='red' stroke-width='2' d='M20 25 L90 25'/></g></svg>");
+        Vector::GeneratedSvgRenderer renderer(svg);
+        if (!renderer.isValid() && renderer.errorString().contains("librsvg"))
+            QSKIP("Optional librsvg/Cairo runtime unavailable.");
+        QVERIFY2(renderer.isValid(), qPrintable(renderer.errorString()));
+        QString error;
+        const auto actual = Vector::rasterizeSvg(svg, QSize(200,160), &error);
+        QVERIFY2(!actual.isNull(), qPrintable(error));
+        QDomDocument expected; QVERIFY(expected.setContent(svg));
+        auto hidden = group(expected, "fill"); hidden.parentNode().removeChild(hidden);
+        const auto reference = Vector::rasterizeSvg(expected.toByteArray(-1), actual.size(), &error);
+        QVERIFY(imageError(actual, reference) < .01);
+        QVERIFY(actual.pixelColor(100,10).alpha() > 100);
+        QVERIFY(actual.pixelColor(100,10).alpha() < 150);
+        QCOMPARE(actual.pixelColor(40,60).alpha(), 0);
     }
 
     void generatedSvgLongPathsRequireBackendAndRestrictedInput() {
@@ -1344,6 +1365,157 @@ private slots:
         QVERIFY2(generate(), qPrintable(failure));
         controller->setEditing(true); QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
         QVERIFY(!editor->document().canUndo()); QVERIFY(!editor->document().canRedo());
+        QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void editToolboxAndLayerVisibilityPersistInExports() {
+        QVERIFY(select("vectorBackground", "transparent"));
+        QVERIFY2(generate(), qPrintable(failure)); controller->showPanel();
+        QVERIFY(panel->findChild<QWidget*>("vectorGenerationControls")->isVisible());
+        controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        QVERIFY(!panel->findChild<QWidget*>("vectorGenerationControls")->isVisible());
+        QVERIFY(!panel->findChild<QPushButton*>("vectorGenerate")->isVisible());
+        QVERIFY(panel->findChild<QWidget*>("vectorEditControls")->isVisible());
+        QVERIFY(panel->findChild<QWidget*>("vectorPalette")->isVisible());
+        auto* lines = panel->findChild<QCheckBox*>("vectorEditShowLines");
+        auto* fill = panel->findChild<QCheckBox*>("vectorEditShowFill");
+        QVERIFY(lines->isChecked()); QVERIFY(fill->isChecked());
+        const auto allSvg = savedSvg();
+        const auto allImage = controller->resultImage();
+        const int paths = editor->document().pathCount();
+        QString error;
+        const auto path = files.filePath("layer-visibility.png");
+        for (const auto visible : {QPair<bool,bool>{true,false}, {false,true}, {false,false}, {true,true}}) {
+            lines->setChecked(visible.first); fill->setChecked(visible.second); QVERIFY(waitIdle());
+            QVERIFY2(controller->savePng(path, 2, &error), qPrintable(error));
+            QDomDocument expected = allSvg.cloneNode(true).toDocument();
+            for (const auto id : {QStringLiteral("lines"), QStringLiteral("fill")}) {
+                if ((id=="lines" && visible.first) || (id=="fill" && visible.second)) continue;
+                auto element = group(expected, id); element.parentNode().removeChild(element);
+            }
+            const auto reference = Vector::rasterizeSvg(expected.toByteArray(-1), QSize(128,96), &error);
+            QVERIFY2(!reference.isNull(), qPrintable(error));
+            QVERIFY(imageError(QImage(path), reference) < .01);
+            Vector::EditDocument restored;
+            QVERIFY(restored.load(savedSvg().toByteArray(-1), &error));
+            QCOMPARE(restored.layerVisible(Vector::Layer::Lines), visible.first);
+            QCOMPARE(restored.layerVisible(Vector::Layer::Fill), visible.second);
+            QCOMPARE(restored.pathCount(), paths);
+        }
+        QCOMPARE(controller->resultImage(), allImage);
+        fill->setChecked(false); QVERIFY(waitIdle());
+        editor->undo(); QVERIFY(waitIdle()); QVERIFY(fill->isChecked());
+        editor->redo(); QVERIFY(waitIdle()); QVERIFY(!fill->isChecked());
+        controller->setEditing(false); QVERIFY(panel->findChild<QWidget*>("vectorGenerationControls")->isVisible());
+        controller->setEditing(true); QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        QVERIFY(!fill->isChecked()); QVERIFY(lines->isChecked());
+        // Transformed PNG exports must also preserve the hidden layer.
+        window->rotateRight(); window->mirror(); QCoreApplication::processEvents();
+        QVERIFY2(controller->savePng(path, 2, &error), qPrintable(error));
+        auto transformed = savedSvg(); auto hidden = group(transformed, "fill"); hidden.parentNode().removeChild(hidden);
+        const auto reference = Vector::rasterizeSvg(transformed.toByteArray(-1), QSize(96,128), &error);
+        QVERIFY(imageError(QImage(path), reference) < .01);
+        QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void editPenCreatesMultipleBezierSegmentsWithPalette() {
+        QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        controller->showPanel(); QCoreApplication::processEvents();
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolPen"), Qt::LeftButton);
+        QCOMPARE(editor->tool(), Vector::Editor::Tool::Pen);
+        QTest::mouseClick(panel->findChild<QToolButton*>("vectorPalette9"), Qt::LeftButton);
+        editor->setLineWidth(1.5);
+        const int before = editor->document().pathCount(); const auto baseline = editor->svg();
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({8,3}));
+        QVERIFY(editor->hasPendingPen());
+        QVERIFY(!panel->findChild<QPushButton*>("vectorSaveSvg")->isEnabled());
+        QString error; QVERIFY(!controller->saveSvg(files.filePath("unfinished.svg"), &error)); QVERIFY(!error.isEmpty());
+        dragAt(editorPoint({22,4}), editorPoint({26,7}));
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({40,3}));
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({55,4}));
+        QCOMPARE(editor->document().pathCount(), before);
+        // Finishing from the floating palette must preserve the pending anchors.
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorPenFinish"), Qt::LeftButton);
+        QVERIFY(waitIdle()); QVERIFY(!editor->hasPendingPen());
+        QCOMPARE(editor->document().pathCount(), before+1);
+        const int added = editor->selectedPath(); QVERIFY(added >= 0);
+        QCOMPARE(editor->document().color(added), QColor("#1e88e5"));
+        const auto handles = editor->document().handles(added);
+        int anchors=0, controls=0;
+        for (const auto& h : handles) { if(h.kind==Vector::Handle::Anchor) ++anchors; else ++controls; }
+        QCOMPARE(anchors, 4); QCOMPARE(controls, 6);
+        const auto finished = editor->svg();
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), baseline);
+        editor->redo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), finished);
+        // A clicked endpoint adjoining a dragged anchor has a collapsed control.
+        // Its display handle is separated without changing the SVG geometry.
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolSelect"), Qt::LeftButton);
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier,
+                          editorPoint(editor->document().path(added).pointAtPercent(.5)));
+        QCOMPARE(editor->selectedPath(), added);
+        const auto originalHandles = editor->document().handles(added);
+        const auto start = editorPoint(originalHandles[0].point);
+        const auto nextAnchor = editorPoint(originalHandles[3].point);
+        const QPointF direction = QPointF(nextAnchor-start) / QLineF(start, nextAnchor).length();
+        const auto displayedControl = (QPointF(start)+direction*14.).toPoint();
+        QCOMPARE(originalHandles[1].point, originalHandles[0].point);
+        dragAt(displayedControl, displayedControl+QPoint(0,22)); QVERIFY(waitIdle());
+        const auto movedHandles = editor->document().handles(added);
+        QCOMPARE(movedHandles[0].point, originalHandles[0].point);
+        QVERIFY(QLineF(movedHandles[1].point, originalHandles[1].point).length() > .5);
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), finished);
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolPen"), Qt::LeftButton);
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({8,42}));
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({20,43}));
+        QTest::keyClick(view->viewport(), Qt::Key_Escape);
+        QVERIFY(!editor->hasPendingPen()); QCOMPARE(editor->svg(), finished);
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({8,44}));
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({25,45}));
+        QTest::keyClick(view->viewport(), Qt::Key_Return); QVERIFY(waitIdle());
+        QVERIFY(!editor->hasPendingPen()); QCOMPARE(editor->document().pathCount(), before+2);
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({8,40}));
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({20,41}));
+        QTest::mouseDClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({40,42}));
+        QVERIFY(waitIdle()); QVERIFY(!editor->hasPendingPen());
+        QCOMPARE(editor->document().pathCount(), before+3);
+        const auto artifacts = qEnvironmentVariable("ARTIFACTS");
+        if (!artifacts.isEmpty()) {
+            QVERIFY(panel->grab().save(artifacts+"/vector-toolbox-panel.png"));
+            QVERIFY(window->grab().save(artifacts+"/vector-pen-window.png"));
+        }
+        QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void editEraserSweepsSelectedVisibleLayerAsOneUndo() {
+        QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        QString error;
+        const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='48' viewBox='0 0 64 48'>"
+            "<g id='fill'><path fill='#ff8000' d='M5 12 L58 12 L58 36 L5 36 Z'/></g>"
+            "<g id='lines' fill='none' stroke='black' stroke-width='1'>"
+            "<path d='M20 8 L20 40'/><path d='M44 8 L44 40'/></g></svg>";
+        QVERIFY2(editor->begin(svg, &error), qPrintable(error));
+        editor->setBrushRadius(1);
+        controller->showPanel(); QCoreApplication::processEvents();
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolEraser"), Qt::LeftButton);
+        QCOMPARE(editor->tool(), Vector::Editor::Tool::Eraser);
+        dragAt(editorPoint({8,24}), editorPoint({56,24})); QVERIFY(waitIdle());
+        QVERIFY(!editor->document().path(0).isEmpty());
+        QVERIFY(editor->document().path(1).isEmpty()); QVERIFY(editor->document().path(2).isEmpty());
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), svg);
+        editor->setLayerVisible(Vector::Layer::Lines, false); QVERIFY(waitIdle());
+        const auto hidden = editor->svg();
+        dragAt(editorPoint({8,24}), editorPoint({56,24})); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), hidden);
+        QVERIFY(select("vectorEditLayer", "fill"));
+        dragAt(editorPoint({8,24}), editorPoint({56,24})); QVERIFY(waitIdle());
+        QVERIFY(editor->document().path(0).isEmpty());
+        QVERIFY(!editor->document().path(1).isEmpty()); QVERIFY(!editor->document().path(2).isEmpty());
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), hidden);
         QCOMPARE(digest(sourcePath), sourceDigest);
     }
 
