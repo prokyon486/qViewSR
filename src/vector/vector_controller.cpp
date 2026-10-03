@@ -3,6 +3,7 @@
 #include "cancellable_save_file.h"
 #include "memory_budget.h"
 #include "generated_svg_renderer.h"
+#include "vector_editor.h"
 #include "mainwindow.h"
 #include "qvgraphicsview.h"
 #include "sr/color_pipeline.h"
@@ -11,6 +12,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QColorSpace>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QDialog>
 #include <QDir>
@@ -26,6 +28,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPointer>
 #include <QProcess>
@@ -34,6 +37,7 @@
 #include <QSaveFile>
 #include <QScreen>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -65,6 +69,7 @@ struct Rendered {
     QByteArray svg;
     QImage image;
     QString error;
+    std::shared_ptr<EditDocument> editable;
 };
 
 QString repositoryRoot() {
@@ -118,6 +123,20 @@ QImage rasterizeSvg(const QByteArray& svg, QSize size, QString* error) {
 }
 
 namespace {
+Rendered previewDocument(const QByteArray& svg, QSize size, double previewScale) {
+    Rendered output;
+    output.svg = svg;
+    output.error = svgMemoryError(quint64(svg.size()));
+    if (!output.error.isEmpty()) return output;
+    const double proxyScale = qMin(previewScale, qMin(
+        std::sqrt(double(MaxProxyPixels) / (qint64(size.width()) * size.height())),
+        double(MaxProxySide) / qMax(size.width(), size.height())));
+    const QSize proxySize(qMax(1, int(std::floor(size.width() * proxyScale))),
+                          qMax(1, int(std::floor(size.height() * proxyScale))));
+    output.image = rasterizeSvg(svg, proxySize, &output.error);
+    return output;
+}
+
 void grayElement(QDomElement element) {
     for (const QString& attribute : {QStringLiteral("fill"), QStringLiteral("stroke"), QStringLiteral("stop-color")}) {
         if (!element.hasAttribute(attribute)) continue;
@@ -193,13 +212,7 @@ Rendered compose(const QByteArray& fillBytes, const QByteArray& linesBytes, QSiz
     if (!output.error.isEmpty()) { output.svg.clear(); return output; }
     // This bitmap only supplies viewer geometry and a bounded fallback. The SVG
     // retains full input coordinates; exports are rendered separately on demand.
-    const double proxyScale = qMin(previewScale, qMin(
-        std::sqrt(double(MaxProxyPixels) / (qint64(size.width()) * size.height())),
-        double(MaxProxySide) / qMax(size.width(), size.height())));
-    const QSize proxySize(qMax(1, int(std::floor(size.width() * proxyScale))),
-                          qMax(1, int(std::floor(size.height() * proxyScale))));
-    output.image = rasterizeSvg(output.svg, proxySize, &output.error);
-    return output;
+    return previewDocument(output.svg, size, previewScale);
 }
 
 bool writePng(const QImage& image, const QString& path, QString* error,
@@ -258,6 +271,16 @@ struct Controller::Private {
     MainWindow* window;
     QVGraphicsView* view;
     Sr::Controller* sr;
+    Editor* editor;
+    QCheckBox *editMode, *addLine;
+    QComboBox* editLayer;
+    QDoubleSpinBox *brushRadius, *editLineWidth;
+    QPushButton *editColor, *editDelete, *editUndo, *editRedo, *editDiscard;
+    QWidget* editControls;
+    QColor selectedEditColor = Qt::black;
+    QByteArray editBaseSvg, editInitialSvg;
+    QImage editBaseImage;
+    bool edited = false, startingEditor = false;
     QPointer<QDialog> panel;
     QComboBox *strength, *detail, *color, *background, *lineMode, *maskGap, *inputSource;
     QDoubleSpinBox *width, *scale, *previewScale, *minLineLength, *joinDistance, *shapeTolerance;
@@ -385,6 +408,36 @@ struct Controller::Private {
         previewScale->setObjectName("vectorPreviewScale"); previewScale->setRange(.01, 8); previewScale->setSingleStep(.1);
         previewScale->setSuffix(QStringLiteral(" 倍")); form->addRow(QStringLiteral("受け渡し画像の倍率"), previewScale);
         previewScale->setToolTip(QStringLiteral("Ctrl＋ドラッグで渡す画像の倍率です。画面のプレビューは倍率に関係なくSVGから描画します。"));
+        editor = new Editor(view);
+        editor->setPanelWidget(panel);
+        editMode = new QCheckBox(QStringLiteral("編集モード（Space＋ドラッグで画像移動）"), panel);
+        editMode->setObjectName("vectorEditMode"); layout->insertWidget(2, editMode);
+        editControls = new QWidget(panel);
+        auto* edits = new QFormLayout(editControls); edits->setContentsMargins(0, 0, 0, 0);
+        editLayer = new QComboBox(editControls); editLayer->setObjectName("vectorEditLayer");
+        editLayer->addItem(QStringLiteral("主線（ベジエ編集）"), "lines");
+        editLayer->addItem(QStringLiteral("色面（ドラッグで境界を変形）"), "fill");
+        edits->addRow(QStringLiteral("編集するレイヤー"), editLayer);
+        addLine = new QCheckBox(QStringLiteral("ドラッグで線を追加"), editControls); addLine->setObjectName("vectorAddLine"); edits->addRow(addLine);
+        brushRadius = new QDoubleSpinBox(editControls); brushRadius->setObjectName("vectorBrushRadius");
+        brushRadius->setRange(1, 10000); brushRadius->setValue(40); brushRadius->setSuffix(" px");
+        edits->addRow(QStringLiteral("境界変形の範囲"), brushRadius);
+        editLineWidth = new QDoubleSpinBox(editControls); editLineWidth->setObjectName("vectorEditLineWidth");
+        editLineWidth->setRange(.1, 1000); editLineWidth->setValue(2.6); editLineWidth->setSuffix(" px");
+        edits->addRow(QStringLiteral("追加する線の幅"), editLineWidth);
+        auto* editButtons = new QHBoxLayout;
+        auto button = [&](const QString& text, const char* name) {
+            auto* b = new QPushButton(text, editControls); b->setObjectName(name); editButtons->addWidget(b); return b;
+        };
+        editColor = button(QStringLiteral("色…"), "vectorEditColor");
+        editDelete = button(QStringLiteral("削除"), "vectorEditDelete");
+        editUndo = button(QStringLiteral("戻す"), "vectorEditUndo");
+        editRedo = button(QStringLiteral("やり直す"), "vectorEditRedo");
+        edits->addRow(editButtons);
+        auto* help = new QLabel(QStringLiteral("線を選択し、節点やハンドルをドラッグします。色面は境界付近からドラッグし、離すと滑らかに整えます。Deleteで削除、Ctrl＋Zで取り消し。"), editControls);
+        help->setWordWrap(true); edits->addRow(help); form->insertRow(0, editControls);
+        editDiscard = new QPushButton(QStringLiteral("手編集を破棄して生成結果へ戻す"), panel);
+        editDiscard->setObjectName("vectorEditDiscard"); form->insertRow(1, editDiscard);
         auto* note = new QLabel(QStringLiteral("透明背景は塗りの白い部分を消しません。主線を透明にしても塗り側の元線は残ります。"), panel);
         note->setWordWrap(true); layout->addWidget(note);
         showResult = new QCheckBox(QStringLiteral("変換結果を表示（オフで元画像）"), panel);
@@ -438,6 +491,31 @@ struct Controller::Private {
             else setStatus(QStringLiteral("SVGを保存しました。"));
         });
         QObject::connect(pngSave, &QPushButton::clicked, owner, [this] { exportPng(); });
+        QObject::connect(editMode, &QCheckBox::toggled, owner, &Controller::setEditing);
+        QObject::connect(editLayer, &QComboBox::currentIndexChanged, owner, [this] {
+            if (editLayer->currentData() == "fill") addLine->setChecked(false);
+            editor->setLayer(editLayer->currentData() == "fill" ? EditDocument::Layer::Fill : EditDocument::Layer::Lines);
+            updateControls(false);
+        });
+        QObject::connect(addLine, &QCheckBox::toggled, editor, &Editor::setAddLine);
+        QObject::connect(brushRadius, &QDoubleSpinBox::valueChanged, editor, &Editor::setBrushRadius);
+        QObject::connect(editLineWidth, &QDoubleSpinBox::valueChanged, editor, &Editor::setLineWidth);
+        QObject::connect(editColor, &QPushButton::clicked, owner, [this] {
+            const auto chosen = QColorDialog::getColor(selectedEditColor, panel, QStringLiteral("選択した図形／追加する線の色"));
+            if (chosen.isValid()) { selectedEditColor = chosen; editor->setColor(chosen); }
+        });
+        QObject::connect(editDelete, &QPushButton::clicked, editor, &Editor::deleteSelection);
+        QObject::connect(editUndo, &QPushButton::clicked, editor, &Editor::undo);
+        QObject::connect(editRedo, &QPushButton::clicked, editor, &Editor::redo);
+        QObject::connect(editDiscard, &QPushButton::clicked, owner, [this] {
+            if (QMessageBox::question(panel, QStringLiteral("手編集を破棄"), QStringLiteral("主線・色面への手編集を破棄し、編集前の生成結果へ戻しますか？"),
+                                      QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes) owner->discardEdits();
+        });
+        QObject::connect(editor, &Editor::changed, owner, [this](const QByteArray& svg) {
+            edited = svg != editInitialSvg; composedSvg = svg; queueRender(); updateControls(false);
+        });
+        QObject::connect(editor, &Editor::stateChanged, owner, [this] { updateControls(false); });
+        QObject::connect(editor, &Editor::message, owner, [this](const QString& text) { setStatus(text); });
         QObject::connect(&view->getImageCore(), &QVImageCore::sourceChanging, owner, [this] { loading = true; invalidate(); });
         QObject::connect(view, &QVGraphicsView::fileChanged, owner, [this] { loading = false; updateControls(); });
         QObject::connect(view, &QVGraphicsView::vectorRenderingFailed, owner, [this](const QString& error) { report(error); });
@@ -446,6 +524,7 @@ struct Controller::Private {
     }
 
     ~Private() {
+        editor->end();
         ++epoch;
         if (preparationCancelled) preparationCancelled->store(true, std::memory_order_relaxed);
         if (process) { process->disconnect(owner); process->kill(); process->waitForFinished(2000); }
@@ -537,7 +616,7 @@ struct Controller::Private {
     }
 
     bool workerBusy() const { return preparing || process; }
-    bool busy() const { return workerBusy() || rendering || saving || debounce.isActive() || rerun; }
+    bool busy() const { return workerBusy() || rendering || saving || debounce.isActive() || rerun || editor->isBusy(); }
     void setStatus(const QString& message) { status->setText(message); status->setToolTip(message); }
     void report(const QString& message) { setStatus(message); emit owner->failed(message); updateControls(false); }
     QString suggestedName(const QString& extension) const {
@@ -588,23 +667,34 @@ struct Controller::Private {
 
     void updateControls(bool updateMessage = true) {
         const QString unavailable = eligibilityError();
-        run->setEnabled(unavailable.isEmpty() && !workerBusy() && !saving);
+        const bool manual = edited || editor->active() || startingEditor;
+        const bool canGenerate = !externalBusy && !manual;
+        run->setEnabled(unavailable.isEmpty() && !workerBusy() && !saving && !manual);
         stop->setEnabled(workerBusy() || rendering || debounce.isActive());
         showResult->setEnabled(!image.isNull() && !externalBusy);
         svgSave->setEnabled(!composedSvg.isEmpty() && !busy());
         pngSave->setEnabled(!composedSvg.isEmpty() && !busy());
-        for (auto* control : {strength, detail, color, background, lineMode, inputSource}) control->setEnabled(!externalBusy);
-        maskGap->setEnabled(!externalBusy && lineMode->currentData().toString() == "dark");
-        showFill->setEnabled(!externalBusy); previewScale->setEnabled(!externalBusy); scale->setEnabled(!externalBusy);
-        correctLines->setEnabled(!externalBusy);
-        cleanLines->setEnabled(!externalBusy);
-        shapeTolerance->setEnabled(!externalBusy && correctLines->isChecked());
-        minLineLength->setEnabled(!externalBusy && cleanLines->isChecked());
-        joinDistance->setEnabled(!externalBusy && cleanLines->isChecked());
-        branchStrength->parentWidget()->setEnabled(!externalBusy && cleanLines->isChecked() && minLineLength->value() > 0);
-        suppression->parentWidget()->setEnabled(!externalBusy && showFill->isChecked()); grayFill->setEnabled(!externalBusy && showFill->isChecked());
+        for (auto* control : {strength, detail, color, background, lineMode, inputSource}) control->setEnabled(canGenerate);
+        maskGap->setEnabled(canGenerate && lineMode->currentData().toString() == "dark");
+        showFill->setEnabled(canGenerate); previewScale->setEnabled(!externalBusy && !startingEditor); scale->setEnabled(!externalBusy);
+        correctLines->setEnabled(canGenerate);
+        cleanLines->setEnabled(canGenerate);
+        shapeTolerance->setEnabled(canGenerate && correctLines->isChecked());
+        minLineLength->setEnabled(canGenerate && cleanLines->isChecked());
+        joinDistance->setEnabled(canGenerate && cleanLines->isChecked());
+        branchStrength->parentWidget()->setEnabled(canGenerate && cleanLines->isChecked() && minLineLength->value() > 0);
+        suppression->parentWidget()->setEnabled(canGenerate && showFill->isChecked()); grayFill->setEnabled(canGenerate && showFill->isChecked());
         const bool linesVisible = color->currentData().toString() != "transparent";
-        width->setEnabled(!externalBusy && linesVisible); opacity->parentWidget()->setEnabled(!externalBusy && linesVisible);
+        width->setEnabled(canGenerate && linesVisible); opacity->parentWidget()->setEnabled(canGenerate && linesVisible);
+        editMode->setEnabled(!externalBusy && !startingEditor && !editor->isBusy() && ((!image.isNull() && !busy()) || editor->active()));
+        { QSignalBlocker block(editMode); editMode->setChecked(editor->active() || startingEditor); }
+        editControls->setVisible(editor->active());
+        const bool lineLayer = editLayer->currentData() == "lines";
+        addLine->setEnabled(lineLayer); editLineWidth->setEnabled(lineLayer); brushRadius->setEnabled(!lineLayer);
+        editDelete->setEnabled(editor->selectedPath() >= 0);
+        editControls->setEnabled(!editor->isBusy());
+        editUndo->setEnabled(editor->document().canUndo() && !editor->isBusy()); editRedo->setEnabled(editor->document().canRedo() && !editor->isBusy());
+        editDiscard->setVisible(edited); editDiscard->setEnabled(edited && !busy() && !externalBusy);
         if (updateMessage && !unavailable.isEmpty()) setStatus(unavailable);
         else if (updateMessage && image.isNull() && !busy()) setStatus(QStringLiteral("「生成・更新」で変換を開始します。設定の変更は生成後に自動反映します。"));
         updateInputStatus();
@@ -612,6 +702,7 @@ struct Controller::Private {
     }
 
     void shapeChanged() {
+        if (edited || editor->active() || startingEditor) { updateControls(false); return; }
         ++shapeRevision;
         saveSettings();
         if (generated && !externalBusy) debounce.start();
@@ -626,6 +717,8 @@ struct Controller::Private {
 
     void invalidate() {
         owner->cancel();
+        editor->reset(); edited = false; startingEditor = false;
+        editBaseSvg.clear(); editInitialSvg.clear(); editBaseImage = {};
         fillSvg.clear(); linesSvg.clear(); composedSvg.clear(); image = {}; sourceSize = {};
         workspace.reset(); generated = false; showing = false;
         inputCacheKey = 0; inputProfileIcc.clear();
@@ -642,12 +735,80 @@ struct Controller::Private {
         startRender();
     }
 
+    void beginEditing() {
+        if (editor->active() || startingEditor) return;
+        if (busy() || externalBusy || image.isNull()) { updateControls(false); return; }
+        const auto memoryError = EditDocument::memoryError(
+            qMax(quint64(composedSvg.size()), quint64(fillSvg.size()) + quint64(linesSvg.size())), availableMemoryBytes());
+        if (!memoryError.isEmpty()) { report(memoryError); return; }
+        if (!edited) { editBaseSvg = composedSvg; editBaseImage = image; }
+        const auto editEpoch = epoch;
+        auto look = appearance(); look.showFill = true;
+        if (look.color == "transparent") look.color = "source";
+        if (look.opacity == 0) look.opacity = 100;
+        const auto fill = fillSvg, lines = linesSvg, svg = composedSvg;
+        const auto size = sourceSize;
+        const auto requestedScale = previewScale->value();
+        const bool existing = edited;
+        startingEditor = true; rendering = true;
+        setStatus(QStringLiteral("編集用の主線・色面を準備しています…"));
+        updateControls(false);
+        auto* watcher = new QFutureWatcher<Rendered>(owner);
+        QObject::connect(watcher, &QFutureWatcher<Rendered>::finished, owner, [this, watcher, editEpoch] {
+            auto result = watcher->result(); watcher->deleteLater();
+            rendering = false; startingEditor = false;
+            if (epoch != editEpoch || externalBusy) { updateControls(false); return; }
+            QString error = result.error;
+            if (error.isEmpty() && !editor->beginPrepared(result.svg, result.editable, &error)) {
+                if (error.isEmpty()) error = QStringLiteral("編集用SVGを読み込めません。");
+            }
+            if (!error.isEmpty()) { report(error); updateControls(false); return; }
+            if (!edited) editInitialSvg = editor->svg();
+            composedSvg = result.svg; image = result.image;
+            editor->setLayer(editLayer->currentData() == "fill" ? EditDocument::Layer::Fill : EditDocument::Layer::Lines);
+            editor->setAddLine(addLine->isChecked()); editor->setBrushRadius(brushRadius->value());
+            editor->setLineWidth(editLineWidth->value());
+            owner->setShowingResult(true);
+            window->cancelSlideshow();
+            updateControls(false);
+            if (auto* scroll = panel->findChild<QScrollArea*>("vectorParameters")) scroll->verticalScrollBar()->setValue(0);
+            setStatus(QStringLiteral("編集モード: 主線と色面を表示しています。Space＋ドラッグで移動、左右キーのファイル移動は停止中です。"));
+            view->setFocus(); emit owner->resultReady();
+        });
+        watcher->setFuture(QtConcurrent::run([fill, lines, svg, size, look, requestedScale, existing] {
+            auto result = existing ? previewDocument(svg, size, requestedScale) : compose(fill, lines, size, look, requestedScale);
+            if (result.error.isEmpty()) {
+                result.editable = std::make_shared<EditDocument>();
+                if (!result.editable->load(result.svg, &result.error)) result.editable.reset();
+            }
+            return result;
+        }));
+    }
+
+    void endEditing() {
+        if (startingEditor) { owner->cancel(); startingEditor = false; }
+        if (!editor->active()) return;
+        editor->end();
+        // Leaving a session without edits restores the original layer visibility.
+        if (!edited && !editBaseSvg.isEmpty()) {
+            ++renderRevision; renderPending = false;
+            composedSvg = editBaseSvg; image = editBaseImage;
+            editBaseSvg.clear(); editInitialSvg.clear(); editBaseImage = {};
+            if (showing) emit owner->previewReady(image, composedSvg, previewScale->value());
+        }
+        updateControls(false);
+        setStatus(edited ? QStringLiteral("編集結果を保持しています。SVG／PNGで保存できます。再生成するには手編集を破棄してください。")
+                         : QStringLiteral("編集モードを終了しました。"));
+    }
+
     void startRender() {
         const auto renderEpoch = epoch, revision = renderRevision;
         const auto fill = fillSvg, lines = linesSvg;
         const auto size = sourceSize;
         const auto inputDescription = resultInputDescription;
         const auto look = appearance();
+        const bool manual = edited || editor->active();
+        const auto editedSvg = composedSvg;
         const double requestedScale = previewScale->value();
         rendering = true;
         auto* watcher = new QFutureWatcher<Rendered>(owner);
@@ -666,11 +827,16 @@ struct Controller::Private {
             if (renderPending && !fillSvg.isEmpty() && !externalBusy) { renderPending = false; startRender(); }
             updateControls(false);
         });
-        watcher->setFuture(QtConcurrent::run([fill, lines, size, look, requestedScale] { return compose(fill, lines, size, look, requestedScale); }));
+        watcher->setFuture(QtConcurrent::run([fill, lines, size, look, requestedScale, manual, editedSvg] {
+            return manual ? previewDocument(editedSvg, size, requestedScale) : compose(fill, lines, size, look, requestedScale);
+        }));
         updateControls(false);
     }
 
     void startJob() {
+        if (edited || editor->active() || startingEditor) {
+            report(QStringLiteral("手編集を保持しています。再生成するには編集モードを終了し、手編集を破棄してください。")); return;
+        }
         const QString unavailable = eligibilityError();
         if (!unavailable.isEmpty()) { report(unavailable); return; }
         if (workerBusy()) { rerun = true; return; }
@@ -803,6 +969,7 @@ struct Controller::Private {
             if (fill.isEmpty()) { report(error); continuePending(); return; }
             const auto lines = readSvgAsset(result.value("lines_svg").toString(), folder->filePath("cache"), &error);
             if (fill.isEmpty() || lines.isEmpty()) { report(error); continuePending(); return; }
+            editor->reset();
             fillSvg = fill; linesSvg = lines; sourceSize = size; resultInputDescription = inputDescription;
             const auto stats = result.value("correction_stats").toObject();
             correctionSummary = selectedCorrection
@@ -863,6 +1030,8 @@ Controller::~Controller() = default;
 bool Controller::hasResult() const { return !d->image.isNull(); }
 bool Controller::showingResult() const { return d->showing && hasResult(); }
 bool Controller::isBusy() const { return d->busy(); }
+bool Controller::isEditing() const { return d->editor->active(); }
+bool Controller::hasEdits() const { return d->edited; }
 QImage Controller::resultImage() const { return d->image; }
 
 void Controller::showPanel() {
@@ -872,6 +1041,9 @@ void Controller::showPanel() {
         visibleOnScreen |= screen->availableGeometry().intersects(d->panel->frameGeometry());
     if (!visibleOnScreen) d->panel->move(d->window->frameGeometry().topRight() - QPoint(d->panel->width(), 0));
     d->panel->show(); d->panel->raise(); d->panel->activateWindow(); d->updateControls();
+    if (isEditing()) {
+        if (auto* scroll = d->panel->findChild<QScrollArea*>("vectorParameters")) scroll->verticalScrollBar()->setValue(0);
+    }
 }
 
 void Controller::setFullscreen(bool fullscreen) {
@@ -906,11 +1078,30 @@ void Controller::setExternalBusy(bool busy) {
 
 void Controller::setShowingResult(bool showing) {
     showing = showing && hasResult() && !d->externalBusy;
+    if (!showing) d->endEditing();
     { QSignalBlocker block(d->showResult); d->showResult->setChecked(showing); }
     const bool changed = d->showing != showing; d->showing = showing;
     if (showing) emit previewReady(d->image, d->composedSvg, d->previewScale->value());
     else if (changed) emit originalRequested();
     emit stateChanged();
+}
+
+void Controller::setEditing(bool editing) {
+    if (editing) d->beginEditing(); else d->endEditing();
+}
+
+void Controller::discardEdits() {
+    if (d->busy() || d->externalBusy) return;
+    d->endEditing();
+    if (!d->edited) return;
+    d->edited = false;
+    d->editor->reset();
+    d->composedSvg = d->editBaseSvg; d->image = d->editBaseImage;
+    d->editBaseSvg.clear(); d->editInitialSvg.clear(); d->editBaseImage = {};
+    ++d->renderRevision; d->renderPending = false;
+    if (d->showing) emit previewReady(d->image, d->composedSvg, d->previewScale->value());
+    d->setStatus(QStringLiteral("手編集を破棄し、編集前の生成結果へ戻しました。"));
+    d->updateControls(false);
 }
 
 bool Controller::saveSvg(const QString& path, QString* error) {

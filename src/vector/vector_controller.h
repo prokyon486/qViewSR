@@ -21,6 +21,8 @@ public:
     bool hasResult() const;
     bool showingResult() const;
     bool isBusy() const;
+    bool isEditing() const;
+    bool hasEdits() const;
     QImage resultImage() const;
     bool saveSvg(const QString& path, QString* error = nullptr);
     bool savePng(const QString& path, double scale, QString* error = nullptr);
@@ -33,6 +35,8 @@ public slots:
     void cancel();
     void setExternalBusy(bool busy);
     void setShowingResult(bool showing);
+    void setEditing(bool editing);
+    void discardEdits();
 
 signals:
     void previewReady(const QImage& sRGBImage, const QByteArray& svg, double transferScale);

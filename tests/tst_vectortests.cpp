@@ -7,6 +7,7 @@
 #include "vector/cancellable_save_file.h"
 #include "vector/memory_budget.h"
 #include "vector/generated_svg_renderer.h"
+#include "vector/vector_editor.h"
 #include <QtTest>
 #include <QCheckBox>
 #include <QColorSpace>
@@ -101,6 +102,18 @@ class VectorTests : public QObject {
         if (index < 0) return false;
         combo->setCurrentIndex(index);
         return waitIdle();
+    }
+
+    void dragAt(QPoint from, QPoint to) {
+        auto* viewport = view->viewport();
+        QTest::mousePress(viewport, Qt::LeftButton, Qt::NoModifier, from);
+        QMouseEvent move(QEvent::MouseMove, to, viewport->mapToGlobal(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport, &move);
+        QTest::mouseRelease(viewport, Qt::LeftButton, Qt::NoModifier, to);
+    }
+
+    QPoint editorPoint(QPointF point) const {
+        return view->vectorToViewportTransform(QRectF(0, 0, 64, 48)).map(point).toPoint();
     }
 
     bool configureFakeSr(Sr::Controller* sr, const QString& mode, double scale = 2) {
@@ -1182,6 +1195,182 @@ private slots:
         QCOMPARE(QSvgRenderer(savedSvg().toByteArray()).defaultSize(), QSize(31, 25));
         QVERIFY(panel->findChild<QLabel*>("vectorInputStatus")->text().contains(QStringLiteral("元画像")));
         QCOMPARE(digest(sourcePath), sourceDigest); QCOMPARE(digest(other), otherDigest);
+    }
+
+    void editBezierAddColorDeleteUndoAndExport() {
+        QVERIFY2(generate(), qPrintable(failure));
+        const auto originalSvg = savedSvg().toByteArray(-1);
+        controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        const int beforeCount = editor->document().pathCount();
+        editor->setAddLine(true); editor->setLineWidth(1.5);
+        dragAt(editorPoint({8, 3}), editorPoint({56, 3}));
+        QVERIFY(waitIdle()); QVERIFY(controller->hasEdits());
+        QCOMPARE(editor->document().pathCount(), beforeCount+1);
+        const int added = editor->selectedPath(); QVERIFY(added >= 0);
+        editor->setAddLine(false); // Keep selection by reselecting the new path.
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({30, 3}));
+        QCOMPARE(editor->selectedPath(), added);
+        editor->setColor(Qt::red); QVERIFY(waitIdle());
+        QCOMPARE(editor->document().color(added), QColor(Qt::red));
+        const auto beforeCurve = editor->svg();
+        const auto handles = editor->document().handles(added);
+        bool moved = false;
+        for (const auto& handle : handles) {
+            if (handle.kind != Vector::EditDocument::Handle::Control1) continue;
+            dragAt(editorPoint(handle.point), editorPoint(handle.point+QPointF(0, 8)));
+            moved = true; break;
+        }
+        QVERIFY(moved); QVERIFY(waitIdle()); QVERIFY(editor->svg() != beforeCurve);
+        const auto curved = editor->svg();
+        QTest::keyClick(view->viewport(), Qt::Key_Z, Qt::ControlModifier); QVERIFY(waitIdle());
+        QCOMPARE(editor->svg(), beforeCurve);
+        QTest::keyClick(view->viewport(), Qt::Key_Z, Qt::ControlModifier | Qt::ShiftModifier); QVERIFY(waitIdle());
+        QCOMPARE(editor->svg(), curved);
+        window->rotateRight(); window->mirror(); QCoreApplication::processEvents();
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier,
+                          editorPoint(editor->document().path(added).pointAtPercent(.5)));
+        const auto transformedHandles = editor->document().handles(added);
+        for (const auto& handle : transformedHandles) {
+            if (handle.kind != Vector::EditDocument::Handle::Control2) continue;
+            dragAt(editorPoint(handle.point), editorPoint(handle.point+QPointF(2, 0)));
+            QVERIFY(waitIdle());
+            const auto changedHandles = editor->document().handles(added);
+            bool checked = false;
+            for (const auto& changed : changedHandles) {
+                if (changed.kind != handle.kind || changed.index != handle.index) continue;
+                QVERIFY(QLineF(changed.point, handle.point+QPointF(2,0)).length() < .3); checked = true;
+            }
+            QVERIFY(checked); break;
+        }
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), curved);
+        window->mirror(); window->rotateLeft(); QCoreApplication::processEvents();
+        // Restore selection after undo/redo, then Delete must remove one path.
+        const auto middle = editor->document().path(added).pointAtPercent(.5);
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint(middle));
+        QCOMPARE(editor->selectedPath(), added);
+        QTest::keyClick(view->viewport(), Qt::Key_Delete); QVERIFY(waitIdle());
+        QVERIFY(editor->document().path(added).isEmpty());
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(), curved);
+        QString error;
+        const auto svgPath = files.filePath("edited.svg"), pngPath = files.filePath("edited.png");
+        QVERIFY2(controller->saveSvg(svgPath, &error), qPrintable(error));
+        QVERIFY2(controller->savePng(pngPath, 2, &error), qPrintable(error));
+        const QImage png(pngPath); QCOMPARE(png.size(), QSize(128, 96));
+        int red = 0;
+        for (int y=0; y<png.height(); ++y) for(int x=0; x<png.width(); ++x) {
+            const auto c = png.pixelColor(x,y); red += c.red()>200 && c.green()<100 && c.blue()<100;
+        }
+        QVERIFY(red > 10);
+        QVERIFY(savedSvg().toByteArray(-1) != originalSvg);
+        controller->setEditing(false); QVERIFY(!controller->isEditing()); QVERIFY(controller->hasEdits());
+        QVERIFY(!panel->findChild<QPushButton*>("vectorGenerate")->isEnabled());
+        const auto retained = savedSvg().toByteArray(-1);
+        controller->setEditing(true); QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        QCOMPARE(savedSvg().toByteArray(-1), retained);
+        controller->setEditing(false); controller->discardEdits(); QVERIFY(!controller->hasEdits());
+        QCOMPARE(savedSvg().toByteArray(-1), originalSvg);
+        QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void editFillAndSpacePanBlockFileNavigation() {
+        QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        QVERIFY(select("vectorEditLayer", "fill"));
+        panel->findChild<QDoubleSpinBox*>("vectorBrushRadius")->setValue(12);
+        int fill = -1;
+        for(int i=0; i<editor->document().pathCount(); ++i)
+            if(editor->document().layer(i)==Vector::EditDocument::Layer::Fill) fill=i;
+        QVERIFY(fill>=0);
+        const auto boundary = editor->document().path(fill).pointAtPercent(.35);
+        const auto before = editor->svg();
+        dragAt(editorPoint(boundary), editorPoint(boundary+QPointF(3,2)));
+        QVERIFY(waitIdle()); QVERIFY(editor->svg()!=before);
+        QVERIFY(editor->document().canUndo()); editor->undo(); QVERIFY(waitIdle());
+        QCOMPARE(editor->svg(), before);
+        const auto other = files.filePath("z-navigation-editor.png"); QVERIFY(fixture().save(other));
+        const auto current = view->getCurrentFileDetails().fileInfo.absoluteFilePath();
+        QTest::keyClick(view->viewport(), Qt::Key_Right);
+        QTest::keyClick(view->viewport(), Qt::Key_Left);
+        window->nextFile(); window->previousFile(); QTest::qWait(100);
+        QCOMPARE(view->getCurrentFileDetails().fileInfo.absoluteFilePath(), current);
+        QVERIFY(controller->isEditing());
+        view->setTransform(QTransform::fromScale(30, 30)); QCoreApplication::processEvents();
+        auto* bar = view->horizontalScrollBar(); QVERIFY(bar->maximum()>bar->minimum());
+        bar->setValue((bar->minimum()+bar->maximum())/2);
+        const int initial = bar->value();
+        const auto center = view->viewport()->rect().center();
+        QTest::keyPress(view->viewport(), Qt::Key_Space);
+        dragAt(center, center+QPoint(60, 0));
+        QTest::keyRelease(view->viewport(), Qt::Key_Space);
+        QVERIFY(bar->value()!=initial); QCOMPARE(editor->svg(), before);
+        const auto artifacts = qEnvironmentVariable("ARTIFACTS");
+        if (!artifacts.isEmpty()) {
+            controller->showPanel(); QCoreApplication::processEvents();
+            QVERIFY(panel->grab().save(artifacts+"/vector-editor-panel.png"));
+            QVERIFY(window->grab().save(artifacts+"/vector-editor-window.png"));
+        }
+        controller->setEditing(false); QVERIFY(!view->property("vectorEditing").toBool());
+        QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void editHistoryAndVisibilityAreScopedToCurrentImage() {
+        QVERIFY2(generate(), qPrintable(failure));
+        const auto baseline = savedSvg().toByteArray(-1);
+        controller->setEditing(true); QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        controller->setEditing(false); QCOMPARE(savedSvg().toByteArray(-1), baseline);
+        controller->setEditing(true); QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        editor->setAddLine(true); dragAt(editorPoint({10, 3}), editorPoint({50, 3})); QVERIFY(waitIdle());
+        editor->setAddLine(false);
+        const int added = editor->selectedPath(); QVERIFY(added >= 0);
+        const auto complete = editor->svg();
+        const auto handle = editor->document().handles(added).at(1);
+        auto* viewport = view->viewport(); const auto from = editorPoint(handle.point), to = editorPoint(handle.point+QPointF(0,10));
+        QTest::mousePress(viewport, Qt::LeftButton, Qt::NoModifier, from);
+        QMouseEvent move(QEvent::MouseMove, to, viewport->mapToGlobal(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport, &move);
+        QTest::keyClick(viewport, Qt::Key_Escape);
+        QTest::mouseRelease(viewport, Qt::LeftButton, Qt::NoModifier, to);
+        QCOMPARE(editor->svg(), complete);
+        editor->undo(); QVERIFY(waitIdle()); QVERIFY(!controller->hasEdits()); QVERIFY(editor->document().canRedo());
+        controller->setEditing(false); QCOMPARE(savedSvg().toByteArray(-1), baseline);
+        const auto identical = files.filePath("identical-editor-image.png"); QVERIFY(fixture().save(identical));
+        window->openFile(identical);
+        QTRY_COMPARE(view->getCurrentFileDetails().fileInfo.absoluteFilePath(), identical);
+        QTRY_VERIFY(view->getCurrentFileDetails().isPixmapLoaded);
+        QVERIFY2(generate(), qPrintable(failure));
+        controller->setEditing(true); QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        QVERIFY(!editor->document().canUndo()); QVERIFY(!editor->document().canRedo());
+        QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void largeEditUndoRunsAsynchronouslyAndCancelsOnReset() {
+        QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        auto padded = editor->svg();
+        const auto at = padded.lastIndexOf("</svg>"); QVERIFY(at > 0);
+        padded.insert(at, QByteArray("<!--") + QByteArray(9*1024*1024, 'x') + "-->");
+        QString error; QVERIFY2(editor->begin(padded, &error), qPrintable(error));
+        editor->setAddLine(true); dragAt(editorPoint({8,3}), editorPoint({55,3})); QVERIFY(waitIdle());
+        const auto modified = editor->svg(); QVERIFY(modified != padded);
+        editor->undo(); QVERIFY(editor->isBusy()); QVERIFY(controller->isBusy());
+        QVERIFY(!panel->findChild<QPushButton*>("vectorSaveSvg")->isEnabled());
+        bool responsive = false; QTimer::singleShot(0, [&]{ responsive = true; });
+        QTRY_VERIFY(responsive);
+        QVERIFY(waitIdle(30000)); QCOMPARE(editor->svg(), padded);
+        editor->redo(); QVERIFY(editor->isBusy()); QVERIFY(waitIdle(30000)); QCOMPARE(editor->svg(), modified);
+        editor->undo(); QVERIFY(editor->isBusy());
+        const auto other = files.filePath("large-edit-reset.png"); QVERIFY(fixture().save(other));
+        window->openFile(other);
+        QTRY_COMPARE(view->getCurrentFileDetails().fileInfo.absoluteFilePath(), other);
+        QThreadPool::globalInstance()->waitForDone(); QCoreApplication::processEvents();
+        QVERIFY(!editor->active()); QVERIFY(!editor->isBusy());
+        QVERIFY(!controller->hasResult()); QVERIFY(!controller->hasEdits());
+        QCOMPARE(digest(sourcePath), sourceDigest);
     }
 
     void realUserImage() {

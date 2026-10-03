@@ -55,6 +55,8 @@ set(PROJECT_SOURCES
     src/sr/gif_export.cpp
     src/vector/vector_controller.cpp
     src/vector/vector_preview_item.cpp
+    src/vector/edit_document.cpp
+    src/vector/vector_editor.cpp
     src/vector/generated_svg_renderer.cpp
     src/vector/memory_budget.cpp
     src/model3d/glb_document.cpp
@@ -82,6 +84,8 @@ set(PROJECT_HEADERS
     src/sr/gif_export.h
     src/vector/vector_controller.h
     src/vector/vector_preview_item.h
+    src/vector/edit_document.h
+    src/vector/vector_editor.h
     src/vector/generated_svg_renderer.h
     src/vector/memory_budget.h
     src/vector/cancellable_save_file.h

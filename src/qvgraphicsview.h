@@ -12,6 +12,7 @@
 #include <optional>
 
 class QDrag;
+class QPainter;
 namespace Vector { class PreviewItem; }
 
 class QVGraphicsView : public QGraphicsView
@@ -68,16 +69,21 @@ public:
     void setDisplayImagePreservingView(const QImage &image);
     bool setVectorPreview(const QByteArray &svg, const QByteArray &displayIcc);
     bool hasVectorPreview() const;
+    // Logical SVG coordinates to logical viewport pixels, including the
+    // current raster proxy size, rotation, mirroring and scroll position.
+    QTransform vectorToViewportTransform(const QRectF& svgViewBox) const;
 
 signals:
     void cancelSlideshow();
     void vectorRenderingFailed(const QString& error);
+    void vectorEditorOverlay(QPainter* painter);
 
     void fileChanged();
 
     void updatedLoadedPixmapItem();
 
 protected:
+    void drawForeground(QPainter* painter, const QRectF& rect) override;
     void wheelEvent(QWheelEvent *event) override;
 
     void resizeEvent(QResizeEvent *event) override;

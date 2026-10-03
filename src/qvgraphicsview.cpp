@@ -21,6 +21,7 @@
 #include <QDateTime>
 #include <QToolTip>
 #include <QUuid>
+#include <QPainter>
 
 QVGraphicsView::QVGraphicsView(QWidget *parent) : QGraphicsView(parent)
 {
@@ -125,7 +126,7 @@ void QVGraphicsView::enterEvent(QEnterEvent *event)
 #endif
 {
     QGraphicsView::enterEvent(event);
-    viewport()->setCursor(Qt::ArrowCursor);
+    if (!property("vectorEditing").toBool()) viewport()->setCursor(Qt::ArrowCursor);
 }
 
 void QVGraphicsView::mousePressEvent(QMouseEvent *event)
@@ -661,6 +662,34 @@ bool QVGraphicsView::hasVectorPreview() const
     return loadedPixmapItem->hasVectorPreview();
 }
 
+QTransform QVGraphicsView::vectorToViewportTransform(const QRectF& box) const
+{
+    const QRectF bounds = loadedPixmapItem->boundingRect();
+    if (box.isEmpty() || bounds.isEmpty()) return {};
+    // Keep this mapping identical to PreviewItem::paint. The proxy pixmap can
+    // be much smaller than the editable SVG, so mapToScene alone is not enough.
+    const QTransform rotated = QImage::trueMatrix(
+        QTransform().rotate(imageCore.getCurrentRotation()),
+        qMax(1, qRound(box.width())), qMax(1, qRound(box.height())));
+    const QRectF rotatedBounds = rotated.mapRect(QRectF(QPointF(), box.size()));
+    return QTransform::fromTranslate(-box.left(), -box.top())
+        * rotated
+        * QTransform::fromTranslate(-rotatedBounds.left(), -rotatedBounds.top())
+        * QTransform::fromScale(bounds.width() / rotatedBounds.width(),
+                                bounds.height() / rotatedBounds.height())
+        * QTransform::fromTranslate(bounds.left(), bounds.top())
+        * loadedPixmapItem->sceneTransform() * viewportTransform();
+}
+
+void QVGraphicsView::drawForeground(QPainter* painter, const QRectF& rect)
+{
+    QGraphicsView::drawForeground(painter, rect);
+    painter->save();
+    painter->resetTransform();
+    emit vectorEditorOverlay(painter);
+    painter->restore();
+}
+
 void QVGraphicsView::setDisplayImagePreservingView(const QImage &image)
 {
     if (image.isNull() || getLoadedPixmap().isNull()) return;
@@ -739,6 +768,7 @@ void QVGraphicsView::originalSize()
 
 void QVGraphicsView::goToFile(const GoToFileMode &mode, int index)
 {
+    if (property("vectorEditing").toBool()) return;
     bool shouldRetryFolderInfoUpdate = false;
 
     // Update folder info only after a little idle time as an optimization for when
