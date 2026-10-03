@@ -246,11 +246,12 @@ class LineCorrectionTests(unittest.TestCase):
             )),
         ]
         for kind, data in cases:
-            with self.subTest(shape=kind):
-                before = svg(data)
-                after, stats = correct_paths(before)
-                self.assertEqual(stats[kind], 1)
-                self.assertBounded(before, after)
+            for shape_error in (None, 2.):
+                with self.subTest(shape=kind, shape_tolerance=shape_error):
+                    before = svg(data)
+                    after, stats = correct_paths(before, shape_tolerance=shape_error)
+                    self.assertEqual(stats[kind], 1)
+                    self.assertBounded(before, after, shape_error or 1.)
 
     def test_very_large_circle_adapts_arc_count_for_subpixel_error(self):
         # Existing curves are already accurate, but slightly uneven control
@@ -263,6 +264,91 @@ class LineCorrectionTests(unittest.TestCase):
         self.assertEqual(stats['circles'], 1)
         self.assertGreater(sum(segment['command']=='C' for segment in geometry(after)), 4)
         self.assertBounded(before, after)
+
+    def test_shape_tolerance_is_independent_from_cubic_simplification(self):
+        circle = svg(polyline(outline((100, 100), noise=1.5), True))
+        strict, strict_stats = correct_paths(circle, shape_tolerance=1.)
+        relaxed, relaxed_stats = correct_paths(circle, shape_tolerance=3.)
+        self.assertEqual(strict_stats['circles'] + strict_stats['ellipses'], 0)
+        self.assertEqual(relaxed_stats['circles'], 1)
+        self.assertEqual(relaxed_stats['shape_tolerance'], 3.)
+        self.assertEqual(relaxed_stats['shape_candidates'], 1)
+        self.assertBounded(circle, strict)
+        self.assertBounded(circle, relaxed, 3.)
+
+        open_curve = svg('M0 0C5 4 10 5 15 5C20 5 25 4 30 0')
+        original, _ = correct_paths(open_curve)
+        high_shape_error, _ = correct_paths(open_curve, shape_tolerance=20.)
+        self.assertEqual(ET.tostring(original), ET.tostring(high_shape_error))
+
+    def test_pixel_stair_circle_and_rotated_ellipse_are_regularized(self):
+        for axes, noise, key in (((40, 40), .7, 'circles'), ((100, 40), 1., 'ellipses')):
+            with self.subTest(axes=axes):
+                points = np.round(outline(axes, angle=.7, count=512, noise=noise))
+                points = points[np.r_[True, np.linalg.norm(np.diff(points, axis=0), axis=1) > 0]]
+                before = svg(polyline(points, True))
+                _, old_stats = correct_paths(before)
+                after, stats = correct_paths(before, shape_tolerance=2.)
+                self.assertEqual(old_stats['circles'] + old_stats['ellipses'], 0)
+                self.assertEqual(stats[key], 1)
+                self.assertBounded(before, after, 2.)
+
+    def test_translated_large_noisy_shapes_keep_pixel_error_bound(self):
+        for axes, key in (((3000, 3000), 'circles'), ((4000, 1800), 'ellipses')):
+            with self.subTest(axes=axes):
+                points = outline(axes, angle=.7, count=1024, noise=3., center=(150000., -170000.))
+                before = svg(polyline(points, True))
+                after, stats = correct_paths(before, shape_tolerance=4.)
+                self.assertEqual(stats[key], 1)
+                self.assertBounded(before, after, 4.)
+
+    def test_large_shape_tolerance_does_not_override_relative_error_cap(self):
+        before = svg(polyline(outline((10, 10), count=256, noise=1.2), True))
+        after, stats = correct_paths(before, shape_tolerance=100.)
+        self.assertEqual(stats['circles'] + stats['ellipses'], 0)
+        self.assertBounded(before, after)
+
+    def test_relaxed_shape_fit_keeps_open_arc_and_attached_junction(self):
+        points = outline((100, 100), noise=1.5)
+        for before in (svg(polyline(points[:-1])),
+                       svg(polyline(points, True), polyline([points[0], points[0] + [20, 0]]))):
+            with self.subTest(paths=len(before)):
+                after, stats = correct_paths(before, shape_tolerance=10.)
+                self.assertEqual(stats['circles'] + stats['ellipses'], 0)
+                np.testing.assert_allclose(geometry(after)[0]['points'][0], points[0])
+                self.assertBounded(before, after)
+
+    def test_relaxed_shape_fit_keeps_rounded_rectangle_star_and_partial_loop(self):
+        theta = np.linspace(0, 2*math.pi, 256, endpoint=False)
+        rounded_rectangle = np.c_[80*np.sign(np.cos(theta))*np.sqrt(np.abs(np.cos(theta))),
+                                  50*np.sign(np.sin(theta))*np.sqrt(np.abs(np.sin(theta)))] + 100
+        radii = np.where(np.arange(20) % 2, 50., 100.)
+        star_theta = np.arange(20)*math.pi/10
+        star = np.c_[radii*np.cos(star_theta), radii*np.sin(star_theta)] + 100
+        partial_loop = outline((100, 100), count=128)[:90]
+        for points in (rounded_rectangle, star, partial_loop):
+            with self.subTest(vertices=len(points)):
+                before = svg(polyline(points, True))
+                after, stats = correct_paths(before, shape_tolerance=20.)
+                self.assertEqual(stats['circles'] + stats['ellipses'], 0)
+                self.assertBounded(before, after)
+
+    def test_sparse_polygons_and_subdivided_edges_do_not_become_circles(self):
+        for count in (4, 8, 12, 16):
+            polygon = outline((100, 100), count=count)
+            dense = np.concatenate([a + (b-a)*np.arange(20)[:, None]/20
+                                    for a, b in zip(polygon, np.roll(polygon, -1, axis=0))])
+            for points in (polygon, dense):
+                with self.subTest(corners=count, samples=len(points)):
+                    before = svg(polyline(points, True))
+                    after, stats = correct_paths(before, shape_tolerance=20.)
+                    self.assertEqual(stats['circles'] + stats['ellipses'], 0)
+                    self.assertBounded(before, after)
+
+    def test_shape_tolerance_must_be_positive_finite(self):
+        for tolerance in (0., -1., float('nan'), float('inf')):
+            with self.subTest(tolerance=tolerance), self.assertRaises(ValueError):
+                correct_paths(svg(), shape_tolerance=tolerance)
 
 
 if __name__ == '__main__':

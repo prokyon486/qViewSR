@@ -171,6 +171,53 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(len(list(ET.parse(blank['fill_svg']).getroot())), 0)
         self.assertEqual(len(list(ET.parse(blank['lines_svg']).getroot())), 0)
 
+    def test_cleanup_shape_and_color_modes_have_independent_caches(self):
+        source_digest = hashlib.sha256(self.input.read_bytes()).hexdigest()
+        original = self.worker()
+        original_bytes = Path(original['lines_svg']).read_bytes()
+        options = ('--clean-lines', '--min-line-length', '8', '--join-distance', '3', '--branch-strength', '60')
+        cleaned = self.worker(*options)
+        self.assertEqual(cleaned['cache_hits'], ['fill', 'raw_lines'])
+        self.assertTrue(cleaned['clean_lines'])
+        self.assertIn('isolated_removed', cleaned['cleanup_stats'])
+        fitted = self.worker(*options, '--correct-lines', '--shape-tolerance', '3')
+        self.assertEqual(fitted['cache_hits'], ['fill', 'clean_lines'])
+        relaxed = self.worker(*options, '--correct-lines', '--shape-tolerance', '4')
+        self.assertEqual(relaxed['cache_hits'], ['fill', 'clean_lines'])
+        self.assertNotEqual(fitted['lines_svg'], relaxed['lines_svg'])
+        repeated = self.worker(*options, '--correct-lines', '--shape-tolerance', '4')
+        self.assertEqual(repeated['cache_hits'], ['fill', 'lines'])
+        resized = self.worker(*options, '--min-line-length', '10')
+        self.assertEqual(resized['cache_hits'], ['fill', 'raw_lines'])
+        color = self.worker('--line-mode', 'color', *options)
+        self.assertEqual(color['cache_hits'], ['fill'])
+        self.assertEqual(color['line_mode'], 'color')
+        self.assertNotEqual(color['lines_svg'], cleaned['lines_svg'])
+        self.assertGreater(len(list(ET.parse(color['lines_svg']).getroot().iter(f'{{{NS}}}path'))), 0)
+        gap = self.worker('--mask-gap', '1', *options)
+        self.assertEqual(gap['cache_hits'], ['fill'])
+        self.assertEqual(gap['mask_gap'], 1)
+        self.assertNotEqual(gap['lines_svg'], cleaned['lines_svg'])
+        self.assertEqual(self.worker('--mask-gap', '1', *options)['cache_hits'], ['fill', 'lines'])
+        color_gap = self.worker('--line-mode', 'color', '--mask-gap', '1', *options)
+        self.assertEqual(color_gap['cache_hits'], ['fill', 'lines'])
+        self.assertEqual(color_gap['mask_gap'], 0)
+        self.assertEqual(color_gap['lines_svg'], color['lines_svg'])
+        restored = self.worker()
+        self.assertEqual(restored['lines_svg'], original['lines_svg'])
+        self.assertEqual(Path(restored['lines_svg']).read_bytes(), original_bytes)
+        self.assertEqual(restored['cleanup_stats'], {})
+        self.assertEqual(hashlib.sha256(self.input.read_bytes()).hexdigest(),
+                         source_digest)
+
+    def test_invalid_cleanup_parameters_fail_before_processing(self):
+        for option, value in (('--min-line-length', '-1'), ('--join-distance', 'inf'),
+                              ('--branch-strength', '101'), ('--shape-tolerance', 'nan')):
+            with self.subTest(option=option):
+                cp = subprocess.run(self.command(option, value), capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(cp.returncode, 0)
+                self.assertIn('範囲外', cp.stderr)
+
     def test_unsupported_alpha_fails_cleanly(self):
         image = Image.open(self.input).convert('RGBA')
         image.putpixel((0, 0), (0, 0, 0, 127)); image.save(self.input)

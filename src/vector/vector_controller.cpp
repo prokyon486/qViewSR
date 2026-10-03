@@ -32,6 +32,7 @@
 #include <QPushButton>
 #include <QSaveFile>
 #include <QScreen>
+#include <QScrollArea>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSlider>
@@ -256,10 +257,10 @@ struct Controller::Private {
     MainWindow* window;
     QVGraphicsView* view;
     QPointer<QDialog> panel;
-    QComboBox *strength, *detail, *color, *background;
-    QDoubleSpinBox *width, *scale, *previewScale;
-    QSlider *opacity, *suppression;
-    QCheckBox *showFill, *grayFill, *showResult, *correctLines;
+    QComboBox *strength, *detail, *color, *background, *lineMode, *maskGap;
+    QDoubleSpinBox *width, *scale, *previewScale, *minLineLength, *joinDistance, *shapeTolerance;
+    QSlider *opacity, *suppression, *branchStrength;
+    QCheckBox *showFill, *grayFill, *showResult, *correctLines, *cleanLines;
     QPushButton *run, *stop, *svgSave, *pngSave;
     QLabel* status;
     QTimer debounce, watchdog;
@@ -286,8 +287,14 @@ struct Controller::Private {
         auto* explanation = new QLabel(QStringLiteral("塗りと主線を別々にベクター化します。静止画の元画像が入力です。"), panel);
         explanation->setWordWrap(true);
         layout->addWidget(explanation);
-        auto* form = new QFormLayout;
-        layout->addLayout(form);
+        auto* scroll = new QScrollArea(panel);
+        scroll->setObjectName("vectorParameters");
+        scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setMinimumHeight(280);
+        auto* parameters = new QWidget(scroll);
+        auto* form = new QFormLayout(parameters);
+        scroll->setWidget(parameters);
+        layout->addWidget(scroll, 1);
         auto combo = [this, form](const QString& name, const QString& text,
                                   const QList<QPair<QString, QString>>& items) {
             auto* control = new QComboBox(panel);
@@ -296,17 +303,37 @@ struct Controller::Private {
             form->addRow(text, control);
             return control;
         };
+        lineMode = combo("vectorLineMode", QStringLiteral("主線の抽出方式"),
+                         {{QStringLiteral("暗い主線（線画・イラスト）"), "dark"},
+                          {QStringLiteral("色の境界（ロゴ・色面の輪郭）"), "color"}});
+        lineMode->setToolTip(QStringLiteral("色の境界は明るさが近い色同士も検出します。太い線は両側の輪郭になるため、線の中心を残す場合は「暗い主線」を使います。"));
         strength = combo("vectorStrength", QStringLiteral("主線の抽出強度"),
                          {{QStringLiteral("弱：濃い線を中心に"), "weak"}, {QStringLiteral("標準"), "balanced"}, {QStringLiteral("強：薄い線も拾う"), "strong"}});
+        maskGap = combo("vectorMaskGap", QStringLiteral("線抽出の隙間補正"),
+                        {{QStringLiteral("OFF（元の抽出）"), "0"}, {QStringLiteral("1px（小さな隙間）"), "1"},
+                         {QStringLiteral("2px（強め）"), "2"}});
+        maskGap->setToolTip(QStringLiteral("暗い主線の中にできた細い隙間を埋め、梯子状の分岐を抑えます。近接した別の線や小さい文字の穴も結合するため、必要な画像で1pxから試してください。色の境界には適用しません。"));
         detail = combo("vectorDetail", QStringLiteral("曲線の細かさ"),
                        {{QStringLiteral("細部優先（0.3px）"), "fine"}, {QStringLiteral("標準（1px）"), "balanced"}, {QStringLiteral("簡略化（3px）"), "simple"}});
         correctLines = new QCheckBox(QStringLiteral("主線を補正（直線・円・楕円・滑らかな曲線）"), panel);
         correctLines->setObjectName("vectorCorrectLines");
         correctLines->setToolTip(QStringLiteral("元の形からのずれを抑えながら、主線を直線・円・楕円や少ないベジエ曲線で近似します。オフにすると補正前の線に戻ります。塗りには適用しません。"));
         form->addRow(correctLines);
-        width = new QDoubleSpinBox(panel);
-        width->setObjectName("vectorWidth"); width->setRange(.3, 3.0); width->setSingleStep(.1); width->setDecimals(1);
-        width->setSuffix(QStringLiteral(" px")); form->addRow(QStringLiteral("線幅（元画像基準）"), width);
+        auto pixels = [this, form](const QString& name, const QString& label, double minimum, double maximum, double step) {
+            auto* spin = new QDoubleSpinBox(panel);
+            spin->setObjectName(name); spin->setRange(minimum, maximum); spin->setSingleStep(step); spin->setDecimals(2);
+            spin->setSuffix(QStringLiteral(" px")); form->addRow(label, spin); return spin;
+        };
+        shapeTolerance = pixels("vectorShapeTolerance", QStringLiteral("円・楕円の許容誤差"), .25, 100, .5);
+        shapeTolerance->setToolTip(QStringLiteral("元画像のピクセル単位。値を上げると揺らいだ閉輪郭も円・楕円に近似しやすくなります。大きすぎる値は形状を変えるため、表示を比較してください。直線・曲線の補正誤差とは独立しています。"));
+        cleanLines = new QCheckBox(QStringLiteral("主線を整理（短いノイズ除去・途切れ接続）"), panel);
+        cleanLines->setObjectName("vectorCleanLines");
+        cleanLines->setToolTip(QStringLiteral("短い孤立線や、滑らかな長い主線に直交する短い横枝を除き、方向の揃った近い端点を接続します。小さな文字や意図した線も消える場合があるため、ON/OFFで比較してください。"));
+        form->addRow(cleanLines);
+        minLineLength = pixels("vectorMinLineLength", QStringLiteral("短い線の基準長"), 0, 1000, 1);
+        minLineLength->setToolTip(QStringLiteral("元画像のピクセル単位。孤立線はこの長さ未満を除去し、横枝の長さ判定にも使用します。0で短線の除去を無効にし、途切れの接続だけを行います。"));
+        joinDistance = pixels("vectorJoinDistance", QStringLiteral("途切れの接続距離"), 0, 200, 1);
+        joinDistance->setToolTip(QStringLiteral("この距離以内で、接線方向が揃い、接続先が一つに定まる端点だけをつなぎます。0で接続を無効にします。"));
         auto percentageSlider = [this, form](const QString& name, const QString& text, int step) {
             auto* row = new QWidget(panel);
             auto* controls = new QHBoxLayout(row);
@@ -330,6 +357,10 @@ struct Controller::Private {
             form->addRow(text, row);
             return slider;
         };
+        branchStrength = percentageSlider("vectorBranchStrength", QStringLiteral("短い横枝の除去"), 1);
+        branchStrength->setToolTip(QStringLiteral("長い主線にほぼ直交する短い枝を除去する強さ。0で無効にします。長い枝、角、閉じた輪郭は保持します。"));
+        width = pixels("vectorWidth", QStringLiteral("線幅（元画像基準）"), .3, 3.0, .1);
+        width->setDecimals(1);
         opacity = percentageSlider("vectorOpacity", QStringLiteral("主線の濃さ"), 1);
         suppression = percentageSlider("vectorSuppression", QStringLiteral("塗り側の元線を弱める量"), 5);
         color = combo("vectorColor", QStringLiteral("主線の色"),
@@ -362,7 +393,8 @@ struct Controller::Private {
         exports->addWidget(svgSave); exports->addWidget(pngSave); exports->addWidget(scale); layout->addLayout(exports);
         status = new QLabel(panel); status->setObjectName("vectorStatus"); status->setWordWrap(true); status->setTextInteractionFlags(Qt::TextSelectableByMouse);
         layout->addWidget(status);
-        panel->setMinimumWidth(390);
+        panel->setMinimumWidth(460);
+        panel->resize(500, 720);
         loadSettings();
         debounce.setSingleShot(true); debounce.setInterval(350);
         QObject::connect(&debounce, &QTimer::timeout, owner, &Controller::generate);
@@ -370,10 +402,14 @@ struct Controller::Private {
         QObject::connect(&watchdog, &QTimer::timeout, owner, [this] {
             owner->cancel(); report(QStringLiteral("ベクター変換が制限時間を超えたため中止しました。"));
         });
-        for (auto* control : {strength, detail})
+        for (auto* control : {strength, detail, lineMode, maskGap})
             QObject::connect(control, &QComboBox::currentIndexChanged, owner, [this] { shapeChanged(); });
         QObject::connect(suppression, &QSlider::valueChanged, owner, [this] { shapeChanged(); });
         QObject::connect(correctLines, &QCheckBox::toggled, owner, [this] { shapeChanged(); });
+        QObject::connect(cleanLines, &QCheckBox::toggled, owner, [this] { shapeChanged(); });
+        QObject::connect(branchStrength, &QSlider::valueChanged, owner, [this] { shapeChanged(); });
+        for (auto* control : {minLineLength, joinDistance, shapeTolerance})
+            QObject::connect(control, &QDoubleSpinBox::valueChanged, owner, [this] { shapeChanged(); });
         for (auto* control : {color, background})
             QObject::connect(control, &QComboBox::currentIndexChanged, owner, [this] { appearanceChanged(); });
         QObject::connect(width, &QDoubleSpinBox::valueChanged, owner, [this] { appearanceChanged(); });
@@ -418,6 +454,8 @@ struct Controller::Private {
             control->setCurrentIndex(index);
         };
         selected(strength, "strength", "strong"); selected(detail, "detail", "balanced");
+        selected(lineMode, "lineMode", "dark");
+        selected(maskGap, "maskGap", "0");
         selected(color, "color", "source"); selected(background, "background", "white");
         width->setValue(settings.value("vector/width", 2.6).toDouble());
         opacity->setValue(settings.value("vector/opacity", 85).toInt());
@@ -425,6 +463,11 @@ struct Controller::Private {
         showFill->setChecked(settings.value("vector/showFill", false).toBool());
         grayFill->setChecked(settings.value("vector/grayFill", false).toBool());
         correctLines->setChecked(settings.value("vector/correctLines", false).toBool());
+        cleanLines->setChecked(settings.value("vector/cleanLines", false).toBool());
+        minLineLength->setValue(settings.value("vector/minLineLength", 6.).toDouble());
+        joinDistance->setValue(settings.value("vector/joinDistance", 4.).toDouble());
+        branchStrength->setValue(settings.value("vector/branchStrength", 50).toInt());
+        shapeTolerance->setValue(settings.value("vector/shapeTolerance", 2.).toDouble());
         scale->setValue(settings.value("vector/exportScale", 4.0).toDouble());
         previewScale->setValue(settings.value("vector/previewScale", 4.0).toDouble());
         panel->restoreGeometry(settings.value("vector/panelGeometry").toByteArray());
@@ -441,6 +484,13 @@ struct Controller::Private {
         settings.setValue("vector/grayFill", grayFill->isChecked()); settings.setValue("vector/exportScale", scale->value());
         settings.setValue("vector/previewScale", previewScale->value());
         settings.setValue("vector/correctLines", correctLines->isChecked());
+        settings.setValue("vector/lineMode", lineMode->currentData());
+        settings.setValue("vector/maskGap", maskGap->currentData());
+        settings.setValue("vector/cleanLines", cleanLines->isChecked());
+        settings.setValue("vector/minLineLength", minLineLength->value());
+        settings.setValue("vector/joinDistance", joinDistance->value());
+        settings.setValue("vector/branchStrength", branchStrength->value());
+        settings.setValue("vector/shapeTolerance", shapeTolerance->value());
     }
 
     QString eligibilityError() const {
@@ -511,9 +561,15 @@ struct Controller::Private {
         showResult->setEnabled(!image.isNull() && !externalBusy);
         svgSave->setEnabled(!composedSvg.isEmpty() && !busy());
         pngSave->setEnabled(!composedSvg.isEmpty() && !busy());
-        for (auto* control : {strength, detail, color, background}) control->setEnabled(!externalBusy);
+        for (auto* control : {strength, detail, color, background, lineMode}) control->setEnabled(!externalBusy);
+        maskGap->setEnabled(!externalBusy && lineMode->currentData().toString() == "dark");
         showFill->setEnabled(!externalBusy); previewScale->setEnabled(!externalBusy); scale->setEnabled(!externalBusy);
         correctLines->setEnabled(!externalBusy);
+        cleanLines->setEnabled(!externalBusy);
+        shapeTolerance->setEnabled(!externalBusy && correctLines->isChecked());
+        minLineLength->setEnabled(!externalBusy && cleanLines->isChecked());
+        joinDistance->setEnabled(!externalBusy && cleanLines->isChecked());
+        branchStrength->parentWidget()->setEnabled(!externalBusy && cleanLines->isChecked() && minLineLength->value() > 0);
         suppression->parentWidget()->setEnabled(!externalBusy && showFill->isChecked()); grayFill->setEnabled(!externalBusy && showFill->isChecked());
         const bool linesVisible = color->currentData().toString() != "transparent";
         width->setEnabled(!externalBusy && linesVisible); opacity->parentWidget()->setEnabled(!externalBusy && linesVisible);
@@ -606,17 +662,24 @@ struct Controller::Private {
         const QString selectedDetail = detail->currentData().toString();
         const int selectedSuppression = suppression->value() * 5;
         const bool selectedCorrection = correctLines->isChecked();
+        QStringList selectedLineOptions{"--line-mode", lineMode->currentData().toString(),
+            "--mask-gap", maskGap->currentData().toString(),
+            "--shape-tolerance", QString::number(shapeTolerance->value())};
+        if (cleanLines->isChecked()) selectedLineOptions << "--clean-lines"
+            << "--min-line-length" << QString::number(minLineLength->value())
+            << "--join-distance" << QString::number(joinDistance->value())
+            << "--branch-strength" << QString::number(branchStrength->value());
         setStatus(QStringLiteral("入力画像の色と作業ファイルを準備しています…"));
         updateControls(false);
         auto* watcher = new QFutureWatcher<QString>(owner);
         QObject::connect(watcher, &QFutureWatcher<QString>::finished, owner,
-                         [this, watcher, folder, cancelled, jobEpoch, revision, size, python, script, selectedStrength, selectedDetail, selectedSuppression, selectedCorrection] {
+                         [this, watcher, folder, cancelled, jobEpoch, revision, size, python, script, selectedStrength, selectedDetail, selectedSuppression, selectedCorrection, selectedLineOptions] {
             const QString error = watcher->result(); watcher->deleteLater(); preparing = false;
             if (preparationCancelled == cancelled) preparationCancelled.reset();
             if (jobEpoch != epoch || externalBusy) { continuePending(); return; }
             if (!error.isEmpty()) { report(error); continuePending(); return; }
             if (revision != shapeRevision) { rerun = true; continuePending(); return; }
-            launch(folder, jobEpoch, revision, size, python, script, selectedStrength, selectedDetail, selectedSuppression, selectedCorrection);
+            launch(folder, jobEpoch, revision, size, python, script, selectedStrength, selectedDetail, selectedSuppression, selectedCorrection, selectedLineOptions);
         });
         watcher->setFuture(QtConcurrent::run([source, profile, folder, cancelled] {
             const auto stopped = [&] { return cancelled->load(std::memory_order_relaxed); };
@@ -643,7 +706,7 @@ struct Controller::Private {
 
     void launch(const std::shared_ptr<QTemporaryDir>& folder, quint64 jobEpoch, quint64 revision, QSize size,
                 const QString& python, const QString& script, const QString& selectedStrength,
-                const QString& selectedDetail, int selectedSuppression, bool selectedCorrection) {
+                const QString& selectedDetail, int selectedSuppression, bool selectedCorrection, const QStringList& selectedLineOptions) {
         auto* child = new QProcess(owner); process = child;
         stdoutBytes.clear(); stderrBytes.clear();
         auto environment = QProcessEnvironment::systemEnvironment(); environment.remove("LD_LIBRARY_PATH");
@@ -698,13 +761,18 @@ struct Controller::Private {
                 ? QStringLiteral("主線補正ON: 直線 %1、円 %2、楕円 %3、曲線の簡略化 %4。")
                     .arg(stats.value("lines").toInt()).arg(stats.value("circles").toInt())
                     .arg(stats.value("ellipses").toInt()).arg(stats.value("simplified_curves").toInt())
-                : QStringLiteral("主線補正OFF（抽出した元の線）。");
+                : QStringLiteral("形状補正OFF。");
+            const auto cleaned = result.value("cleanup_stats").toObject();
+            if (result.value("clean_lines").toBool()) correctionSummary += QStringLiteral("\n主線整理ON: 孤立線 %1、横枝 %2を除去、%3か所を接続。")
+                .arg(cleaned.value("isolated_removed").toInt()).arg(cleaned.value("spurs_removed").toInt())
+                .arg(cleaned.value("joins").toInt());
             queueRender(); continuePending();
         });
         child->setProgram(python);
         QStringList arguments{script, "--input", folder->filePath("input.png"), "--cache", folder->filePath("cache"),
                               "--strength", selectedStrength, "--detail", selectedDetail, "--suppression", QString::number(selectedSuppression)};
         if (selectedCorrection) arguments << "--correct-lines";
+        arguments << selectedLineOptions;
         child->setArguments(arguments);
         setStatus(QStringLiteral("塗りと主線をベクター化しています…"));
         const qint64 timeoutSeconds = qMin<qint64>(10800, 300 + qint64(size.width()) * size.height() / 10000);

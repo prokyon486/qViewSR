@@ -13,7 +13,7 @@ import numpy as np
 
 from color_paths import NS, parse_segments
 
-CORRECTION_VERSION = 'geometry-2'
+CORRECTION_VERSION = 'geometry-3'
 _EPS = 1e-9
 
 
@@ -136,15 +136,77 @@ def _ellipse_segments(center, axes, basis, angle, direction, tolerance):
     return result
 
 
-def _shape_fit(points, circle, tolerance):
+def _is_sparse_polygon(points, tolerance):
+    """Recognize straight-sided outlines even when their edges are subdivided."""
+    split = int(np.argmax(np.linalg.norm(points - points[0], axis=1)))
+    if split == 0:
+        return True
+    pending = [points[:split + 1], points[split:]]
+    sides = 0
+    while pending:
+        run = pending.pop()
+        distances = _distance_to_segments(run, run[[0, -1]])
+        furthest = int(np.argmax(distances))
+        if distances[furthest] > min(.1, tolerance * .05):
+            pending.extend((run[:furthest + 1], run[furthest:]))
+        else:
+            sides += 1
+            # Stop early: this check needs only to distinguish a sparse polygon
+            # from a curve/noisy raster contour, not produce its simplification.
+            if sides >= 24:
+                return False
+    return True
+
+
+def _has_resolved_corner(points, angles, center, axes, basis, tolerance):
+    """Reject corners that remain after averaging over the noise distance.
+
+    A one-pixel staircase can turn 90 degrees at every other vertex. Comparing
+    those raw tangents rejects good raster circles. Compare supported directions
+    with the fitted outline instead: this retains polygon corners while allowing
+    both pixel noise and the naturally high curvature at an ellipse's ends.
+    Sampling uses the original contour's arc positions for both outlines.
+    """
+    distance = np.r_[0., np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))]
+    if distance[-1] < _EPS:
+        return True
+    positions = distance[:-1]
+    support = tolerance * 3
+
+    def turns(ideal):
+        averages = []
+        for support_offset in (-support, 0., support):
+            sample = np.zeros((len(positions), 2))
+            for offset in np.linspace(-support / 3, support / 3, 7):
+                location = (positions + support_offset + offset) % distance[-1]
+                if ideal:
+                    theta = np.interp(location, distance, angles)
+                    sample += center + (np.c_[np.cos(theta), np.sin(theta)] * axes) @ basis.T
+                else:
+                    sample += np.c_[np.interp(location, distance, points[:, 0]),
+                                    np.interp(location, distance, points[:, 1])]
+            averages.append(sample / 7)
+        before = averages[1] - averages[0]
+        after = averages[2] - averages[1]
+        norm = np.linalg.norm(before, axis=1) * np.linalg.norm(after, axis=1)
+        if np.any(norm < _EPS):
+            return None
+        return np.arccos(np.clip(np.sum(before * after, axis=1) / norm, -1., 1.))
+
+    actual_turn, ideal_turn = turns(False), turns(True)
+    return (actual_turn is None or ideal_turn is None
+            or np.any(actual_turn - ideal_turn > math.radians(18)))
+
+
+def _shape_fit(points, circle, tolerance, allow_pixel_noise=False, input_error=0.):
     # Normalize isotropically before least squares to avoid cancellation at
     # 10,000+ pixel coordinates. Reject small/degenerate and partial shapes.
     vertices = points[:-1]
-    if len(vertices) < 12 or len(vertices) > 8192:
+    if len(vertices) < (24 if allow_pixel_noise else 12) or len(vertices) > 8192:
         return None
     origin = np.mean(vertices, axis=0)
     scale = max(np.ptp(vertices, axis=0)) / 2
-    if scale < max(4., tolerance * 6):
+    if scale < (4. if allow_pixel_noise else max(4., tolerance * 6)):
         return None
     p = (vertices - origin) / scale
     x, y = p.T
@@ -173,8 +235,15 @@ def _shape_fit(points, circle, tolerance):
                 return None
         center = origin + c * scale
         # Fit must describe a well resolved outline, not tiny arbitrary blobs.
-        if min(axes) < max(3., tolerance * 4):
+        if min(axes) < (3. if allow_pixel_noise else max(3., tolerance * 4)):
             return None
+        if allow_pixel_noise:
+            # A large UI value is an upper bound, not permission to reshape a
+            # small logo into an arbitrary ellipse. Cap movement at 5% of the
+            # fitted minor radius, independently of cubic simplification.
+            tolerance = min(tolerance, min(axes) * .05)
+            if _is_sparse_polygon(points, tolerance):
+                return None
         local = (points - center) @ basis / axes
         angles = np.unwrap(np.arctan2(local[:, 1], local[:, 0]))
         changes = np.diff(angles)
@@ -182,7 +251,16 @@ def _shape_fit(points, circle, tolerance):
         if abs(abs(total) - 2*math.pi) > .01 or max(np.abs(changes)) > math.pi/4:
             return None
         direction = 1 if total > 0 else -1
-        if np.min(changes * direction) < -.003:
+        if allow_pixel_noise:
+            # Tiny angular backtracking is common on pixel stairs. Bound the
+            # entire reversal (not just each step) in source pixels so retraced
+            # arcs and self-intersecting contours still cannot become ellipses.
+            progress = angles * direction
+            if max(np.maximum.accumulate(progress) - progress) * max(axes) > tolerance * .75:
+                return None
+            if _has_resolved_corner(points, angles, center, axes, basis, tolerance):
+                return None
+        elif np.min(changes * direction) < -.003:
             return None
         replacement = _ellipse_segments(center, axes, basis, angles[0], direction, tolerance)
         flat = _flatten(replacement, tolerance * .025)
@@ -191,7 +269,7 @@ def _shape_fit(points, circle, tolerance):
         # Each polyline approximates its true curve within .025*tolerance.
         # Reserve both bounds plus .01 for rounding, instead of rejecting
         # valid large raster circles merely because their trace varies by .8px.
-        if not _within_error(points, flat, tolerance * .94):
+        if not _within_error(points, flat, tolerance * .94 - input_error):
             return None
         return replacement
     except (ValueError, np.linalg.LinAlgError, FloatingPointError):
@@ -276,17 +354,25 @@ def _cleanup_run(segments, tolerance, stats):
             + _cleanup_run(segments[middle:], tolerance, stats))
 
 
-def correct_paths(root, tolerance=1.0):
+def correct_paths(root, tolerance=1.0, shape_tolerance=None):
     """Return ``(new_root, stats)`` with optional near-geometric line cleanup.
 
-    ``tolerance`` must be a positive finite source-pixel distance. Call this
+    ``tolerance`` must be a positive finite source-pixel distance. The optional
+    ``shape_tolerance`` controls only circle/ellipse fits, with an additional 5%
+    minor-radius cap and noise-aware corner checks. Omitting it preserves the
+    original stricter corner and size guards. Open curves, junctions and their
+    endpoints are never moved by shape fitting. Call this
     before source-color segmentation. Unsupported paths are retained verbatim;
     switching this feature off should bypass this function entirely.
     """
     if not math.isfinite(tolerance) or tolerance <= 0:
         raise ValueError('Line correction tolerance must be positive and finite')
+    if shape_tolerance is not None and (not math.isfinite(shape_tolerance) or shape_tolerance <= 0):
+        raise ValueError('Shape correction tolerance must be positive and finite')
+    shape_error = tolerance if shape_tolerance is None else shape_tolerance
     result = copy.deepcopy(root)
-    stats = dict(paths=0, lines=0, circles=0, ellipses=0, simplified_curves=0, removed_segments=0)
+    stats = dict(paths=0, lines=0, circles=0, ellipses=0, simplified_curves=0, removed_segments=0,
+                 shape_candidates=0, shape_tolerance=shape_error)
     parsed = []
     degree = Counter()
     for path in result.iter(NS + 'path'):
@@ -322,10 +408,15 @@ def correct_paths(root, tolerance=1.0):
                        or degree[_point_key(working[i]['points'][0])] > 2]
             junction = any(degree[_point_key(segment['points'][0])] > 2 for segment in working)
             fit = None
-            if closed and not corners and not junction and not _corner(working[-1], working[0]):
-                points = _flatten(working, tolerance * .025)
+            shape_corners_allowed = shape_tolerance is not None or (
+                not corners and not _corner(working[-1], working[0]))
+            if closed and not junction and shape_corners_allowed:
+                stats['shape_candidates'] += 1
+                flatten_error = min(tolerance, shape_error) * .025
+                points = _flatten(working, flatten_error)
                 for circle, key in ((True, 'circles'), (False, 'ellipses')):
-                    fit = _shape_fit(points, circle, tolerance)
+                    fit = _shape_fit(points, circle, shape_error, allow_pixel_noise=shape_tolerance is not None,
+                                     input_error=flatten_error if shape_tolerance is not None else 0.)
                     if fit is not None:
                         stats[key] += 1
                         stats['removed_segments'] += max(0, len(working) - len(fit))

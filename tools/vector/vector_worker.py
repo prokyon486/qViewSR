@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import io
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -303,11 +304,18 @@ def suppress_lines(rgb, alpha):
     return Image.fromarray(values.astype(np.uint8), 'RGB')
 
 
-def trace_lines(rgb, alpha, strength, detail, autotrace, scratch):
+def trace_lines(rgb, alpha, strength, detail, autotrace, scratch, line_mode='dark', mask_gap=0):
     import numpy as np
     from PIL import Image
     root = svg_root(*rgb.size)
-    mask = extract(rgb, alpha, STRENGTHS[strength])
+    if line_mode == 'color':
+        from edge_extraction import extract_color_edges
+        mask = extract_color_edges(rgb, alpha, STRENGTHS[strength])
+    else:
+        mask = extract(rgb, alpha, STRENGTHS[strength])
+        if mask_gap:
+            from mask_cleanup import close_dark_gaps
+            mask = close_dark_gaps(mask, alpha, mask_gap)
     if not mask.any():
         return root
     maskpath = scratch / 'lines.png'
@@ -335,12 +343,14 @@ def trace_lines(rgb, alpha, strength, detail, autotrace, scratch):
     return traced
 
 
-def lines_svg(traced, rgb, alpha, correction=False):
+def lines_svg(traced, rgb, alpha, correction=False, shape_tolerance=1.0):
     from color_paths import color_paths
     root = svg_root(*rgb.size)
+    if traced.get('data-qviewsr-cleanup'):
+        root.set('data-qviewsr-cleanup', traced.get('data-qviewsr-cleanup'))
     if correction:
         from line_correction import correct_paths
-        traced, stats = correct_paths(traced, tolerance=1.0)
+        traced, stats = correct_paths(traced, tolerance=1.0, shape_tolerance=shape_tolerance)
         root.set('data-qviewsr-correction', json.dumps(stats, sort_keys=True))
     rgba = rgb.copy(); rgba.putalpha(alpha)
     colored = color_paths(traced, rgba, exclude_transparent=True)
@@ -391,12 +401,24 @@ def main():
     parser.add_argument('--cache', required=True, type=Path)
     parser.add_argument('--strength', choices=STRENGTHS, default='balanced')
     parser.add_argument('--detail', choices=DETAILS, default='balanced')
+    parser.add_argument('--line-mode', choices=('dark', 'color'), default='dark')
+    parser.add_argument('--mask-gap', type=int, choices=(0, 1, 2), default=0)
+    parser.add_argument('--clean-lines', action='store_true')
+    parser.add_argument('--min-line-length', type=float, default=6.0)
+    parser.add_argument('--join-distance', type=float, default=4.0)
+    parser.add_argument('--branch-strength', type=int, default=50)
+    parser.add_argument('--shape-tolerance', type=float, default=1.0)
     parser.add_argument('--suppression', type=int, default=35)
     parser.add_argument('--correct-lines', action='store_true',
-                        help='主線を許容誤差1px以内で直線・円・楕円・少数のベジェ曲線に補正する')
+                        help='主線を直線・円・楕円・少数のベジェ曲線に補正する')
     args = parser.parse_args()
     if not 0 <= args.suppression <= 100:
         raise ValueError('元線の弱化は0〜100で指定してください。')
+    if not (math.isfinite(args.min_line_length) and 0 <= args.min_line_length <= 1000
+            and math.isfinite(args.join_distance) and 0 <= args.join_distance <= 200
+            and math.isfinite(args.shape_tolerance) and .25 <= args.shape_tolerance <= 100
+            and 0 <= args.branch_strength <= 100):
+        raise ValueError('主線整理・円と楕円の許容誤差の設定が範囲外です。')
     autotrace = Path(os.environ.get('QVIEWSR_AUTOTRACE',
                                    str(REPO / '.local/vector-probe-autotrace/bin/autotrace'))).resolve()
     if not autotrace.is_file() or not os.access(autotrace, os.X_OK):
@@ -423,10 +445,21 @@ def main():
         cache.mkdir(parents=True, exist_ok=True)
         fillkey = key([ALGORITHM, packages['vtracer'], args.suppression])
         linekey = key([ALGORITHM, hashlib.sha256(autotrace.read_bytes()).hexdigest(), args.strength, args.detail])
+        if args.line_mode != 'dark':
+            from edge_extraction import EDGE_VERSION
+            linekey = key([linekey, args.line_mode, EDGE_VERSION])
+        elif args.mask_gap:
+            from mask_cleanup import MASK_VERSION
+            linekey = key([linekey, MASK_VERSION, args.mask_gap])
         rawpath = cache / f'raw-lines-{linekey}.svg'
+        cleanpath = None
+        if args.clean_lines:
+            from line_cleanup import CLEANUP_VERSION
+            linekey = key([linekey, CLEANUP_VERSION, args.min_line_length, args.join_distance, args.branch_strength])
+            cleanpath = cache / f'clean-lines-{linekey}.svg'
         if args.correct_lines:
             from line_correction import CORRECTION_VERSION
-            linekey = key([linekey, CORRECTION_VERSION, 1.0])
+            linekey = key([linekey, CORRECTION_VERSION, 1.0, args.shape_tolerance])
         fillpath = cache / f'fill-{fillkey}.svg'
         linepath = cache / f'lines-{linekey}.svg'
         fill_cached = validate_svg(fillpath, width, height)
@@ -445,20 +478,34 @@ def main():
         if lines_cached:
             hits.append('lines')
         else:
-            if validate_svg(rawpath, width, height):
+            if cleanpath is not None and validate_svg(cleanpath, width, height):
+                hits.append('clean_lines')
+                traced = read_svg(cleanpath)
+            elif validate_svg(rawpath, width, height):
                 hits.append('raw_lines')
                 traced = read_svg(rawpath)
             else:
                 print('主線を抽出し、ベジェ曲線に変換しています。', file=sys.stderr)
-                traced = trace_lines(rgb, alpha, args.strength, args.detail, autotrace, scratch)
+                traced = trace_lines(rgb, alpha, args.strength, args.detail, autotrace, scratch, args.line_mode, args.mask_gap)
                 save_svg(traced, rawpath, width, height)
+            if cleanpath is not None and 'clean_lines' not in hits:
+                from line_cleanup import cleanup_lines
+                print('短い孤立線・横枝を整理し、方向の揃った途切れを接続しています。', file=sys.stderr)
+                traced, cleanup_stats = cleanup_lines(traced, args.min_line_length, args.join_distance, args.branch_strength)
+                traced.set('data-qviewsr-cleanup', json.dumps(cleanup_stats, sort_keys=True))
+                save_svg(traced, cleanpath, width, height)
             if args.correct_lines:
                 print('主線を直線・円・楕円・なめらかな曲線に補正しています。', file=sys.stderr)
-            save_svg(lines_svg(traced, rgb, alpha, args.correct_lines), linepath, width, height)
-        stats = json.loads(read_svg(linepath).get('data-qviewsr-correction', '{}'))
+            save_svg(lines_svg(traced, rgb, alpha, args.correct_lines, args.shape_tolerance), linepath, width, height)
+        result_root = read_svg(linepath)
+        stats = json.loads(result_root.get('data-qviewsr-correction', '{}'))
+        cleanup_stats = json.loads(result_root.get('data-qviewsr-cleanup', '{}'))
     print(json.dumps({'width': width, 'height': height, 'fill_svg': str(fillpath),
                       'lines_svg': str(linepath), 'cache_hits': hits,
-                      'correct_lines': args.correct_lines, 'correction_stats': stats}, ensure_ascii=False))
+                      'correct_lines': args.correct_lines, 'correction_stats': stats,
+                      'line_mode': args.line_mode, 'clean_lines': args.clean_lines,
+                      'mask_gap': args.mask_gap if args.line_mode == 'dark' else 0,
+                      'cleanup_stats': cleanup_stats}, ensure_ascii=False))
 
 
 if __name__ == '__main__':

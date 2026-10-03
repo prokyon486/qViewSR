@@ -26,6 +26,7 @@
 #include <QPushButton>
 #include <QSignalSpy>
 #include <QSlider>
+#include <QScrollArea>
 #include <QSvgRenderer>
 #include <QTemporaryDir>
 #include <QSettings>
@@ -573,6 +574,55 @@ private slots:
         QVERIFY(view->hasVectorPreview());
     }
 
+    void cleanupAndColorEdgeControlsRegenerateAndRestore() {
+        auto* cleaning = panel->findChild<QCheckBox*>("vectorCleanLines"); QVERIFY(cleaning);
+        auto* fitting = panel->findChild<QCheckBox*>("vectorCorrectLines"); QVERIFY(fitting);
+        auto* minimum = panel->findChild<QDoubleSpinBox*>("vectorMinLineLength"); QVERIFY(minimum);
+        auto* gap = panel->findChild<QDoubleSpinBox*>("vectorJoinDistance"); QVERIFY(gap);
+        auto* tolerance = panel->findChild<QDoubleSpinBox*>("vectorShapeTolerance"); QVERIFY(tolerance);
+        auto* branch = panel->findChild<QSlider*>("vectorBranchStrength"); QVERIFY(branch);
+        auto* scroll = panel->findChild<QScrollArea*>("vectorParameters"); QVERIFY(scroll);
+        QVERIFY(!cleaning->isChecked()); QVERIFY(!minimum->isEnabled()); QVERIFY(!tolerance->isEnabled());
+        QVERIFY2(generate(), qPrintable(failure));
+        const auto original = savedSvg(); QVERIFY(!original.isNull());
+        const auto geometry = [](const QDomElement& layer) {
+            QStringList result;
+            for (auto path = layer.firstChildElement(); !path.isNull(); path = path.nextSiblingElement())
+                result << path.attribute("d") << path.attribute("stroke");
+            return result;
+        };
+        cleaning->setChecked(true); minimum->setValue(8); gap->setValue(3); branch->setValue(60);
+        fitting->setChecked(true); tolerance->setValue(3);
+        QVERIFY(select("vectorMaskGap", "1"));
+        QVERIFY(minimum->isEnabled()); QVERIFY(tolerance->isEnabled());
+        QVERIFY(waitIdle()); QVERIFY2(failure.isEmpty(), qPrintable(failure));
+        QVERIFY(panel->findChild<QLabel*>("vectorStatus")->text().contains(QStringLiteral("主線整理ON")));
+        QVERIFY(select("vectorLineMode", "color")); QVERIFY(waitIdle());
+        QVERIFY(!panel->findChild<QComboBox*>("vectorMaskGap")->isEnabled());
+        QVERIFY2(failure.isEmpty(), qPrintable(failure));
+        QVERIFY(!group(savedSvg(), "lines").firstChildElement().isNull());
+        QCOMPARE(QSettings().value("vector/lineMode").toString(), QString("color"));
+        QCOMPARE(QSettings().value("vector/minLineLength").toDouble(), 8.);
+        QCOMPARE(QSettings().value("vector/shapeTolerance").toDouble(), 3.);
+        QCOMPARE(QSettings().value("vector/maskGap").toString(), QString("1"));
+        QVERIFY(select("vectorLineMode", "dark")); cleaning->setChecked(false); fitting->setChecked(false);
+        QVERIFY(select("vectorMaskGap", "0"));
+        QVERIFY(waitIdle()); QVERIFY2(failure.isEmpty(), qPrintable(failure));
+        QCOMPARE(geometry(group(savedSvg(), "lines")), geometry(group(original, "lines")));
+        QCOMPARE(digest(sourcePath), sourceDigest);
+        controller->showPanel(); panel->resize(500, 600);
+        scroll->ensureWidgetVisible(panel->findChild<QDoubleSpinBox*>("vectorPreviewScale"));
+        QCoreApplication::processEvents();
+        QVERIFY(panel->findChild<QPushButton*>("vectorSavePng")->isVisibleTo(panel));
+        const auto artifacts = qEnvironmentVariable("ARTIFACTS");
+        if (!artifacts.isEmpty()) {
+            QVERIFY(QDir().mkpath(artifacts));
+            scroll->ensureWidgetVisible(panel->findChild<QComboBox*>("vectorLineMode"));
+            QCoreApplication::processEvents();
+            QVERIFY(panel->grab().save(artifacts+"/line-controls.png"));
+        }
+    }
+
     void manyNestedLinePathsPreserveDocumentOrder() {
         const auto worker = files.filePath("nested-path-worker.py");
         const QByteArray script =
@@ -951,6 +1001,13 @@ private slots:
         window->openFile(source);
         QTRY_COMPARE_WITH_TIMEOUT(view->getCurrentFileDetails().fileInfo.absoluteFilePath(), QFileInfo(source).absoluteFilePath(), 15000);
         QTRY_VERIFY_WITH_TIMEOUT(view->getCurrentFileDetails().isPixmapLoaded, 15000);
+        if (qEnvironmentVariableIsSet("QVIEWSR_TEST_REFINE_LINES")) {
+            QVERIFY(select("vectorMaskGap", "1"));
+            panel->findChild<QCheckBox*>("vectorCleanLines")->setChecked(true);
+            panel->findChild<QCheckBox*>("vectorCorrectLines")->setChecked(true);
+            panel->findChild<QDoubleSpinBox*>("vectorShapeTolerance")->setValue(3);
+            QVERIFY(select("vectorColor", "black"));
+        }
         controller->showPanel(); QTRY_VERIFY(panel->isVisible());
         QSignalSpy ready(controller, &Vector::Controller::resultReady);
         auto* button = panel->findChild<QPushButton*>("vectorGenerate"); QVERIFY(button->isEnabled());
