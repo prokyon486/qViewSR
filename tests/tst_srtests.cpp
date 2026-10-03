@@ -239,7 +239,7 @@ private slots:
         std::unique_ptr<QMimeData> valid(view->getFileDragMimeData(&error));
         QVERIFY2(error.isEmpty(),qPrintable(error)); QCOMPARE(valid->urls().size(),1);
         QVERIFY(!QFileInfo::exists(cache.filePath("qviewsr-sr-expired.png"))); QVERIFY(QFileInfo::exists(cache.filePath("keep.txt")));
-        view->setDragImageProvider([] { return std::optional<QImage>(QImage()); });
+        view->setDragImageProvider([](QString*) { return std::optional<QImage>(QImage()); });
         std::unique_ptr<QMimeData> missing(view->getFileDragMimeData(&error));
         QVERIFY(!missing->hasUrls()); QVERIFY(!error.isEmpty()); // Never silently fall back to the original.
         view->closeImage(); std::unique_ptr<QMimeData> empty(view->getFileDragMimeData(&error)); QVERIFY(!empty->hasUrls());

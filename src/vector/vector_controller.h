@@ -9,6 +9,9 @@ class MainWindow;
 class QVGraphicsView;
 
 namespace Vector {
+bool rasterSize(QSize source, double scale, QSize* size, QString* error = nullptr);
+QImage rasterizeSvg(const QByteArray& svg, QSize size, QString* error = nullptr);
+QByteArray readSvgAsset(const QString& requestedPath, const QString& cacheDirectory, QString* error = nullptr);
 class Controller : public QObject {
     Q_OBJECT
 public:
@@ -31,7 +34,7 @@ public slots:
     void setShowingResult(bool showing);
 
 signals:
-    void previewReady(const QImage& sRGBImage, const QByteArray& svg);
+    void previewReady(const QImage& sRGBImage, const QByteArray& svg, double transferScale);
     void originalRequested();
     void stateChanged();
     void failed(const QString& message);

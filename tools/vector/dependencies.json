@@ -1,10 +1,72 @@
 {
-  "python_packages": {"numpy": "2.2.6", "Pillow": "10.2.0", "vtracer": "0.6.15"},
+  "python_packages": {
+    "numpy": "2.2.6",
+    "Pillow": "10.2.0",
+    "vtracer": "0.6.15+qviewsr.4"
+  },
   "autotrace": {
     "release": "0.31.10",
     "url": "https://github.com/autotrace/autotrace/archive/refs/tags/0.31.10.tar.gz",
     "sha256": "14627f93bb02fe14eeda0163434a7cb9b1f316c0f1727f0bdf6323a831ffe80d",
     "source_directory": "autotrace-0.31.10",
-    "license_files": ["COPYING", "COPYING.LIB"]
+    "license_files": [
+      "COPYING",
+      "COPYING.LIB"
+    ]
+  },
+  "vtracer": {
+    "version": "0.6.15+qviewsr.4",
+    "marker": "large-color-sums-area-tree-parallel-sparse-v4",
+    "maturin": "1.9.4",
+    "upstream": {
+      "archive": "vtracer-0.6.15.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/e4/62/c3c23511ebe3d76dc679db0bb045dfd20ed3452bec12dcbbe8d655498a7d/vtracer-0.6.15.tar.gz",
+      "sha256": "f7f39943d1fc8e9dc82f5360a40e941aaf4c9166d8df30c3f6a2da8cc21dfc52",
+      "source_directory": "vtracer-0.6.15",
+      "license_files": [
+        "LICENSE"
+      ]
+    },
+    "visioncortex": {
+      "archive": "visioncortex-0.8.10.crate",
+      "url": "https://static.crates.io/crates/visioncortex/visioncortex-0.8.10.crate",
+      "sha256": "7c9a7e6cc136c7c79b4adbd311c46c323a19db7baf446822b5f90f84375934e3",
+      "source_directory": "visioncortex-0.8.10",
+      "license_files": [
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+        "Attributions.md"
+      ]
+    },
+    "patch": {
+      "file": "patches/vtracer-0.6.15-qviewsr.patch",
+      "sha256": "5c0cd9155dcb667a9ffe6354e8fe514f20aa88560422f322ae8698b475404fb3"
+    },
+    "rust": {
+      "version": "1.90.0",
+      "target": "x86_64-unknown-linux-gnu",
+      "manifest_url": "https://static.rust-lang.org/dist/channel-rust-1.90.0.toml",
+      "manifest_sha256": "489c19f20d331765ab2835661eb546de90f6446a107a8db83045e7371e45cae2",
+      "components": [
+        {
+          "archive": "rustc-1.90.0-x86_64-unknown-linux-gnu.tar.xz",
+          "source_directory": "rustc-1.90.0-x86_64-unknown-linux-gnu",
+          "url": "https://static.rust-lang.org/dist/2025-09-18/rustc-1.90.0-x86_64-unknown-linux-gnu.tar.xz",
+          "sha256": "48c2a42de9e92fcae8c24568f5fe40d5734696a6f80e83cc6d46eef1a78f13c9"
+        },
+        {
+          "archive": "rust-std-1.90.0-x86_64-unknown-linux-gnu.tar.xz",
+          "source_directory": "rust-std-1.90.0-x86_64-unknown-linux-gnu",
+          "url": "https://static.rust-lang.org/dist/2025-09-18/rust-std-1.90.0-x86_64-unknown-linux-gnu.tar.xz",
+          "sha256": "663f4ab7945b392d5e5294dec1b050a66820a20e86f084ec37eeb0f2f7ff5569"
+        },
+        {
+          "archive": "cargo-1.90.0-x86_64-unknown-linux-gnu.tar.xz",
+          "source_directory": "cargo-1.90.0-x86_64-unknown-linux-gnu",
+          "url": "https://static.rust-lang.org/dist/2025-09-18/cargo-1.90.0-x86_64-unknown-linux-gnu.tar.xz",
+          "sha256": "9853db03d68578a30972e2755c89c66aec035fec641cf8f3a7117c81eec2578d"
+        }
+      ]
+    }
   }
 }

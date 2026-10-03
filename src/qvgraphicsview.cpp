@@ -379,12 +379,12 @@ QMimeData *QVGraphicsView::getFileDragMimeData(QString *error)
     auto *mime = new QMimeData;
     if (error) error->clear();
     if (!getCurrentFileDetails().isPixmapLoaded || getCurrentFileDetails().isModelDocument) return mime;
-    const auto replacement = dragImageProvider ? dragImageProvider() : std::nullopt;
+    const auto replacement = dragImageProvider ? dragImageProvider(error) : std::nullopt;
     QString path = getCurrentFileDetails().fileInfo.absoluteFilePath();
     if (replacement) {
         const auto &image = *replacement;
         if (image.isNull()) {
-            if (error) *error = QStringLiteral("受け渡し用のSR画像を用意できません。メモリーの空きを確認してください。");
+            if (error && error->isEmpty()) *error = QStringLiteral("受け渡し用の画像を用意できません。メモリーの空きを確認してください。");
             return mime;
         }
         // Keep immutable exports beyond the drag/window lifetime: browsers read
@@ -712,16 +712,22 @@ void QVGraphicsView::resetScale()
 
 void QVGraphicsView::originalSize()
 {
+    QTransform unity;
+    if (hasVectorPreview() && !loadedPixmapItem->boundingRect().isEmpty()) {
+        const auto source = loadedPixmapItem->vectorSourceSize();
+        const QSizeF bounds = getLoadedPixmap().size();
+        unity.scale(source.width() / bounds.width(), source.height() / bounds.height());
+    }
     if (isOriginalSize) {
         // If we are at the actual original size
-        if (transform() == QTransform()) {
+        if (transform() == unity) {
             resetScale(); // back to normal mode
             return;
         }
     }
     makeUnscaled();
 
-    resetTransform();
+    setTransform(unity);
     centerOn(loadedPixmapItem);
 
     zoomBasis = transform();

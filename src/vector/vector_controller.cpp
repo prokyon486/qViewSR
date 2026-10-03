@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vector_controller.h"
+#include "cancellable_save_file.h"
+#include "memory_budget.h"
+#include "generated_svg_renderer.h"
 #include "mainwindow.h"
 #include "qvgraphicsview.h"
 #include "sr/color_pipeline.h"
@@ -36,15 +39,15 @@
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QVector>
 #include <QtConcurrent/QtConcurrentRun>
 #include <cmath>
 
 namespace Vector {
 namespace {
-constexpr qint64 MaxInputPixels = 4000000;
-constexpr int MaxInputSide = 4096;
 constexpr qint64 MaxOutputPixels = 64000000;
-constexpr qint64 MaxSvgBytes = 64LL * 1024 * 1024;
+constexpr qint64 MaxProxyPixels = 16000000;
+constexpr int MaxProxySide = 8192;
 const QString SvgNamespace = QStringLiteral("http://www.w3.org/2000/svg");
 
 struct Appearance {
@@ -73,25 +76,29 @@ QString repositoryRoot() {
     return QCoreApplication::applicationDirPath();
 }
 
-bool validOutputSize(QSize source, double scale, QSize* size, QString* error) {
-    if (!std::isfinite(scale) || scale < 1.0 || scale > 8.0 || source.isEmpty()) {
-        if (error) *error = QStringLiteral("保存倍率は1〜8倍で指定してください。");
+}
+
+bool rasterSize(QSize source, double scale, QSize* size, QString* error) {
+    if (!std::isfinite(scale) || scale < 0.01 || scale > 8.0 || source.isEmpty()) {
+        if (error) *error = QStringLiteral("画像化の倍率は0.01〜8倍で指定してください。");
         return false;
     }
     const qint64 width = qRound64(source.width() * scale);
     const qint64 height = qRound64(source.height() * scale);
     if (width <= 0 || height <= 0 || width > 32768 || height > 32768 || width * height > MaxOutputPixels) {
-        if (error) *error = QStringLiteral("出力画像が上限（64メガピクセル・一辺32768px）を超えます。倍率を下げてください。");
+        if (error) *error = QStringLiteral("出力画像が上限（64メガピクセル・一辺32768px）を超えます。保存／受け渡し画像の倍率を下げてください。SVG保存はこの制限を受けません。");
         return false;
     }
     *size = QSize(int(width), int(height));
     return true;
 }
 
-QImage renderSvg(const QByteArray& svg, QSize size, QString* error) {
-    QSvgRenderer renderer(svg);
+QImage rasterizeSvg(const QByteArray& svg, QSize size, QString* error) {
+    const auto memoryError = svgMemoryError(quint64(svg.size()));
+    if (!memoryError.isEmpty()) { if (error) *error = memoryError; return {}; }
+    GeneratedSvgRenderer renderer(svg);
     if (!renderer.isValid()) {
-        if (error) *error = QStringLiteral("生成されたSVGを描画できません。");
+        if (error) *error = renderer.errorString();
         return {};
     }
     QImage image(size, QImage::Format_ARGB32_Premultiplied);
@@ -101,13 +108,14 @@ QImage renderSvg(const QByteArray& svg, QSize size, QString* error) {
     }
     image.fill(Qt::transparent);
     image.setColorSpace(QColorSpace::SRgb);
-    QPainter painter(&image);
-    painter.setRenderHint(QPainter::Antialiasing);
-    renderer.render(&painter, QRectF(QPointF(0, 0), QSizeF(size)));
-    painter.end();
+    const auto box = renderer.viewBoxF();
+    const auto transform = QTransform::fromTranslate(-box.left(), -box.top())
+        * QTransform::fromScale(size.width()/box.width(), size.height()/box.height());
+    if (!renderer.render(image, transform, error)) return {};
     return image;
 }
 
+namespace {
 void grayElement(QDomElement element) {
     for (const QString& attribute : {QStringLiteral("fill"), QStringLiteral("stroke"), QStringLiteral("stop-color")}) {
         if (!element.hasAttribute(attribute)) continue;
@@ -122,6 +130,8 @@ void grayElement(QDomElement element) {
 
 Rendered compose(const QByteArray& fillBytes, const QByteArray& linesBytes, QSize size, const Appearance& look, double previewScale) {
     Rendered output;
+    output.error = svgMemoryError(quint64(fillBytes.size()) + quint64(linesBytes.size()));
+    if (!output.error.isEmpty()) return output;
     QDomDocument fillDocument, linesDocument, document;
     if (!fillDocument.setContent(fillBytes) || !linesDocument.setContent(linesBytes)) {
         output.error = QStringLiteral("生成されたベクターデータを読み込めません。");
@@ -159,8 +169,16 @@ Rendered compose(const QByteArray& fillBytes, const QByteArray& linesBytes, QSiz
         root.appendChild(lines);
         // The worker returns source-colored paths in source-image coordinates.
         const auto paths = linesDocument.elementsByTagName(QStringLiteral("path"));
-        for (int i = 0; i < paths.size(); ++i) {
-            auto path = document.importNode(paths.item(i), true).toElement();
+        // QDomNodeList is live: importing and changing destination nodes can
+        // invalidate its generation even across documents. Snapshot references
+        // before any mutation, preserving the descendant document order while
+        // avoiding a complete source-tree scan for every imported path.
+        const int pathCount = paths.size();
+        QVector<QDomNode> pathNodes;
+        pathNodes.reserve(pathCount);
+        for (int i = 0; i < pathCount; ++i) pathNodes.append(paths.item(i));
+        for (const auto& sourcePath : pathNodes) {
+            auto path = document.importNode(sourcePath, true).toElement();
             path.setAttribute(QStringLiteral("fill"), QStringLiteral("none"));
             path.removeAttribute(QStringLiteral("stroke-width"));
             if (look.color != QStringLiteral("source"))
@@ -169,21 +187,34 @@ Rendered compose(const QByteArray& fillBytes, const QByteArray& linesBytes, QSiz
         }
     }
     output.svg = document.toByteArray(-1);
-    QSize previewSize;
-    if (validOutputSize(size, previewScale, &previewSize, &output.error))
-        output.image = renderSvg(output.svg, previewSize, &output.error);
+    output.error = svgMemoryError(quint64(output.svg.size()));
+    if (!output.error.isEmpty()) { output.svg.clear(); return output; }
+    // This bitmap only supplies viewer geometry and a bounded fallback. The SVG
+    // retains full input coordinates; exports are rendered separately on demand.
+    const double proxyScale = qMin(previewScale, qMin(
+        std::sqrt(double(MaxProxyPixels) / (qint64(size.width()) * size.height())),
+        double(MaxProxySide) / qMax(size.width(), size.height())));
+    const QSize proxySize(qMax(1, int(std::floor(size.width() * proxyScale))),
+                          qMax(1, int(std::floor(size.height() * proxyScale))));
+    output.image = rasterizeSvg(output.svg, proxySize, &output.error);
     return output;
 }
 
-bool writePng(const QImage& image, const QString& path, QString* error) {
-    QSaveFile file(path);
+bool writePng(const QImage& image, const QString& path, QString* error,
+              const std::shared_ptr<std::atomic_bool>& cancelled = {}) {
+    CancellableSaveFile file(path, cancelled);
+    if (file.cancellationRequested()) {
+        if (error) *error = QStringLiteral("入力画像の準備を中止しました。");
+        return false;
+    }
     if (!file.open(QIODevice::WriteOnly)) {
         if (error) *error = file.errorString();
         return false;
     }
     QImageWriter writer(&file, "png");
     if (!writer.write(image)) {
-        if (error) *error = writer.errorString();
+        if (error) *error = file.cancellationRequested()
+            ? QStringLiteral("入力画像の準備を中止しました。") : writer.errorString();
         return false;
     }
     if (!file.commit()) {
@@ -193,19 +224,31 @@ bool writePng(const QImage& image, const QString& path, QString* error) {
     return true;
 }
 
-QByteArray readAsset(const QString& requestedPath, const QString& cacheDirectory, QString* error) {
+}
+
+QByteArray readSvgAsset(const QString& requestedPath, const QString& cacheDirectory, QString* error) {
     const QFileInfo info(QDir(cacheDirectory).absoluteFilePath(requestedPath));
     const auto canonical = info.canonicalFilePath();
     const auto cacheCanonical = QFileInfo(cacheDirectory).canonicalFilePath();
     if (canonical.isEmpty() || cacheCanonical.isEmpty() || !info.isFile() ||
-        !canonical.startsWith(cacheCanonical + QDir::separator()) || info.size() <= 0 || info.size() > MaxSvgBytes) {
-        *error = QStringLiteral("ワーカーが不正なSVG出力を返しました。");
+        !canonical.startsWith(cacheCanonical + QDir::separator()) || info.size() <= 0) {
+        if (error) *error = QStringLiteral("ワーカーが不正なSVG出力を返しました。");
         return {};
     }
     QFile file(canonical);
-    if (!file.open(QIODevice::ReadOnly)) { *error = file.errorString(); return {}; }
-    return file.readAll();
-}
+    if (!file.open(QIODevice::ReadOnly)) { if (error) *error = file.errorString(); return {}; }
+    const qint64 expected = file.size();
+    const auto memoryError = expected > 0 ? svgMemoryError(quint64(expected))
+        : QStringLiteral("ワーカーが空のSVG出力を返しました。");
+    if (!memoryError.isEmpty()) { if (error) *error = memoryError; return {}; }
+    // A changed cache must not turn readAll() into an unbounded allocation.
+    const auto bytes = file.read(expected + 1);
+    if (file.error() != QFileDevice::NoError) { if (error) *error = file.errorString(); return {}; }
+    if (bytes.size() != expected || file.size() != expected) {
+        if (error) *error = QStringLiteral("読み込み中にSVG出力のサイズが変わりました。もう一度生成してください。");
+        return {};
+    }
+    return bytes;
 }
 
 struct Controller::Private {
@@ -216,7 +259,7 @@ struct Controller::Private {
     QComboBox *strength, *detail, *color, *background;
     QDoubleSpinBox *width, *scale, *previewScale;
     QSlider *opacity, *suppression;
-    QCheckBox *showFill, *grayFill, *showResult;
+    QCheckBox *showFill, *grayFill, *showResult, *correctLines;
     QPushButton *run, *stop, *svgSave, *pngSave;
     QLabel* status;
     QTimer debounce, watchdog;
@@ -224,7 +267,9 @@ struct Controller::Private {
     QByteArray stdoutBytes, stderrBytes, fillSvg, linesSvg, composedSvg;
     QSize sourceSize;
     QImage image;
+    QString correctionSummary;
     std::shared_ptr<QTemporaryDir> workspace;
+    std::shared_ptr<std::atomic_bool> preparationCancelled;
     quint64 epoch = 0, shapeRevision = 0, renderRevision = 0;
     bool preparing = false, rendering = false, rerun = false, renderPending = false;
     bool generated = false, showing = false, fullscreen = false, restorePanel = false, externalBusy = false, saving = false, loading = false;
@@ -255,6 +300,10 @@ struct Controller::Private {
                          {{QStringLiteral("弱：濃い線を中心に"), "weak"}, {QStringLiteral("標準"), "balanced"}, {QStringLiteral("強：薄い線も拾う"), "strong"}});
         detail = combo("vectorDetail", QStringLiteral("曲線の細かさ"),
                        {{QStringLiteral("細部優先（0.3px）"), "fine"}, {QStringLiteral("標準（1px）"), "balanced"}, {QStringLiteral("簡略化（3px）"), "simple"}});
+        correctLines = new QCheckBox(QStringLiteral("主線を補正（直線・円・楕円・滑らかな曲線）"), panel);
+        correctLines->setObjectName("vectorCorrectLines");
+        correctLines->setToolTip(QStringLiteral("元の形からのずれを抑えながら、主線を直線・円・楕円や少ないベジエ曲線で近似します。オフにすると補正前の線に戻ります。塗りには適用しません。"));
+        form->addRow(correctLines);
         width = new QDoubleSpinBox(panel);
         width->setObjectName("vectorWidth"); width->setRange(.3, 3.0); width->setSingleStep(.1); width->setDecimals(1);
         width->setSuffix(QStringLiteral(" px")); form->addRow(QStringLiteral("線幅（元画像基準）"), width);
@@ -292,7 +341,7 @@ struct Controller::Private {
         grayFill = new QCheckBox(QStringLiteral("塗りをグレースケール化"), panel); grayFill->setObjectName("vectorGrayFill");
         form->addRow(showFill); form->addRow(grayFill);
         previewScale = new QDoubleSpinBox(panel);
-        previewScale->setObjectName("vectorPreviewScale"); previewScale->setRange(1, 8); previewScale->setSingleStep(.5);
+        previewScale->setObjectName("vectorPreviewScale"); previewScale->setRange(.01, 8); previewScale->setSingleStep(.1);
         previewScale->setSuffix(QStringLiteral(" 倍")); form->addRow(QStringLiteral("受け渡し画像の倍率"), previewScale);
         previewScale->setToolTip(QStringLiteral("Ctrl＋ドラッグで渡す画像の倍率です。画面のプレビューは倍率に関係なくSVGから描画します。"));
         auto* note = new QLabel(QStringLiteral("透明背景は塗りの白い部分を消しません。主線を透明にしても塗り側の元線は残ります。"), panel);
@@ -306,7 +355,7 @@ struct Controller::Private {
         auto* exports = new QHBoxLayout;
         svgSave = new QPushButton(QStringLiteral("SVG保存"), panel); svgSave->setObjectName("vectorSaveSvg");
         pngSave = new QPushButton(QStringLiteral("PNG保存"), panel); pngSave->setObjectName("vectorSavePng");
-        scale = new QDoubleSpinBox(panel); scale->setObjectName("vectorExportScale"); scale->setRange(1, 8); scale->setSingleStep(.5); scale->setValue(4); scale->setSuffix(QStringLiteral(" 倍"));
+        scale = new QDoubleSpinBox(panel); scale->setObjectName("vectorExportScale"); scale->setRange(.01, 8); scale->setSingleStep(.1); scale->setValue(4); scale->setSuffix(QStringLiteral(" 倍"));
         scale->setPrefix(QStringLiteral("保存 "));
         scale->setAccessibleName(QStringLiteral("PNG保存倍率"));
         scale->setToolTip(QStringLiteral("PNG保存時の倍率。プレビューとは独立してSVGから描画します。"));
@@ -324,6 +373,7 @@ struct Controller::Private {
         for (auto* control : {strength, detail})
             QObject::connect(control, &QComboBox::currentIndexChanged, owner, [this] { shapeChanged(); });
         QObject::connect(suppression, &QSlider::valueChanged, owner, [this] { shapeChanged(); });
+        QObject::connect(correctLines, &QCheckBox::toggled, owner, [this] { shapeChanged(); });
         for (auto* control : {color, background})
             QObject::connect(control, &QComboBox::currentIndexChanged, owner, [this] { appearanceChanged(); });
         QObject::connect(width, &QDoubleSpinBox::valueChanged, owner, [this] { appearanceChanged(); });
@@ -344,11 +394,13 @@ struct Controller::Private {
         QObject::connect(pngSave, &QPushButton::clicked, owner, [this] { exportPng(); });
         QObject::connect(&view->getImageCore(), &QVImageCore::sourceChanging, owner, [this] { loading = true; invalidate(); });
         QObject::connect(view, &QVGraphicsView::fileChanged, owner, [this] { loading = false; updateControls(); });
+        QObject::connect(view, &QVGraphicsView::vectorRenderingFailed, owner, [this](const QString& error) { report(error); });
         updateControls();
     }
 
     ~Private() {
         ++epoch;
+        if (preparationCancelled) preparationCancelled->store(true, std::memory_order_relaxed);
         if (process) { process->disconnect(owner); process->kill(); process->waitForFinished(2000); }
         saveSettings();
         if (panel) { panel->removeEventFilter(owner); delete panel; }
@@ -372,6 +424,7 @@ struct Controller::Private {
         suppression->setValue(qRound(settings.value("vector/suppression", 30).toDouble() / 5));
         showFill->setChecked(settings.value("vector/showFill", false).toBool());
         grayFill->setChecked(settings.value("vector/grayFill", false).toBool());
+        correctLines->setChecked(settings.value("vector/correctLines", false).toBool());
         scale->setValue(settings.value("vector/exportScale", 4.0).toDouble());
         previewScale->setValue(settings.value("vector/previewScale", 4.0).toDouble());
         panel->restoreGeometry(settings.value("vector/panelGeometry").toByteArray());
@@ -387,6 +440,7 @@ struct Controller::Private {
         settings.setValue("vector/background", background->currentData()); settings.setValue("vector/showFill", showFill->isChecked());
         settings.setValue("vector/grayFill", grayFill->isChecked()); settings.setValue("vector/exportScale", scale->value());
         settings.setValue("vector/previewScale", previewScale->value());
+        settings.setValue("vector/correctLines", correctLines->isChecked());
     }
 
     QString eligibilityError() const {
@@ -396,9 +450,6 @@ struct Controller::Private {
             return QStringLiteral("アニメーションのベクター変換には対応していません。静止画を開いてください。");
         if (!file.isPixmapLoaded || loading || view->getImageCore().getSourceImage().isNull())
             return QStringLiteral("変換する静止画を開いてください。");
-        const QSize size = view->getImageCore().getSourceImage().size();
-        if (size.width() > MaxInputSide || size.height() > MaxInputSide || qint64(size.width()) * size.height() > MaxInputPixels)
-            return QStringLiteral("入力上限は4メガピクセル・一辺4096pxです。小さい画像を開いてください。");
         if (externalBusy) return QStringLiteral("超解像処理中はベクター変換を操作できません。");
         return {};
     }
@@ -424,6 +475,8 @@ struct Controller::Private {
 
     QByteArray exportDocument(QSize* outputSize, QString* error) const {
         if (composedSvg.isEmpty()) { if (error) *error = QStringLiteral("保存する変換結果がありません。"); return {}; }
+        const auto memoryError = svgMemoryError(quint64(composedSvg.size()));
+        if (!memoryError.isEmpty()) { if (error) *error = memoryError; return {}; }
         QDomDocument document;
         if (!document.setContent(composedSvg)) { if (error) *error = QStringLiteral("保存するSVGが不正です。"); return {}; }
         const int rotation = view->getImageCore().getCurrentRotation();
@@ -445,7 +498,10 @@ struct Controller::Private {
             while (!root.firstChild().isNull()) transformed.appendChild(root.firstChild());
             root.appendChild(transformed);
         }
-        return document.toByteArray(-1);
+        const auto bytes = document.toByteArray(-1);
+        const auto outputError = svgMemoryError(quint64(bytes.size()));
+        if (!outputError.isEmpty()) { if (error) *error = outputError; return {}; }
+        return bytes;
     }
 
     void updateControls(bool updateMessage = true) {
@@ -457,6 +513,7 @@ struct Controller::Private {
         pngSave->setEnabled(!composedSvg.isEmpty() && !busy());
         for (auto* control : {strength, detail, color, background}) control->setEnabled(!externalBusy);
         showFill->setEnabled(!externalBusy); previewScale->setEnabled(!externalBusy); scale->setEnabled(!externalBusy);
+        correctLines->setEnabled(!externalBusy);
         suppression->parentWidget()->setEnabled(!externalBusy && showFill->isChecked()); grayFill->setEnabled(!externalBusy && showFill->isChecked());
         const bool linesVisible = color->currentData().toString() != "transparent";
         width->setEnabled(!externalBusy && linesVisible); opacity->parentWidget()->setEnabled(!externalBusy && linesVisible);
@@ -482,6 +539,7 @@ struct Controller::Private {
         owner->cancel();
         fillSvg.clear(); linesSvg.clear(); composedSvg.clear(); image = {}; sourceSize = {};
         workspace.reset(); generated = false; showing = false;
+        correctionSummary.clear();
         { QSignalBlocker block(showResult); showResult->setChecked(false); }
         updateControls();
     }
@@ -508,9 +566,9 @@ struct Controller::Private {
                 if (!result.error.isEmpty()) report(result.error);
                 else {
                     image = result.image; composedSvg = result.svg;
-                    if (showResult->isChecked()) { showing = true; emit owner->previewReady(image, composedSvg); }
-                    setStatus(QStringLiteral("SVGを表示中。拡大時もベクターから描画します。受け渡し画像: %1×%2px。")
-                              .arg(image.width()).arg(image.height()));
+                    if (showResult->isChecked()) { showing = true; emit owner->previewReady(image, composedSvg, previewScale->value()); }
+                    setStatus(QStringLiteral("SVG: %1×%2px。拡大時もベクターから描画します。\n%3")
+                              .arg(sourceSize.width()).arg(sourceSize.height()).arg(correctionSummary));
                     emit owner->resultReady();
                 }
             }
@@ -525,6 +583,8 @@ struct Controller::Private {
         const QString unavailable = eligibilityError();
         if (!unavailable.isEmpty()) { report(unavailable); return; }
         if (workerBusy()) { rerun = true; return; }
+        const auto memoryError = preparationMemoryError(view->getImageCore().getSourceImage().size());
+        if (!memoryError.isEmpty()) { report(memoryError); return; }
         const QString root = repositoryRoot();
         const QString python = qEnvironmentVariable("QVIEWSR_VECTOR_PYTHON", root + "/.local/vector-probe-venv/bin/python");
         const QString script = qEnvironmentVariable("QVIEWSR_VECTOR_WORKER", root + "/tools/vector/vector_worker.py");
@@ -534,6 +594,8 @@ struct Controller::Private {
         if (!workspace) workspace = std::make_shared<QTemporaryDir>(QDir::tempPath() + "/qviewsr-vector-XXXXXX");
         if (!workspace->isValid()) { report(QStringLiteral("作業用フォルダーを作成できません。")); return; }
         generated = true; rerun = false; preparing = true;
+        const auto cancelled = std::make_shared<std::atomic_bool>(false);
+        preparationCancelled = cancelled;
         if (image.isNull()) { QSignalBlocker block(showResult); showResult->setChecked(true); }
         const auto jobEpoch = epoch, revision = shapeRevision;
         const auto folder = workspace;
@@ -543,24 +605,33 @@ struct Controller::Private {
         const QString selectedStrength = strength->currentData().toString();
         const QString selectedDetail = detail->currentData().toString();
         const int selectedSuppression = suppression->value() * 5;
+        const bool selectedCorrection = correctLines->isChecked();
         setStatus(QStringLiteral("入力画像の色と作業ファイルを準備しています…"));
         updateControls(false);
         auto* watcher = new QFutureWatcher<QString>(owner);
         QObject::connect(watcher, &QFutureWatcher<QString>::finished, owner,
-                         [this, watcher, folder, jobEpoch, revision, size, python, script, selectedStrength, selectedDetail, selectedSuppression] {
+                         [this, watcher, folder, cancelled, jobEpoch, revision, size, python, script, selectedStrength, selectedDetail, selectedSuppression, selectedCorrection] {
             const QString error = watcher->result(); watcher->deleteLater(); preparing = false;
+            if (preparationCancelled == cancelled) preparationCancelled.reset();
             if (jobEpoch != epoch || externalBusy) { continuePending(); return; }
             if (!error.isEmpty()) { report(error); continuePending(); return; }
             if (revision != shapeRevision) { rerun = true; continuePending(); return; }
-            launch(folder, jobEpoch, revision, size, python, script, selectedStrength, selectedDetail, selectedSuppression);
+            launch(folder, jobEpoch, revision, size, python, script, selectedStrength, selectedDetail, selectedSuppression, selectedCorrection);
         });
-        watcher->setFuture(QtConcurrent::run([source, profile, folder] {
+        watcher->setFuture(QtConcurrent::run([source, profile, folder, cancelled] {
+            const auto stopped = [&] { return cancelled->load(std::memory_order_relaxed); };
+            const auto cancelledError = QStringLiteral("入力画像の準備を中止しました。");
+            if (stopped()) return cancelledError;
             const QString input = folder->filePath("input.png");
             if (QFileInfo::exists(input)) return QString();
+            const auto unavailable = preparationMemoryError(source.size());
+            if (!unavailable.isEmpty()) return unavailable;
+            if (stopped()) return cancelledError;
             QString error;
             const QImage srgb = Sr::toSrgb(source, profile, &error);
+            if (stopped()) return cancelledError;
             if (srgb.isNull()) return error.isEmpty() ? QStringLiteral("入力画像をsRGBへ変換できません。") : error;
-            if (!writePng(srgb, input, &error)) return error;
+            if (!writePng(srgb, input, &error, cancelled)) return error;
             return QString();
         }));
     }
@@ -572,7 +643,7 @@ struct Controller::Private {
 
     void launch(const std::shared_ptr<QTemporaryDir>& folder, quint64 jobEpoch, quint64 revision, QSize size,
                 const QString& python, const QString& script, const QString& selectedStrength,
-                const QString& selectedDetail, int selectedSuppression) {
+                const QString& selectedDetail, int selectedSuppression, bool selectedCorrection) {
         auto* child = new QProcess(owner); process = child;
         stdoutBytes.clear(); stderrBytes.clear();
         auto environment = QProcessEnvironment::systemEnvironment(); environment.remove("LD_LIBRARY_PATH");
@@ -584,7 +655,12 @@ struct Controller::Private {
         });
         QObject::connect(child, &QProcess::readyReadStandardError, owner, [this, child] {
             const QByteArray bytes = child->readAllStandardError();
-            if (process == child) stderrBytes = (stderrBytes + bytes).right(16384);
+            if (process == child) {
+                stderrBytes = (stderrBytes + bytes).right(16384);
+                watchdog.start();
+                const QString progress = QString::fromUtf8(bytes).trimmed();
+                if (!progress.isEmpty()) setStatus(progress.right(2000));
+            }
         });
         QObject::connect(child, &QProcess::errorOccurred, owner, [this, child, jobEpoch](QProcess::ProcessError error) {
             if (error != QProcess::FailedToStart || process != child) return;
@@ -593,7 +669,7 @@ struct Controller::Private {
             continuePending();
         });
         QObject::connect(child, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), owner,
-                         [this, child, folder, jobEpoch, revision, size](int code, QProcess::ExitStatus exitStatus) {
+                         [this, child, folder, jobEpoch, revision, size, selectedCorrection](int code, QProcess::ExitStatus exitStatus) {
             if (process != child) { child->deleteLater(); return; }
             stdoutBytes += child->readAllStandardOutput(); stderrBytes += child->readAllStandardError();
             process = nullptr; watchdog.stop(); child->deleteLater();
@@ -612,16 +688,27 @@ struct Controller::Private {
                 report(QStringLiteral("ワーカーから受け取った画像サイズが入力と一致しません。")); continuePending(); return;
             }
             QString error;
-            const auto fill = readAsset(result.value("fill_svg").toString(), folder->filePath("cache"), &error);
-            const auto lines = readAsset(result.value("lines_svg").toString(), folder->filePath("cache"), &error);
+            const auto fill = readSvgAsset(result.value("fill_svg").toString(), folder->filePath("cache"), &error);
+            if (fill.isEmpty()) { report(error); continuePending(); return; }
+            const auto lines = readSvgAsset(result.value("lines_svg").toString(), folder->filePath("cache"), &error);
             if (fill.isEmpty() || lines.isEmpty()) { report(error); continuePending(); return; }
             fillSvg = fill; linesSvg = lines; sourceSize = size;
+            const auto stats = result.value("correction_stats").toObject();
+            correctionSummary = selectedCorrection
+                ? QStringLiteral("主線補正ON: 直線 %1、円 %2、楕円 %3、曲線の簡略化 %4。")
+                    .arg(stats.value("lines").toInt()).arg(stats.value("circles").toInt())
+                    .arg(stats.value("ellipses").toInt()).arg(stats.value("simplified_curves").toInt())
+                : QStringLiteral("主線補正OFF（抽出した元の線）。");
             queueRender(); continuePending();
         });
         child->setProgram(python);
-        child->setArguments({script, "--input", folder->filePath("input.png"), "--cache", folder->filePath("cache"),
-                             "--strength", selectedStrength, "--detail", selectedDetail, "--suppression", QString::number(selectedSuppression)});
+        QStringList arguments{script, "--input", folder->filePath("input.png"), "--cache", folder->filePath("cache"),
+                              "--strength", selectedStrength, "--detail", selectedDetail, "--suppression", QString::number(selectedSuppression)};
+        if (selectedCorrection) arguments << "--correct-lines";
+        child->setArguments(arguments);
         setStatus(QStringLiteral("塗りと主線をベクター化しています…"));
+        const qint64 timeoutSeconds = qMin<qint64>(10800, 300 + qint64(size.width()) * size.height() / 10000);
+        watchdog.setInterval(int(timeoutSeconds * 1000));
         watchdog.start(); child->start(); updateControls(false);
     }
 
@@ -629,7 +716,7 @@ struct Controller::Private {
         if (composedSvg.isEmpty() || busy()) return;
         QSize nativeSize, outputSize; QString error;
         const auto svg = exportDocument(&nativeSize, &error);
-        if (svg.isEmpty() || !validOutputSize(nativeSize, scale->value(), &outputSize, &error)) { report(error); return; }
+        if (svg.isEmpty() || !rasterSize(nativeSize, scale->value(), &outputSize, &error)) { report(error); return; }
         const QString path = QFileDialog::getSaveFileName(panel, QStringLiteral("PNGを保存"), suggestedName("png"), QStringLiteral("PNG画像 (*.png)"));
         if (path.isEmpty()) return;
         if (!maySaveTo(path, &error)) { report(error); return; }
@@ -645,7 +732,7 @@ struct Controller::Private {
             updateControls(false);
         });
         watcher->setFuture(QtConcurrent::run([svg, outputSize, path] {
-            QString error; const auto image = renderSvg(svg, outputSize, &error);
+            QString error; const auto image = rasterizeSvg(svg, outputSize, &error);
             if (image.isNull()) return error;
             writePng(image, path, &error); return error;
         }));
@@ -682,6 +769,7 @@ void Controller::generate() { d->debounce.stop(); d->startJob(); }
 
 void Controller::cancel() {
     ++d->epoch; ++d->renderRevision;
+    if (d->preparationCancelled) d->preparationCancelled->store(true, std::memory_order_relaxed);
     d->debounce.stop(); d->watchdog.stop(); d->rerun = false; d->renderPending = false;
     if (d->process) d->process->kill();
     d->setStatus(QStringLiteral("変換を中止しました。直前の変換結果は保持しています。"));
@@ -704,7 +792,7 @@ void Controller::setShowingResult(bool showing) {
     showing = showing && hasResult() && !d->externalBusy;
     { QSignalBlocker block(d->showResult); d->showResult->setChecked(showing); }
     const bool changed = d->showing != showing; d->showing = showing;
-    if (showing) emit previewReady(d->image, d->composedSvg);
+    if (showing) emit previewReady(d->image, d->composedSvg, d->previewScale->value());
     else if (changed) emit originalRequested();
     emit stateChanged();
 }
@@ -728,8 +816,8 @@ bool Controller::savePng(const QString& path, double scale, QString* error) {
     if (!d->maySaveTo(path, error)) return false;
     QSize nativeSize, size;
     const auto svg = d->exportDocument(&nativeSize, error);
-    if (svg.isEmpty() || !validOutputSize(nativeSize, scale, &size, error)) return false;
-    const auto image = renderSvg(svg, size, error);
+    if (svg.isEmpty() || !rasterSize(nativeSize, scale, &size, error)) return false;
+    const auto image = rasterizeSvg(svg, size, error);
     return !image.isNull() && writePng(image, path, error);
 }
 

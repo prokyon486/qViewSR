@@ -30,7 +30,7 @@ public:
     QMimeData *getMimeData() const;
     QMimeData *getFileDragMimeData(QString *error = nullptr);
     // nullopt selects the original file; an empty image reports export failure.
-    void setDragImageProvider(std::function<std::optional<QImage>()> provider) { dragImageProvider = std::move(provider); }
+    void setDragImageProvider(std::function<std::optional<QImage>(QString*)> provider) { dragImageProvider = std::move(provider); }
     void loadMimeData(const QMimeData *mimeData);
     void loadFile(const QString &fileName);
 
@@ -71,6 +71,7 @@ public:
 
 signals:
     void cancelSlideshow();
+    void vectorRenderingFailed(const QString& error);
 
     void fileChanged();
 
@@ -152,7 +153,7 @@ private:
     bool fileDragPending = false;
     bool fileDragGesture = false;
     QPoint fileDragStart;
-    std::function<std::optional<QImage>()> dragImageProvider;
+    std::function<std::optional<QImage>(QString*)> dragImageProvider;
     qint64 exportedImageKey = 0;
     QString exportedImagePath;
 };

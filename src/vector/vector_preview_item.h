@@ -8,10 +8,10 @@
 #include <QTransform>
 #include <memory>
 
-class QSvgRenderer;
 class QVGraphicsView;
 
 namespace Vector {
+class GeneratedSvgRenderer;
 
 // The pixmap continues to define image geometry for the existing viewer. SVG
 // painting replaces its pixels only while a vector preview is active.
@@ -24,6 +24,7 @@ public:
     // Empty SVG clears the preview. Invalid SVG clears it and returns false.
     bool setVectorPreview(const QByteArray& svg, const QByteArray& displayIcc);
     bool hasVectorPreview() const;
+    QSizeF vectorSourceSize() const;
 
     void paint(QPainter* painter, const QStyleOptionGraphicsItem* option,
                QWidget* widget = nullptr) override;
@@ -32,7 +33,7 @@ private:
     void clearCache();
 
     QVGraphicsView* view_;
-    std::unique_ptr<QSvgRenderer> renderer_;
+    std::unique_ptr<GeneratedSvgRenderer> renderer_;
     QByteArray svg_;
     QByteArray displayIcc_;
     QImage cachedImage_;
@@ -40,6 +41,7 @@ private:
     QRect cachedCrop_;
     QRectF cachedBounds_;
     int cachedRotation_ = 0;
+    bool renderFailed_ = false;
 };
 
 }

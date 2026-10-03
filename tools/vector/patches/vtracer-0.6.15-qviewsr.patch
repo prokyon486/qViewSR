@@ -1,0 +1,1009 @@
+--- a/visioncortex-0.8.10/src/color.rs
++++ b/visioncortex-0.8.10/src/color.rs
+@@ -36,14 +36,14 @@
+     pub b: f64,
+ }
+ 
+-/// RGBA; each channel is 32 bit unsigned
++/// RGBA sums use 64 bits so large image regions retain their average color.
+ #[derive(Copy, Clone, Default, PartialEq, Eq)]
+ pub struct ColorSum {
+-    pub r: u32,
+-    pub g: u32,
+-    pub b: u32,
+-    pub a: u32,
+-    pub counter: u32,
++    pub r: u64,
++    pub g: u64,
++    pub b: u64,
++    pub a: u64,
++    pub counter: u64,
+ }
+ 
+ /// HSV; each channel is 64 bit float
+@@ -259,10 +259,10 @@
+     }
+ 
+     pub fn add(&mut self, color: &Color) {
+-        self.r += color.r as u32;
+-        self.g += color.g as u32;
+-        self.b += color.b as u32;
+-        self.a += color.a as u32;
++        self.r += color.r as u64;
++        self.g += color.g as u64;
++        self.b += color.b as u64;
++        self.a += color.a as u64;
+         self.counter += 1;
+     }
+ 
+@@ -291,3 +291,57 @@
+         self.counter = 0;
+     }
+ }
++
++// qViewSR: regression coverage uses aggregate merges, without allocating a large image.
++#[cfg(test)]
++mod qviewsr_large_color_sum_tests {
++    use super::{Color, ColorSum};
++
++    #[test]
++    fn merging_white_regions_exceeds_the_old_channel_limit() {
++        let mut sum = ColorSum::new();
++        sum.add(&Color::new(255, 255, 255));
++        for _ in 0..25 {
++            let other = sum;
++            sum.merge(&other);
++        }
++        assert_eq!(sum.counter, 33_554_432);
++        assert_eq!(sum.r as u64, 8_556_380_160);
++        assert_eq!(sum.average(), Color::new(255, 255, 255));
++    }
++
++    #[test]
++    fn mixed_regions_keep_their_weighted_average_and_alpha() {
++        let mut white = ColorSum::new();
++        white.add(&Color::new(255, 255, 255));
++        for _ in 0..25 {
++            let other = white;
++            white.merge(&other);
++        }
++        let mut black = ColorSum::new();
++        black.add(&Color::new(0, 0, 0));
++        for _ in 0..24 {
++            let other = black;
++            black.merge(&other);
++        }
++        white.merge(&black);
++        assert_eq!(white.average(), Color::new(170, 170, 170));
++        white.add(&Color::new(255, 255, 255));
++        assert_eq!(white.average(), Color::new(170, 170, 170));
++        white.clear();
++        white.add(&Color::new_rgba(4, 5, 6, 7));
++        assert_eq!(white.average(), Color::new_rgba(4, 5, 6, 7));
++    }
++
++    #[test]
++    fn counter_also_retains_large_merged_regions() {
++        let mut sum = ColorSum::new();
++        sum.add(&Color::new(255, 255, 255));
++        for _ in 0..32 {
++            let other = sum;
++            sum.merge(&other);
++        }
++        assert_eq!(sum.counter as u64, 4_294_967_296);
++        assert_eq!(sum.average(), Color::new(255, 255, 255));
++    }
++}
+--- a/visioncortex-0.8.10/src/color_clusters/runner.rs
++++ b/visioncortex-0.8.10/src/color_clusters/runner.rs
+@@ -89,8 +89,11 @@
+             })
+             .diff(color_diff)
+             .deepen(move |internal: &BuilderImpl, patch: &Cluster, neighbours: &[NeighbourInfo]| {
+-                patch_good(internal, patch, good_min_area, good_max_area) &&
+-                neighbours[0].diff > deepen_diff
++                // BuilderImpl calls this only after checking that neighbours is nonempty.
++                // Both predicates are pure; avoid rasterizing the patch when its color
++                // difference already rules out keeping another layer.
++                neighbours[0].diff > deepen_diff &&
++                patch_good(internal, patch, good_min_area, good_max_area)
+             })
+             .hollow(move |_internal: &BuilderImpl, _patch: &Cluster, neighbours: &[NeighbourInfo]| {
+                 neighbours.len() <= hollow_neighbours
+@@ -129,6 +132,77 @@
+ }
+ 
+ fn patch_good(
++    internal: &BuilderImpl,
++    patch: &Cluster,
++    good_min_area: usize,
++    good_max_area: usize,
++) -> bool {
++    let result = patch_good_sparse(internal, patch, good_min_area, good_max_area);
++    #[cfg(test)]
++    {
++        assert_eq!(result, patch_good_raster(internal, patch, good_min_area, good_max_area),
++            "patch_good changed: area={}, holes={}, merged_into={}",
++            patch.area(), patch.holes.len(), patch.merged_into.0);
++        PATCH_GOOD_COMPARISONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    }
++    result
++}
++
++fn patch_good_sparse(
++    internal: &BuilderImpl,
++    patch: &Cluster,
++    good_min_area: usize,
++    good_max_area: usize,
++) -> bool {
++    if !(good_min_area < patch.area() && patch.area() < good_max_area) {
++        return false;
++    }
++    if good_min_area == 0 {
++        return true;
++    }
++    let owner = internal.cluster_indices[patch.indices[0] as usize];
++    // ZERO also labels discarded key pixels that need not belong to its indices.
++    // Deepened snapshots no longer own their pixels. Keep the old definition
++    // for both, and for any caller passing a separate clone of a cluster.
++    if owner == super::builder::ZERO || patch.merged_into != super::builder::ZERO ||
++        !std::ptr::eq(patch, internal.get_cluster(owner)) {
++        #[cfg(test)] PATCH_GOOD_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        return patch_good_raster(internal, patch, good_min_area, good_max_area);
++    }
++    // Active holes were appended only after these pixels were merged into the
++    // target indices. Removing at least one pixel gives boundary < full area.
++    if !patch.holes.is_empty() {
++        #[cfg(test)] PATCH_GOOD_HOLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        return true;
++    }
++    let width = internal.width as usize;
++    let owners = &internal.cluster_indices;
++    for &pixel in &patch.indices {
++        let pixel = pixel as usize;
++        let x = pixel % width;
++        if x > 0 && x + 1 < width && pixel >= width && pixel + width < owners.len() &&
++            owners[pixel - 1] == owner && owners[pixel + 1] == owner &&
++            owners[pixel - width] == owner && owners[pixel + width] == owner {
++            #[cfg(test)] PATCH_GOOD_INTERIOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            return true;
++        }
++    }
++    #[cfg(test)] PATCH_GOOD_THIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    false
++}
++
++#[cfg(test)]
++static PATCH_GOOD_COMPARISONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++#[cfg(test)]
++static PATCH_GOOD_FALLBACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++#[cfg(test)]
++static PATCH_GOOD_HOLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++#[cfg(test)]
++static PATCH_GOOD_INTERIOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++#[cfg(test)]
++static PATCH_GOOD_THIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++
++fn patch_good_raster(
+     internal: &BuilderImpl,
+     patch: &Cluster,
+     good_min_area: usize,
+@@ -144,3 +218,53 @@
+     }
+     false
+ }
++
++#[cfg(test)]
++mod qviewsr_patch_good_tests {
++    use super::*;
++
++    #[test]
++    fn every_predicate_matches_raster_for_structured_clusters() {
++        for mode in 0..8 {
++            let width = 97usize;
++            let height = 81usize;
++            let mut pixels = Vec::with_capacity(width*height*4);
++            for y in 0..height {
++                for x in 0..width {
++                    let distance = x.min(width-1-x).min(y).min(height-1-y);
++                    let color = match mode {
++                        0 => if (x==y || x+1==y) && x>1 {Color::new(10,10,10)} else {Color::new(240,240,240)},
++                        1 => if x==2 || y==2 || x==width-3 || y==height-3 {Color::new(10,10,10)} else {Color::new(240,240,240)},
++                        2 => if distance%7<2 {Color::new(10,10,10)} else {Color::new(240,240,240)},
++                        3 => { let d = (distance/5) as u8; Color::new(d*21,240-d*19,d*13) },
++                        4 => if x>1 && x<8 && y==2 {Color::new(254,0,254)} else if x==8 && y==2 {Color::new(0,0,0)} else {Color::new(255,0,255)},
++                        5 => if x>1 && x<width-2 && y>1 && y<height-2 {Color::new(20,20,20)} else {Color::new(255,0,255)},
++                        6 => if (x/4+y/3)%2==0 {Color::new(30,30,30)} else {Color::new(220,220,220)},
++                        _ => if x%5==0 || y%5==0 {Color::new(255,0,255)} else {Color::new(20,20,20)},
++                    };
++                    pixels.extend_from_slice(&[color.r,color.g,color.b,color.a]);
++                }
++            }
++            for action in [KeyingAction::Keep,KeyingAction::Discard] {
++                for min in [0,1,4] {
++                    let config=RunnerConfig {
++                        key_color: Color::new(255,0,255), keying_action: action,
++                        good_min_area:min, good_max_area:width*height, is_same_color_a:1,
++                        deepen_diff:8,hollow_neighbours:1,batch_size:97,
++                        ..RunnerConfig::default()
++                    };
++                    let _ = Runner::new(config,ColorImage {pixels:pixels.clone(),width,height}).run();
++                }
++            }
++        }
++        let read=|counter:&std::sync::atomic::AtomicUsize| counter.load(std::sync::atomic::Ordering::Relaxed);
++        assert!(read(&PATCH_GOOD_COMPARISONS)>0);
++        assert!(read(&PATCH_GOOD_FALLBACK)>0);
++        assert!(read(&PATCH_GOOD_HOLES)>0);
++        assert!(read(&PATCH_GOOD_INTERIOR)>0);
++        assert!(read(&PATCH_GOOD_THIN)>0);
++        println!("patch_good old/new comparisons={}, fallback={}, holes={}, interior={}, thin={}",
++            read(&PATCH_GOOD_COMPARISONS),read(&PATCH_GOOD_FALLBACK),read(&PATCH_GOOD_HOLES),
++            read(&PATCH_GOOD_INTERIOR),read(&PATCH_GOOD_THIN));
++    }
++}
+--- a/visioncortex-0.8.10/src/color_clusters/builder.rs
++++ b/visioncortex-0.8.10/src/color_clusters/builder.rs
+@@ -1,4 +1,5 @@
+-use std::collections::HashMap;
++use std::collections::{BTreeMap, HashMap};
++use std::ops::Bound::{Excluded, Unbounded};
+ use crate::{Color, ColorImage};
+ use super::{Cluster, Clusters, ClustersView, container::ClusterIndex, container::ClusterIndexElem};
+ 
+@@ -140,6 +141,7 @@
+     }
+ }
+ 
++#[cfg(test)]
+ struct Area {
+     pub area: usize,
+     pub count: usize,
+@@ -160,7 +162,14 @@
+     pixels: Vec<u8>,           // raw bytes from getImageData; 4 bytes as a pixel
+     clusters: Vec<Cluster>,    // array of clusters
+     pub(crate) cluster_indices: Vec<ClusterIndex>, // the cluster index each pixel belongs to
+-    cluster_areas: Vec<Area>,  // uniquely sorted array of cluster sizes
++    // Historical keys/counts stay available when a merge targets an already
++    // visited area; only the cursor advances. A tree avoids shifting the whole
++    // sorted area vector on every newly produced area.
++    area_counts: BTreeMap<usize, usize>,
++    current_area: Option<usize>,
++    #[cfg(test)]
++    cluster_areas: Vec<Area>, // unchanged scan reference only
++    area_candidates: HashMap<usize, Vec<ClusterIndex>>,
+     clusters_output: Vec<ClusterIndex>, // indices of good clusters
+     stage: u32,
+     iteration: u32,
+@@ -188,7 +197,11 @@
+             pixels: im.pixels,
+             clusters: vec![Cluster::new()],
+             cluster_indices: vec![Default::default(); len / 4],
++            area_counts: BTreeMap::new(),
++            current_area: None,
++            #[cfg(test)]
+             cluster_areas: Vec::new(),
++            area_candidates: HashMap::new(),
+             clusters_output: Vec::new(),
+             stage: 1,
+             iteration: 0,
+@@ -262,7 +275,7 @@
+                 50 * self.iteration / self.cluster_indices.len() as u32
+             },
+             2 => {
+-                50 + 50 * self.iteration / self.cluster_areas.len() as u32
++                50 + 50 * self.iteration / self.area_counts.len() as u32
+             },
+             _ => {
+                 100
+@@ -392,17 +405,105 @@
+             *counts.entry(area).or_insert(0) += 1;
+         }
+ 
+-        let mut areas = counts
+-            .into_iter()
+-            .map(|(k, v)| Area { area: k, count: v })
+-            .collect::<Vec<_>>();
+-
+-        areas.sort_by_key(|a| a.area);
+-
+-        self.cluster_areas = areas;
++        self.area_counts = counts.into_iter().collect();
++        self.current_area = self.area_counts.first_key_value().map(|(&area, _)| area);
++        #[cfg(test)]
++        { self.cluster_areas = self.area_counts.iter()
++            .map(|(&area, &count)| Area { area, count }).collect(); }
++        self.area_candidates.clear();
++        if self.hierarchical != 0 {
++            for (index, cluster) in self.clusters.iter().enumerate() {
++                if cluster.area() > 0 {
++                    self.area_candidates.entry(cluster.area()).or_default()
++                        .push(ClusterIndex(index as ClusterIndexElem));
++                }
++            }
++        }
+     }
+ 
+     fn stage_2(&mut self) -> bool {
++        let Some(cur_area) = self.current_area else { return true; };
++        if self.area_counts[&cur_area] == 0 {
++            self.area_candidates.remove(&cur_area);
++            return self.advance_area(cur_area);
++        }
++
++        let can_discard_pixels = matches!(self.keying_action, KeyingAction::Discard) && self.key != Color::default();
++
++        // Match the original ascending index walk. Merges only enqueue larger
++        // areas, so this bucket is complete before any of its candidates run.
++        let mut candidates = self.area_candidates.remove(&cur_area).unwrap_or_default();
++        candidates.sort_unstable();
++        candidates.dedup();
++        for index in candidates {
++            let mycluster = self.get_cluster(index);
++
++            if mycluster.area() != cur_area {
++                continue;
++            }
++
++            if cur_area > self.hierarchical as usize {
++                self.clusters_output.push(index);
++                continue;
++            }
++
++            let mycolor = mycluster.color();
++            let mut infos: Vec<_> = mycluster
++                .neighbours_internal(self)
++                .iter()
++                .map(|other| NeighbourInfo {
++                    index: *other,
++                    diff: (self.diff)(mycolor, self.get_cluster(*other).color()),
++                })
++                .collect();
++
++            if infos.is_empty() {
++                if self.iteration == self.area_counts.len() as ClusterIndexElem - 1  || can_discard_pixels {
++                    // this is either the final background, or an isolated cluster surrounded by keyed, discarded pixels
++                    self.clusters_output.push(index);
++                }
++                continue;
++            }
++
++            infos.sort_by_key(|info| info.diff as i64 * 65535 + info.index.0 as i64);
++
++            let target = infos[0].index;
++
++            let deepen = if self.hierarchical == HIERARCHICAL_MAX {
++                (self.deepen)(self, self.get_cluster(index), &infos)
++            } else {
++                false
++            };
++            let hollow = (self.hollow)(self, self.get_cluster(index), &infos);
++
++            if deepen {
++                self.clusters_output.push(index);
++            }
++
++            let previous_area = self.clusters[target.0 as usize].area();
++            *self.area_counts.get_mut(&previous_area).unwrap() -= 1;
++            self.merge_cluster_into(index, target, deepen, hollow);
++            let updated_area = self.clusters[target.0 as usize].area();
++            // Old entries become stale as a target grows; the area check above
++            // drops them. A deepened source remains at cur_area and is never
++            // enqueued again, exactly as in the original single pass.
++            self.area_candidates.entry(updated_area).or_default().push(target);
++
++            *self.area_counts.entry(updated_area).or_insert(0) += 1;
++        }
++
++        self.advance_area(cur_area)
++    }
++
++    fn advance_area(&mut self, completed_area: usize) -> bool {
++        self.iteration += 1;
++        self.current_area = self.area_counts.range((Excluded(completed_area), Unbounded))
++            .next().map(|(&area, _)| area);
++        self.current_area.is_none()
++    }
++
++    #[cfg(test)]
++    fn stage_2_scan_reference(&mut self) -> bool {
+         if self.cluster_areas.is_empty() {
+             return true;
+         }
+@@ -568,3 +669,104 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod qviewsr_area_index_tests {
++    use super::*;
++    use crate::color_clusters::{Runner, RunnerConfig};
++
++    fn same_state(a: &BuilderImpl, b: &BuilderImpl) {
++        assert_eq!(a.iteration, b.iteration);
++        assert_eq!(a.area_counts.iter().map(|(&area, &count)| (area, count)).collect::<Vec<_>>(),
++                   b.cluster_areas.iter().map(|x| (x.area, x.count)).collect::<Vec<_>>());
++        assert_eq!(a.current_area, b.cluster_areas.get(b.iteration as usize).map(|entry| entry.area));
++        assert!(a.cluster_indices == b.cluster_indices);
++        assert!(a.clusters_output == b.clusters_output);
++        assert_eq!(a.clusters.len(), b.clusters.len());
++        for (left, right) in a.clusters.iter().zip(&b.clusters) {
++            assert_eq!(left.indices, right.indices);
++            assert_eq!(left.holes, right.holes);
++            assert_eq!(left.num_holes, right.num_holes);
++            assert_eq!(left.depth, right.depth);
++            assert!(left.sum == right.sum);
++            assert!(left.residue_sum == right.residue_sum);
++            assert_eq!(left.rect, right.rect);
++            assert!(left.merged_into == right.merged_into);
++        }
++    }
++
++    #[test]
++    fn index_matches_original_scan_after_every_area() {
++        let mut stale_seen = false;
++        let mut clones_seen = false;
++        let mut keyed_zero_seen = false;
++        let mut cases = 0;
++        let mut stages = 0;
++        for seed in 0u32..48 {
++            let width = 9 + seed as usize % 17;
++            let height = 7 + seed as usize % 13;
++            let mut random = seed.wrapping_add(893450);
++            let mut pixels = Vec::new();
++            for y in 0..height {
++                for x in 0..width {
++                    random ^= random << 13; random ^= random >> 17; random ^= random << 5;
++                    let rgb = match seed % 4 {
++                        0 => [(random >> 16) as u8, (random >> 8) as u8, random as u8],
++                        1 => [((x/3)*19) as u8, ((y/2)*23) as u8, ((x/4+y/3)*30) as u8],
++                        2 => { let c = if (x+y)%2 == 0 {20} else {240}; [c,c,c] },
++                        _ => { let c = ((x+y)*3) as u8; [c, c/2, 128] },
++                    };
++                    if (x+2*y)%17 == 0 { pixels.extend_from_slice(&[255,0,255,255]); }
++                    else { pixels.extend_from_slice(&[rgb[0],rgb[1],rgb[2],255]); }
++                }
++            }
++            for mode in 0..24 {
++                let build = || {
++                    let config = RunnerConfig {
++                        diagonal: mode % 2 != 0,
++                        hierarchical: match mode % 3 {0 => HIERARCHICAL_MAX, 1 => 64, _ => 0},
++                        batch_size: 13,
++                        good_min_area: if mode % 4 == 0 {0} else {4},
++                        good_max_area: width*height,
++                        is_same_color_a: (mode % 4) as i32,
++                        is_same_color_b: 1,
++                        deepen_diff: if mode % 5 == 0 {0} else {8},
++                        hollow_neighbours: if mode % 2 == 0 {1} else {9999},
++                        key_color: if mode % 4 < 2 {Color::new(255,0,255)} else {Color::default()},
++                        keying_action: if mode % 4 == 0 {KeyingAction::Discard} else {KeyingAction::Keep},
++                    };
++                    BuilderImpl::from(Runner::new(config, ColorImage {pixels: pixels.clone(), width, height}).builder())
++                };
++                let mut a = build();
++                let mut b = build();
++                while !a.stage_1() {}
++                while !b.stage_1() {}
++                a.iteration = 0; b.iteration = 0;
++                same_state(&a, &b);
++                keyed_zero_seen |= a.clusters[0].area() > 0;
++                if a.hierarchical == 0 {
++                    a.stage_1_output(); b.stage_1_output();
++                    same_state(&a, &b);
++                    continue;
++                }
++                loop {
++                    if let Some(area) = a.current_area {
++                        if let Some(candidates) = a.area_candidates.get(&area) {
++                            stale_seen |= candidates.iter().any(|index| a.get_cluster(*index).area()!=area);
++                        }
++                    }
++                    let done_a = a.stage_2(); let done_b = b.stage_2_scan_reference();
++                    same_state(&a, &b);
++                    assert_eq!(done_a, done_b);
++                    stages += 1;
++                    assert!(stages < 1_000_000);
++                    if done_a { break; }
++                }
++                clones_seen |= a.clusters.iter().any(|c| c.area()>0 && c.merged_into != ZERO);
++                cases += 1;
++            }
++        }
++        assert!(stale_seen && clones_seen && keyed_zero_seen);
++        println!("{cases} hierarchical cases, {stages} exact stage comparisons; stale candidates, deepened clones and ZERO covered");
++    }
++}
+--- a/vtracer-0.6.15/Cargo.toml
++++ b/vtracer-0.6.15/Cargo.toml
+@@ -2,3 +2,6 @@
+ 
+ members = ["cmdapp"]
+ resolver = "2"
++
++[patch.crates-io]
++visioncortex = { path = "../visioncortex-0.8.10" }
+--- a/vtracer-0.6.15/Cargo.lock
++++ b/vtracer-0.6.15/Cargo.lock
+@@ -75,12 +75,6 @@
+ version = "1.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+-
+-[[package]]
+-name = "cfg-if"
+-version = "0.1.10"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4785bdd1c96b2a846b2bd7cc02e86b6b3dbf14e7e53446c4f54c92a361040822"
+ 
+ [[package]]
+ name = "cfg-if"
+@@ -110,33 +104,12 @@
+ checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+ 
+ [[package]]
+-name = "console_error_panic_hook"
+-version = "0.1.7"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+-dependencies = [
+- "cfg-if 1.0.4",
+- "wasm-bindgen",
+-]
+-
+-[[package]]
+-name = "console_log"
+-version = "0.2.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e89f72f65e8501878b8a004d5a1afb780987e2ce2b4532c562e367a72c57499f"
+-dependencies = [
+- "log",
+- "wasm-bindgen",
+- "web-sys",
+-]
+-
+-[[package]]
+ name = "crc32fast"
+ version = "1.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+ dependencies = [
+- "cfg-if 1.0.4",
++ "cfg-if",
+ ]
+ 
+ [[package]]
+@@ -206,7 +179,7 @@
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+ dependencies = [
+- "cfg-if 1.0.4",
++ "cfg-if",
+  "js-sys",
+  "libc",
+  "wasi",
+@@ -267,12 +240,6 @@
+ ]
+ 
+ [[package]]
+-name = "itoa"
+-version = "1.0.18"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+-
+-[[package]]
+ name = "jpeg-decoder"
+ version = "0.1.22"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -305,18 +272,6 @@
+ dependencies = [
+  "scopeguard",
+ ]
+-
+-[[package]]
+-name = "log"
+-version = "0.4.29"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+-
+-[[package]]
+-name = "memchr"
+-version = "2.8.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+ 
+ [[package]]
+ name = "memoffset"
+@@ -408,7 +363,7 @@
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
+ dependencies = [
+- "cfg-if 1.0.4",
++ "cfg-if",
+  "libc",
+  "redox_syscall",
+  "smallvec",
+@@ -442,7 +397,7 @@
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e681a6cfdc4adcc93b4d3cf993749a4552018ee0a9b65fc0ccfad74352c72a38"
+ dependencies = [
+- "cfg-if 1.0.4",
++ "cfg-if",
+  "indoc",
+  "libc",
+  "memoffset",
+@@ -559,49 +514,6 @@
+ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+ 
+ [[package]]
+-name = "serde"
+-version = "1.0.228"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
+-dependencies = [
+- "serde_core",
+- "serde_derive",
+-]
+-
+-[[package]]
+-name = "serde_core"
+-version = "1.0.228"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
+-dependencies = [
+- "serde_derive",
+-]
+-
+-[[package]]
+-name = "serde_derive"
+-version = "1.0.228"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
+-dependencies = [
+- "proc-macro2",
+- "quote",
+- "syn 2.0.117",
+-]
+-
+-[[package]]
+-name = "serde_json"
+-version = "1.0.149"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+-dependencies = [
+- "itoa",
+- "memchr",
+- "serde",
+- "serde_core",
+- "zmij",
+-]
+-
+-[[package]]
+ name = "smallvec"
+ version = "1.15.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -688,8 +600,6 @@
+ [[package]]
+ name = "visioncortex"
+ version = "0.8.10"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7c9a7e6cc136c7c79b4adbd311c46c323a19db7baf446822b5f90f84375934e3"
+ dependencies = [
+  "bit-vec",
+  "flo_curves",
+@@ -708,20 +618,6 @@
+ ]
+ 
+ [[package]]
+-name = "vtracer-webapp"
+-version = "0.4.0"
+-dependencies = [
+- "cfg-if 0.1.10",
+- "console_error_panic_hook",
+- "console_log",
+- "serde",
+- "serde_json",
+- "visioncortex",
+- "wasm-bindgen",
+- "web-sys",
+-]
+-
+-[[package]]
+ name = "wasi"
+ version = "0.11.1+wasi-snapshot-preview1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -733,11 +629,9 @@
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "6532f9a5c1ece3798cb1c2cfdba640b9b3ba884f5db45973a6f442510a87d38e"
+ dependencies = [
+- "cfg-if 1.0.4",
++ "cfg-if",
+  "once_cell",
+  "rustversion",
+- "serde",
+- "serde_json",
+  "wasm-bindgen-macro",
+  "wasm-bindgen-shared",
+ ]
+@@ -775,16 +669,6 @@
+ ]
+ 
+ [[package]]
+-name = "web-sys"
+-version = "0.3.91"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "854ba17bb104abfb26ba36da9729addc7ce7f06f5c0f90f3c391f8461cca21f9"
+-dependencies = [
+- "js-sys",
+- "wasm-bindgen",
+-]
+-
+-[[package]]
+ name = "weezl"
+ version = "0.1.12"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -817,9 +701,3 @@
+ version = "0.2.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+-
+-[[package]]
+-name = "zmij"
+-version = "1.0.21"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+--- a/vtracer-0.6.15/pyproject.toml
++++ b/vtracer-0.6.15/pyproject.toml
+@@ -1,12 +1,12 @@
+ [project]
+ name = "vtracer"
+-version = "0.6.15"
++version = "0.6.15+qviewsr.4"
+ description = "Python bindings for the Rust Vtracer raster-to-vector library"
+ authors = [ { name = "Chris Tsang",  email = "chris.2y3@outlook.com" } ]
+ readme = "vtracer/README.md"
+ requires-python = ">=3.7"
+ license = "MIT"
+-license-files = ["LICENSE"]
++license-files = ["LICENSE", "LICENSES/*"]
+ classifiers = [
+     "Programming Language :: Rust",
+     "Programming Language :: Python :: Implementation :: CPython",
+--- a/vtracer-0.6.15/vtracer/__init__.py
++++ b/vtracer-0.6.15/vtracer/__init__.py
+@@ -1,2 +1,5 @@
+ from .vtracer import (convert_image_to_svg_py, convert_pixels_to_svg,
+                       convert_raw_image_to_svg)
++
++# Local distribution marker; also recorded in importlib.metadata for cache keys.
++__qviewsr_patch__ = "large-color-sums-area-tree-parallel-sparse-v4"
+--- a/vtracer-0.6.15/cmdapp/src/config.rs
++++ b/vtracer-0.6.15/cmdapp/src/config.rs
+@@ -34,6 +34,7 @@
+     pub max_iterations: usize,
+     pub splice_threshold: i32,
+     pub path_precision: Option<u32>,
++    pub num_threads: Option<usize>,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -49,6 +50,7 @@
+     pub max_iterations: usize,
+     pub splice_threshold: f64,
+     pub path_precision: Option<u32>,
++    pub num_threads: Option<usize>,
+ }
+ 
+ impl Default for Config {
+@@ -65,6 +67,7 @@
+             splice_threshold: 45,
+             max_iterations: 10,
+             path_precision: Some(2),
++            num_threads: None,
+         }
+     }
+ }
+@@ -121,6 +124,7 @@
+                 max_iterations: 10,
+                 splice_threshold: 45,
+                 path_precision: Some(2),
++                num_threads: None,
+             },
+             Preset::Poster => Self {
+                 color_mode: ColorMode::Color,
+@@ -134,6 +138,7 @@
+                 max_iterations: 10,
+                 splice_threshold: 45,
+                 path_precision: Some(2),
++                num_threads: None,
+             },
+             Preset::Photo => Self {
+                 color_mode: ColorMode::Color,
+@@ -147,6 +152,7 @@
+                 max_iterations: 10,
+                 splice_threshold: 45,
+                 path_precision: Some(2),
++                num_threads: None,
+             },
+         }
+     }
+@@ -164,6 +170,7 @@
+             max_iterations: self.max_iterations,
+             splice_threshold: deg2rad(self.splice_threshold),
+             path_precision: self.path_precision,
++            num_threads: self.num_threads,
+         }
+     }
+ }
+--- a/vtracer-0.6.15/cmdapp/src/converter.rs
++++ b/vtracer-0.6.15/cmdapp/src/converter.rs
+@@ -1,8 +1,10 @@
+ use std::path::Path;
+-use std::{fs::File, io::Write};
++use std::{fs::File, io::{Write, BufWriter}};
+ 
+ use super::config::{ColorMode, Config, ConverterConfig, Hierarchical};
+-use super::svg::SvgFile;
++use super::svg::{SvgFile, SvgPath};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::time::Instant;
+ use fastrand::Rng;
+ use visioncortex::color_clusters::{KeyingAction, Runner, RunnerConfig, HIERARCHICAL_MAX};
+ use visioncortex::{Color, ColorImage, ColorName};
+@@ -27,9 +29,14 @@
+     output_path: &Path,
+     config: Config,
+ ) -> Result<(), String> {
++    let started = Instant::now();
+     let img = read_image(input_path)?;
++    profile("read", started, 0, 0);
+     let svg = convert(img, config)?;
+-    write_svg(svg, output_path)
++    let started = Instant::now();
++    let result = write_svg(svg, output_path);
++    profile("write", started, 0, 0);
++    result
+ }
+ 
+ fn color_exists_in_image(img: &ColorImage, color: Color) -> bool {
+@@ -135,6 +142,7 @@
+         img,
+     );
+ 
++    let cluster_started = Instant::now();
+     let mut clusters = runner.run();
+ 
+     match config.hierarchical {
+@@ -164,20 +172,56 @@
+ 
+     let view = clusters.view();
+ 
++    profile("clusters", cluster_started, view.clusters_output.len(), 1);
++    let path_started = Instant::now();
++    let indices: Vec<_> = view.clusters_output.iter().rev().copied().collect();
++    let available = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1);
++    let override_workers = config.num_threads;
++    let default_workers = if width.saturating_mul(height) < 262144 { 1 } else { available };
++    let workers = override_workers.unwrap_or(default_workers).min(16).min(available)
++        .min(indices.len().max(1)).max(1);
++    let make_path = |position: usize| {
++        let cluster = view.get_cluster(indices[position]);
++        SvgPath {
++            path: cluster.to_compound_path(
++                &view, false, config.mode, config.corner_threshold,
++                config.length_threshold, config.max_iterations, config.splice_threshold,
++            ),
++            color: cluster.residue_color(),
++        }
++    };
+     let mut svg = SvgFile::new(width, height, config.path_precision);
+-    for &cluster_index in view.clusters_output.iter().rev() {
+-        let cluster = view.get_cluster(cluster_index);
+-        let paths = cluster.to_compound_path(
+-            &view,
+-            false,
+-            config.mode,
+-            config.corner_threshold,
+-            config.length_threshold,
+-            config.max_iterations,
+-            config.splice_threshold,
+-        );
+-        svg.add_path(paths, cluster.residue_color());
+-    }
++    if workers == 1 {
++        svg.paths = (0..indices.len()).map(make_path).collect();
++    } else {
++        // Cluster state is immutable. Workers keep only private path data and
++        // return its original position; the SVG draw order is preserved below.
++        let next = AtomicUsize::new(0);
++        let parts = std::thread::scope(|scope| {
++            let mut handles = Vec::with_capacity(workers);
++            for _ in 0..workers {
++                let make_path = &make_path;
++                let next = &next;
++                let length = indices.len();
++                handles.push(scope.spawn(move || {
++                    let mut results = Vec::new();
++                    loop {
++                        let index = next.fetch_add(1, Ordering::Relaxed);
++                        if index >= length { break; }
++                        results.push((index, make_path(index)));
++                    }
++                    results
++                }));
++            }
++            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
++        });
++        let mut ordered = vec![None; indices.len()];
++        for part in parts {
++            for (position, path) in part { ordered[position] = Some(path); }
++        }
++        svg.paths = ordered.into_iter().map(Option::unwrap).collect();
++    }
++    profile("paths", path_started, indices.len(), workers);
+ 
+     Ok(svg)
+ }
+@@ -226,12 +270,21 @@
+ 
+ fn write_svg(svg: SvgFile, output_path: &Path) -> Result<(), String> {
+     let out_file = File::create(output_path);
+-    let mut out_file = match out_file {
++    let out_file = match out_file {
+         Ok(file) => file,
+         Err(_) => return Err(String::from("Cannot create output file.")),
+     };
+ 
+-    write!(&mut out_file, "{}", svg).expect("failed to write file.");
++    let mut out_file = BufWriter::with_capacity(64 * 1024, out_file);
++    write!(&mut out_file, "{}", svg).map_err(|error| format!("Cannot write SVG: {}", error))?;
++    out_file.flush().map_err(|error| format!("Cannot flush SVG: {}", error))?;
+ 
+     Ok(())
+ }
++
++fn profile(stage: &str, started: Instant, clusters: usize, workers: usize) {
++    if std::env::var_os("QVIEWSR_VTRACER_PROFILE").is_some() {
++        eprintln!("qviewsr_vtracer stage={} seconds={:.6} clusters={} workers={}",
++            stage, started.elapsed().as_secs_f64(), clusters, workers);
++    }
++}
+--- a/vtracer-0.6.15/cmdapp/src/python.rs
++++ b/vtracer-0.6.15/cmdapp/src/python.rs
+@@ -8,6 +8,7 @@
+ /// Python binding
+ #[pyfunction]
+ fn convert_image_to_svg_py(
++    py: Python<'_>,
+     image_path: &str,
+     out_path: &str,
+     colormode: Option<&str>,       // "color" or "binary"
+@@ -21,11 +22,12 @@
+     max_iterations: Option<usize>, // default: 10
+     splice_threshold: Option<i32>, // default: 45
+     path_precision: Option<u32>,   // default: 8
++    num_threads: Option<usize>,   // qViewSR: None=auto, 1..16=explicit budget
+ ) -> PyResult<()> {
+     let input_path = PathBuf::from(image_path);
+     let output_path = PathBuf::from(out_path);
+ 
+-    let config = construct_config(
++    let mut config = construct_config(
+         colormode,
+         hierarchical,
+         mode,
+@@ -39,7 +41,12 @@
+         path_precision,
+     );
+ 
+-    convert_image_to_svg(&input_path, &output_path, config).unwrap();
++    if matches!(num_threads, Some(0)) || num_threads.unwrap_or(1) > 16 {
++        return Err(pyo3::exceptions::PyValueError::new_err("num_threads must be between 1 and 16"));
++    }
++    config.num_threads = num_threads;
++    py.allow_threads(|| convert_image_to_svg(&input_path, &output_path, config))
++        .map_err(PyException::new_err)?;
+     Ok(())
+ }
+ 

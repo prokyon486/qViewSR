@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vector_preview_item.h"
+#include "generated_svg_renderer.h"
 
 #include "qvgraphicsview.h"
 #include "sr/color_pipeline.h"
 #include <QColorSpace>
 #include <QPainter>
 #include <QStyleOptionGraphicsItem>
-#include <QSvgRenderer>
 #include <QWidget>
 #include <cmath>
+#include <limits>
 
 namespace Vector {
 namespace {
@@ -42,6 +43,7 @@ void PreviewItem::clearCache()
 {
     cachedImage_ = QImage();
     cachedCrop_ = QRect();
+    renderFailed_ = false;
 }
 
 bool PreviewItem::setVectorPreview(const QByteArray& svg, const QByteArray& displayIcc)
@@ -58,11 +60,14 @@ bool PreviewItem::setVectorPreview(const QByteArray& svg, const QByteArray& disp
         return true;
 
     if (!renderer_ || svg != svg_) {
-        auto renderer = std::make_unique<QSvgRenderer>(svg);
+        auto renderer = std::make_unique<GeneratedSvgRenderer>(svg);
         const QRectF box = renderer->viewBoxF();
         if (!renderer->isValid() || box.isEmpty() || !finiteRect(box)
-            || box.width() > maxCropSide || box.height() > maxCropSide) {
+            || box.width() > std::numeric_limits<int>::max() || box.height() > std::numeric_limits<int>::max()) {
             setVectorPreview({}, {});
+            if (view_) QMetaObject::invokeMethod(view_, "vectorRenderingFailed", Qt::QueuedConnection,
+                Q_ARG(QString, renderer->errorString().isEmpty()
+                    ? QStringLiteral("生成SVGの描画範囲が不正です。") : renderer->errorString()));
             return false;
         }
         renderer_ = std::move(renderer);
@@ -79,11 +84,19 @@ bool PreviewItem::hasVectorPreview() const
     return bool(renderer_);
 }
 
+QSizeF PreviewItem::vectorSourceSize() const
+{
+    if (!renderer_) return {};
+    QSizeF size = renderer_->viewBoxF().size();
+    if (view_ && view_->getImageCore().getCurrentRotation() % 180 != 0) size.transpose();
+    return size;
+}
+
 void PreviewItem::paint(QPainter* painter, const QStyleOptionGraphicsItem* option,
                         QWidget* widget)
 {
     const auto rasterFallback = [&] { QGraphicsPixmapItem::paint(painter, option, widget); };
-    if (!renderer_) {
+    if (!renderer_ || renderFailed_) {
         rasterFallback();
         return;
     }
@@ -145,12 +158,13 @@ void PreviewItem::paint(QPainter* painter, const QStyleOptionGraphicsItem* optio
             * QTransform::fromScale(bounds.width() / rotatedBounds.width(),
                                     bounds.height() / rotatedBounds.height())
             * QTransform::fromTranslate(bounds.left(), bounds.top());
-        {
-            QPainter renderPainter(&image);
-            renderPainter.setRenderHints(QPainter::Antialiasing | QPainter::TextAntialiasing);
-            renderPainter.setWorldTransform(svgToItem * deviceTransform
-                * QTransform::fromTranslate(-crop.left(), -crop.top()));
-            renderer_->render(&renderPainter, box);
+        QString error;
+        if (!renderer_->render(image, svgToItem * deviceTransform
+            * QTransform::fromTranslate(-crop.left(), -crop.top()), &error)) {
+            renderFailed_ = true;
+            if (view_) QMetaObject::invokeMethod(view_, "vectorRenderingFailed", Qt::QueuedConnection, Q_ARG(QString, error));
+            rasterFallback();
+            return;
         }
 
         if (!displayIcc_.isEmpty()) {

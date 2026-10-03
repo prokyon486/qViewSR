@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "sr_controller.h"
+#include "vector/vector_controller.h"
+#include <QSvgRenderer>
 #include "color_pipeline.h"
 #include "gif_export.h"
 #include "mainwindow.h"
@@ -226,12 +228,29 @@ Controller::Controller(MainWindow* window,QVGraphicsView* view)
     connect(settings_,&QAction::triggered,this,&Controller::showSettings);
     connect(&view_->getImageCore(),&QVImageCore::sourceChanging,this,&Controller::invalidate);
     connect(view_,&QVGraphicsView::fileChanged,this,&Controller::sourceLoaded);
-    view_->setDragImageProvider([this]() -> std::optional<QImage> {
+    view_->setDragImageProvider([this](QString* dragError) -> std::optional<QImage> {
         // Export the full-resolution sRGB result/current animation frame, never
         // the monitor-profile pixels or the zoomed/cropped viewport.
         if (!showingSr_ && externalPreview_.isNull()) return std::nullopt;
         if (!sourceReady_) return QImage();
-        auto image = view_->getImageCore().matchCurrentRotation(externalPreview_.isNull() ? result_ : externalPreview_);
+        QImage transfer = externalPreview_.isNull() ? result_ : externalPreview_;
+        if (!externalPreviewSvg_.isEmpty()) {
+            if (externalVectorExport_.isNull()) {
+                QSvgRenderer renderer(externalPreviewSvg_);
+                QSize size; QString error;
+                if (!Vector::rasterSize(renderer.defaultSize(), externalVectorTransferScale_, &size, &error)) {
+                    if (dragError) *dragError = error;
+                    setStatus(error); return QImage();
+                }
+                externalVectorExport_ = Vector::rasterizeSvg(externalPreviewSvg_, size, &error);
+                if (externalVectorExport_.isNull()) {
+                    if (dragError) *dragError = error;
+                    setStatus(error); return QImage();
+                }
+            }
+            transfer = externalVectorExport_;
+        }
+        auto image = view_->getImageCore().matchCurrentRotation(transfer);
         const auto transform = view_->transform();
         image = image.mirrored(transform.m11() < 0, transform.m22() < 0);
         // Qt 6.4 can lose the color-space metadata on transformed images.
@@ -278,16 +297,18 @@ void Controller::setFullscreen(bool fullscreen) {
 void Controller::setExternalPreview(const QImage& image) {
     setExternalVectorPreview(image, {});
 }
-void Controller::setExternalVectorPreview(const QImage& image, const QByteArray& svg) {
+void Controller::setExternalVectorPreview(const QImage& image, const QByteArray& svg, double transferScale) {
     if (image.isNull() || isBusy() || !sourceReady_ || hasAnimation() ||
         view_->getImageCore().isAnimationFrozenForSr() || view_->getCurrentFileDetails().isMovieLoaded ||
         view_->getCurrentFileDetails().isModelDocument) return;
     animationTimer_.stop(); animationPlaying_=false;
-    externalPreview_=image; externalPreviewSvg_=svg; showingSr_=false;
+    if (svg != externalPreviewSvg_ || transferScale != externalVectorTransferScale_)
+        externalVectorExport_ = {};
+    externalPreview_=image; externalPreviewSvg_=svg; externalVectorTransferScale_=transferScale; showingSr_=false;
     display(); updateActions();
 }
 void Controller::clearExternalPreview() {
-    externalPreview_={}; externalPreviewSvg_.clear(); showingSr_=false;
+    externalPreview_={}; externalPreviewSvg_.clear(); externalVectorExport_={}; showingSr_=false;
     view_->setVectorPreview({}, {});
     emit externalPreviewCleared();
     display(); updateActions();
@@ -307,7 +328,7 @@ void Controller::invalidate() {
     animationTimer_.stop(); animationPlaying_=false; animationIndex_=0; animationLoopsDone_=0; animationEnded_=false;
     originalAnimation_.reset(); resultAnimation_.reset(); originalDisplayFrames_.clear(); resultDisplayFrames_.clear(); animationDisplayProfile_.clear();
     ++generation_; sourceReady_=false; result_={}; showingSr_=false; resultSummary_.clear();
-    externalPreview_={}; externalPreviewSvg_.clear(); view_->setVectorPreview({}, {}); emit externalPreviewCleared();
+    externalPreview_={}; externalPreviewSvg_.clear(); externalVectorExport_={}; view_->setVectorPreview({}, {}); emit externalPreviewCleared();
     resultScale_=1.0; resultSteps_.clear();
     cancel(); updateActions();
 }
@@ -370,7 +391,9 @@ void Controller::display(bool updateStatus) {
     view_->setDisplayImagePreservingView(image);
     view_->setVectorPreview(externalPreview_.isNull() ? QByteArray() : externalPreviewSvg_, destination);
     if(updateStatus && !isBusy()) {
-        QString summary=!externalPreview_.isNull()?QStringLiteral("ベクター調整結果 · %1×%2").arg(externalPreview_.width()).arg(externalPreview_.height()):
+        QString summary=!externalPreview_.isNull()?(externalPreviewSvg_.isEmpty()
+            ?QStringLiteral("ベクター調整結果 · %1×%2").arg(externalPreview_.width()).arg(externalPreview_.height())
+            :QStringLiteral("SVGベクター表示")):
             showingSr_?QStringLiteral("SR ×%1（%2回） · %3×%4").arg(scaleText(resultScale_)).arg(resultSteps_.size()).arg(result_.width()).arg(result_.height()):
                               QStringLiteral("元画像 · ")+view_->getImageCore().getSourceProfile().description;
         if(hasAnimation()) summary+=QStringLiteral(" · GIF %1フレーム · %2").arg(animationFrameCount()).arg(animationPlaying_?QStringLiteral("再生中"):QStringLiteral("一時停止"));
@@ -391,7 +414,7 @@ void Controller::startJob(bool fromResult) {
         emit failed(status_->text()); return;
     }
     // Also cancel a pending vector render: it must not overwrite a later SR result.
-    externalPreview_={}; externalPreviewSvg_.clear(); view_->setVectorPreview({}, {}); emit externalPreviewCleared();
+    externalPreview_={}; externalPreviewSvg_.clear(); externalVectorExport_={}; view_->setVectorPreview({}, {}); emit externalPreviewCleared();
     const auto path=view_->getCurrentFileDetails().fileInfo.absoluteFilePath();
     const bool animated=hasAnimation() || (view_->getCurrentFileDetails().isMovieLoaded && QImageReader::imageFormat(path)=="gif");
     if(!animated) {
