@@ -73,6 +73,7 @@ struct Rendered {
     QImage image;
     QString error;
     std::shared_ptr<EditDocument> editable;
+    std::shared_ptr<GeneratedSvgRenderer> renderer;
 };
 
 QString repositoryRoot() {
@@ -103,10 +104,8 @@ bool rasterSize(QSize source, double scale, QSize* size, QString* error) {
     return true;
 }
 
-QImage rasterizeSvg(const QByteArray& svg, QSize size, QString* error) {
-    const auto memoryError = svgMemoryError(quint64(svg.size()));
-    if (!memoryError.isEmpty()) { if (error) *error = memoryError; return {}; }
-    GeneratedSvgRenderer renderer(svg);
+namespace {
+QImage rasterizePreparedSvg(GeneratedSvgRenderer& renderer, QSize size, QString* error) {
     if (!renderer.isValid()) {
         if (error) *error = renderer.errorString();
         return {};
@@ -124,6 +123,14 @@ QImage rasterizeSvg(const QByteArray& svg, QSize size, QString* error) {
     if (!renderer.render(image, transform, error)) return {};
     return image;
 }
+}
+
+QImage rasterizeSvg(const QByteArray& svg, QSize size, QString* error) {
+    const auto memoryError = svgMemoryError(quint64(svg.size()));
+    if (!memoryError.isEmpty()) { if (error) *error = memoryError; return {}; }
+    GeneratedSvgRenderer renderer(svg);
+    return rasterizePreparedSvg(renderer, size, error);
+}
 
 namespace {
 Rendered previewDocument(const QByteArray& svg, QSize size, double previewScale) {
@@ -136,7 +143,13 @@ Rendered previewDocument(const QByteArray& svg, QSize size, double previewScale)
         double(MaxProxySide) / qMax(size.width(), size.height())));
     const QSize proxySize(qMax(1, int(std::floor(size.width() * proxyScale))),
                           qMax(1, int(std::floor(size.height() * proxyScale))));
-    output.image = rasterizeSvg(svg, proxySize, &output.error);
+    output.renderer = std::make_shared<GeneratedSvgRenderer>(svg);
+    output.image = rasterizePreparedSvg(*output.renderer, proxySize, &output.error);
+    // The view reuses this parsed document instead of parsing the same SVG
+    // again on the GUI thread. All rendering after handoff happens there.
+    if (output.error.isEmpty() && !output.renderer->moveToThread(QCoreApplication::instance()->thread(), &output.error))
+        output.image = {};
+    if (!output.error.isEmpty()) output.renderer.reset();
     return output;
 }
 
@@ -301,6 +314,7 @@ struct Controller::Private {
     QByteArray stdoutBytes, stderrBytes, fillSvg, linesSvg, composedSvg;
     QSize sourceSize;
     QImage image;
+    std::shared_ptr<GeneratedSvgRenderer> displayRenderer;
     QString correctionSummary, resultInputDescription;
     qint64 inputCacheKey = 0;
     QByteArray inputProfileIcc;
@@ -451,7 +465,7 @@ struct Controller::Private {
         editEyedropper = toolButton(QStringLiteral("スポイト"), "vectorToolEyedropper", Editor::Tool::Eyedropper);
         editSelect->setChecked(true);
         editPen->setToolTip(QStringLiteral("主線: 節点を追加し、右クリックで最後の節点まで確定。色面: 選択色で塗り、離すと輪郭をベクター化します。"));
-        editEraser->setToolTip(QStringLiteral("主線: ブラシに重なる区間を切断。色面: 部分消去し、離すと輪郭を作り直します。"));
+        editEraser->setToolTip(QStringLiteral("主線: ブラシに重なる区間を切断。色面: 選択・変形で選んだ1面だけを部分消去します。"));
         editErasePaths->setToolTip(QStringLiteral("従来の消しゴム。選択レイヤーの触れたパス全体を削除します。"));
         editEyedropper->setToolTip(QStringLiteral("表示中の画像から色を採取します。採取後にパレットをクリックすると、その枠の色を置き換えます。"));
         edits->addRow(QStringLiteral("ツールボックス"), toolbox);
@@ -593,7 +607,7 @@ struct Controller::Private {
                                       QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes) owner->discardEdits();
         });
         QObject::connect(editor, &Editor::changed, owner, [this](const QByteArray& svg) {
-            edited = svg != editInitialSvg; composedSvg = svg; queueRender(); updateControls(false);
+            edited = svg != editInitialSvg; composedSvg = svg; displayRenderer.reset(); queueRender(); updateControls(false);
         });
         QObject::connect(editor, &Editor::stateChanged, owner, [this] { updateControls(false); });
         QObject::connect(editor, &Editor::message, owner, [this](const QString& text) { setStatus(text); });
@@ -835,7 +849,7 @@ struct Controller::Private {
             : QStringLiteral("選択色で色面を塗ります。マウスを離すと輪郭を計算してベクターへ戻します。");
         else if (erasing) help = lineLayer
             ? QStringLiteral("ブラシに重なる線の区間を切断します。残った曲線の形を保持し、切断点にも節点とハンドルを作ります。")
-            : QStringLiteral("色面を部分消去し、マウスを離すと輪郭を作り直します。面を横切って消すと分断できます。");
+            : QStringLiteral("選択・変形で選んだ色面だけを消します。重なったほかの面は保持し、マウスを離すと選択面の輪郭を作り直します。");
         else if (deleting) help = QStringLiteral("触れたパス全体を消去します。非表示のレイヤーは対象外です。");
         else if (tool == Editor::Tool::Eyedropper) help = QStringLiteral("画像をクリックして色を採取します。そのままパレットの枠をクリックすると、採取色で置き換えます。");
         else help = lineLayer ? QStringLiteral("線を選び、節点や丸いハンドルをドラッグします。パレットで選択した線の色を変更できます。")
@@ -881,7 +895,7 @@ struct Controller::Private {
         owner->cancel();
         editor->reset(); edited = false; startingEditor = false;
         editBaseSvg.clear(); editInitialSvg.clear(); editBaseImage = {};
-        fillSvg.clear(); linesSvg.clear(); composedSvg.clear(); image = {}; sourceSize = {};
+        fillSvg.clear(); linesSvg.clear(); composedSvg.clear(); image = {}; displayRenderer.reset(); sourceSize = {};
         workspace.reset(); generated = false; showing = false;
         inputCacheKey = 0; inputProfileIcc.clear();
         correctionSummary.clear(); resultInputDescription.clear();
@@ -926,7 +940,7 @@ struct Controller::Private {
             }
             if (!error.isEmpty()) { report(error); updateControls(false); return; }
             if (!edited) editInitialSvg = editor->svg();
-            composedSvg = result.svg; image = result.image;
+            composedSvg = result.svg; image = result.image; displayRenderer = result.renderer;
             editor->setLayer(editLayer->currentData() == "fill" ? EditDocument::Layer::Fill : EditDocument::Layer::Lines);
             editor->setBrushRadius(pixelValue(brushRadius));
             editor->setLineWidth(pixelValue(editLineWidth));
@@ -954,7 +968,7 @@ struct Controller::Private {
         // Leaving a session without edits restores the original layer visibility.
         if (!edited && !editBaseSvg.isEmpty()) {
             ++renderRevision; renderPending = false;
-            composedSvg = editBaseSvg; image = editBaseImage;
+            composedSvg = editBaseSvg; image = editBaseImage; displayRenderer.reset();
             editBaseSvg.clear(); editInitialSvg.clear(); editBaseImage = {};
             if (showing) emit owner->previewReady(image, composedSvg, previewScale->value());
         }
@@ -979,8 +993,8 @@ struct Controller::Private {
             if (renderEpoch == epoch && revision == renderRevision && !externalBusy) {
                 if (!result.error.isEmpty()) report(result.error);
                 else {
-                    image = result.image; composedSvg = result.svg;
-                    if (showResult->isChecked()) { showing = true; emit owner->previewReady(image, composedSvg, previewScale->value()); }
+                    image = result.image; composedSvg = result.svg; displayRenderer = result.renderer;
+                    if (showResult->isChecked()) { showing = true; emit owner->previewReady(image, composedSvg, previewScale->value(), displayRenderer); }
                     if (editor->active())
                         setStatus(QStringLiteral("編集結果: %1×%2px。表示中のレイヤーをPNGに保存します。\nSVGは非表示の図形も含めて保持します。Space＋ドラッグで画像移動。")
                                   .arg(sourceSize.width()).arg(sourceSize.height()));
@@ -1246,7 +1260,7 @@ void Controller::setShowingResult(bool showing) {
     if (!showing) d->endEditing();
     { QSignalBlocker block(d->showResult); d->showResult->setChecked(showing); }
     const bool changed = d->showing != showing; d->showing = showing;
-    if (showing) emit previewReady(d->image, d->composedSvg, d->previewScale->value());
+    if (showing) emit previewReady(d->image, d->composedSvg, d->previewScale->value(), d->displayRenderer);
     else if (changed) emit originalRequested();
     emit stateChanged();
 }
@@ -1261,7 +1275,7 @@ void Controller::discardEdits() {
     if (!d->edited) return;
     d->edited = false;
     d->editor->reset();
-    d->composedSvg = d->editBaseSvg; d->image = d->editBaseImage;
+    d->composedSvg = d->editBaseSvg; d->image = d->editBaseImage; d->displayRenderer.reset();
     d->editBaseSvg.clear(); d->editInitialSvg.clear(); d->editBaseImage = {};
     ++d->renderRevision; d->renderPending = false;
     if (d->showing) emit previewReady(d->image, d->composedSvg, d->previewScale->value());

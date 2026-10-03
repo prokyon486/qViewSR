@@ -649,9 +649,10 @@ void QVGraphicsView::updateLoadedPixmapItem()
     emit updatedLoadedPixmapItem();
 }
 
-bool QVGraphicsView::setVectorPreview(const QByteArray &svg, const QByteArray &displayIcc)
+bool QVGraphicsView::setVectorPreview(const QByteArray &svg, const QByteArray &displayIcc,
+                                    std::shared_ptr<Vector::GeneratedSvgRenderer> renderer)
 {
-    const bool accepted = loadedPixmapItem->setVectorPreview(svg, displayIcc);
+    const bool accepted = loadedPixmapItem->setVectorPreview(svg, displayIcc, std::move(renderer));
     if (hasVectorPreview()) expensiveScaleTimerNew->stop();
     viewport()->update();
     return accepted;

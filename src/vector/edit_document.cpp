@@ -7,6 +7,7 @@
 #include <QHash>
 #include <QPainterPathStroker>
 #include <QPainter>
+#include <QSet>
 #include <QRegularExpression>
 #include <QStringList>
 #include <algorithm>
@@ -229,8 +230,8 @@ void makeCubic(QPointF from, Segment& segment) {
     segment.c2 = from + (segment.end - from) * (2. / 3.);
     segment.cubic = true;
 }
-void clearTouched(QVector<Shape>& shapes) {
-    for (auto& shape : shapes) for (auto& sub : shape.subpaths) {
+void clearTouched(Shape& shape) {
+    for (auto& sub : shape.subpaths) {
         sub.startTouched = false;
         for (auto& segment : sub.segments) segment.touched = false;
     }
@@ -302,6 +303,9 @@ ClippedSegment retainedInterval(QPointF from, const Segment& source, double begi
 }
 
 bool pathToSubpaths(const QPainterPath& path, QPointF offset, QVector<Subpath>* output, QString* error) {
+    // Qt can leave a lone MoveTo in an empty boolean result. It is not a
+    // surviving face and must not prevent complete erasure from removing it.
+    if (path.isEmpty()) return true;
     if (path.elementCount() > MaxSegments * 3LL) {
         *error = QStringLiteral("塗りの境界が編集可能な点数を超えています。"); return false;
     }
@@ -436,6 +440,11 @@ struct EditDocument::Private {
     QByteArray before;
     QList<QByteArray> undo, redo;
     bool editing = false;
+    bool dirty = false;
+    QSet<int> touchedShapes;
+    mutable QVector<int> previewCandidates;
+    mutable QRectF previewCandidateBounds;
+    mutable bool previewCandidatesValid = false;
     int segments = 0;
 
     bool read(const QByteArray& input, QString* error) {
@@ -516,7 +525,39 @@ struct EditDocument::Private {
         if (bytes.isEmpty()) bytes = document.toByteArray(-1);
         return bytes;
     }
-    void changed() { bytes.clear(); }
+    void changed(bool boundsChanged = true) {
+        // Mark before mutating the DOM/geometry: an allocation failure during
+        // the mutation must still let cancelEdit restore the saved document.
+        bytes.clear();
+        dirty = true;
+        if (boundsChanged) previewCandidatesValid = false;
+    }
+    void resetTouched() {
+        for (int index : touchedShapes)
+            if (index >= 0 && index < shapes.size()) clearTouched(shapes[index]);
+        touchedShapes.clear();
+    }
+    bool editableFill(int index) const {
+        return visible[1] && valid(index) && shapes[index].visible && shapes[index].layer == Layer::Fill;
+    }
+    const QVector<int>& nearbyShapes(const QRectF& bounds, double scale) const {
+        if (previewCandidatesValid && previewCandidateBounds.contains(bounds)) return previewCandidates;
+        // Most pointer moves stay in this padded region. Reuse its candidates
+        // instead of scanning a million paths twice for every preview frame.
+        const double padding = qMax(128., 128. / qMax(scale, .000001));
+        previewCandidateBounds = bounds.adjusted(-padding, -padding, padding, padding);
+        previewCandidates.clear();
+        for (int index : paintOrder) {
+            const auto& shape = shapes[index];
+            if (shape.deleted || !shape.visible || !visible[layerIndex(shape.layer)]) continue;
+            // Fill hit tests also use a narrow outline at zero tolerance.
+            const double width = shape.strokeWidth;
+            if (shape.geometry.controlPointRect().adjusted(-width, -width, width, width).intersects(previewCandidateBounds))
+                previewCandidates.append(index);
+        }
+        previewCandidatesValid = true;
+        return previewCandidates;
+    }
     void trimHistory() {
         qsizetype total = 0;
         for (const auto& item : undo) total += item.size();
@@ -559,6 +600,7 @@ QByteArray EditDocument::svg() const { return d->data(); }
 QSize EditDocument::size() const { return d->size; }
 QRectF EditDocument::viewBox() const { return QRectF(QPointF(), QSizeF(d->size)); }
 int EditDocument::pathCount() const { return d->shapes.size(); }
+int EditDocument::segmentCount() const { return d->segments; }
 Layer EditDocument::layer(int index) const { return d->valid(index) ? d->shapes[index].layer : Layer::Lines; }
 bool EditDocument::layerVisible(Layer layer) const { return d->visible[layerIndex(layer)]; }
 bool EditDocument::setLayerVisible(Layer layer, bool visible) {
@@ -566,6 +608,7 @@ bool EditDocument::setLayerVisible(Layer layer, bool visible) {
     if (d->visible[slot] == visible || d->document.documentElement().isNull()) return false;
     const bool automatic = !d->editing;
     if (automatic) beginEdit();
+    d->changed();
     if (d->groups[slot].isEmpty()) {
         // Keep an empty hidden layer in the document so newly added paths and
         // undo/redo retain the selected visibility state.
@@ -591,15 +634,17 @@ bool EditDocument::setLayerVisible(Layer layer, bool visible) {
     d->visible[slot] = visible;
     for (auto& shape : d->shapes)
         if (!shape.deleted && shape.layer == layer) shape.visible = paintVisible(shape.element);
-    d->changed();
     if (automatic) commitEdit();
     return true;
 }
 QPainterPath EditDocument::path(int index) const { return d->valid(index) ? d->shapes[index].geometry : QPainterPath(); }
 int EditDocument::hitTest(QPointF point, double tolerance, Layer layer) const {
     if (!layerVisible(layer) || !validPoint(point) || !std::isfinite(tolerance) || tolerance < 0 || tolerance > MaxCoordinate) return -1;
-    for (int order = d->paintOrder.size() - 1; order >= 0; --order) {
-        const int i = d->paintOrder[order];
+    const double radius = qMax(tolerance, .0001);
+    const QRectF query(point - QPointF(radius, radius), QSizeF(radius * 2, radius * 2));
+    const auto& nearby = d->nearbyShapes(query, qMin(1., 7. / radius));
+    for (int order = nearby.size() - 1; order >= 0; --order) {
+        const int i = nearby[order];
         const auto& shape = d->shapes[i];
         if (shape.deleted || !shape.visible || shape.layer != layer) continue;
         const double width = qMax(shape.strokeWidth, tolerance * 2);
@@ -648,21 +693,31 @@ void EditDocument::beginEdit() {
     if (d->editing) return;
     d->before = d->data();
     d->editing = true;
-    clearTouched(d->shapes);
+    d->dirty = false;
+    d->resetTouched();
 }
 void EditDocument::commitEdit() {
     if (!d->editing) return;
-    if (d->data() != d->before) {
+    // The caller can serialize the committed result on a worker. A transaction
+    // itself must not rebuild hundreds of MiB of unrelated SVG on the GUI.
+    if (d->dirty) {
         d->undo.append(d->before);
         d->redo.clear();
         d->trimHistory();
     }
     d->before.clear();
     d->editing = false;
-    clearTouched(d->shapes);
+    d->dirty = false;
+    d->resetTouched();
 }
 void EditDocument::cancelEdit() {
     if (!d->editing) return;
+    if (!d->dirty) {
+        d->before.clear();
+        d->editing = false;
+        d->resetTouched();
+        return;
+    }
     auto next = std::make_unique<Private>();
     QString error;
     if (next->read(d->before, &error)) {
@@ -711,6 +766,12 @@ bool EditDocument::moveHandle(int index, Handle handle, QPointF point) {
         if (handle.index > sub.segments.size()) return false;
     } else if ((handle.kind != Handle::Control1 && handle.kind != Handle::Control2)
                || handle.index >= sub.segments.size()) return false;
+    if (handle.kind == Handle::Anchor && same(local, endpoint(sub, handle.index))) return false;
+    if (handle.kind != Handle::Anchor) {
+        auto current = sub.segments[handle.index];
+        makeCubic(endpoint(sub, handle.index), current);
+        if (same(local, handle.kind == Handle::Control1 ? current.c1 : current.c2)) return false;
+    }
     if (handle.kind == Handle::Anchor) {
         const bool seam = sub.closed && !sub.segments.isEmpty() && same(sub.segments.last().end, sub.start);
         const QPointF old = endpoint(sub, handle.index);
@@ -743,9 +804,9 @@ bool EditDocument::moveHandle(int index, Handle handle, QPointF point) {
                 || !validPoint(segment.c1 + shape.offset) || !validPoint(segment.c2 + shape.offset)))) return false;
     const bool automatic = !d->editing;
     if (automatic) beginEdit();
+    d->changed();
     shape.subpaths[handle.subpath] = std::move(sub);
     serialize(shape);
-    d->changed();
     if (automatic) commitEdit();
     return true;
 }
@@ -768,6 +829,7 @@ int EditDocument::addBezierPath(const QVector<BezierAnchor>& anchors, QColor col
     }
     const bool automatic = !d->editing;
     if (automatic) beginEdit();
+    d->changed();
     if (group.isNull()) {
         group = d->document.createElementNS(QString::fromLatin1(SvgNamespace), QStringLiteral("g"));
         group.setAttribute(QStringLiteral("id"), QStringLiteral("lines"));
@@ -813,7 +875,6 @@ int EditDocument::addBezierPath(const QVector<BezierAnchor>& anchors, QColor col
     d->paintOrder.append(index);
     d->shapes.append(shape);
     d->segments += int(requiredSegments);
-    d->changed();
     if (automatic) commitEdit();
     return index;
 }
@@ -833,7 +894,8 @@ int EditDocument::erasePaths(QPointF from, QPointF to, double radius, Layer laye
     }
     const QRectF brushBounds = brush.controlPointRect();
     QVector<int> matches;
-    for (int i = 0; i < d->shapes.size(); ++i) {
+    const auto& nearby = d->nearbyShapes(brushBounds, 1.);
+    for (int i : nearby) {
         const auto& shape = d->shapes[i];
         if (shape.deleted || !shape.visible || shape.layer != layer) continue;
         const double halfWidth = layer == Layer::Lines ? shape.strokeWidth / 2. : 0.;
@@ -938,6 +1000,7 @@ int EditDocument::eraseLineSegments(const QPainterPath& sweptRegion, QString* er
     if (candidates.isEmpty()) return 0;
     const bool automatic = !d->editing;
     if (automatic) beginEdit();
+    d->changed();
     for (auto& candidate : candidates) {
         if (candidate.second.subpaths.isEmpty()) remove(candidate.first);
         else {
@@ -946,12 +1009,15 @@ int EditDocument::eraseLineSegments(const QPainterPath& sweptRegion, QString* er
         }
     }
     d->segments = int(totalSegments);
-    d->changed();
     if (automatic) commitEdit();
     return candidates.size();
 }
-int EditDocument::applyRasterFillBrush(const QPainterPath& sweptRegion, QColor color, bool erase, QString* error) {
+int EditDocument::applyRasterFillBrush(const QPainterPath& sweptRegion, QColor color, bool erase,
+                                     QString* error, int selectedFill) {
     if (error) error->clear();
+    if (erase && !d->editableFill(selectedFill)) {
+        if (error) *error = QStringLiteral("消しゴムで消去する色面を選択してください。"); return -1;
+    }
     if (!layerVisible(Layer::Fill)) return 0;
     if (!color.isValid()) { if (error) *error = QStringLiteral("塗りの色が不正です。"); return -1; }
     QString message;
@@ -962,17 +1028,15 @@ int EditDocument::applyRasterFillBrush(const QPainterPath& sweptRegion, QColor c
     qint64 totalSegments = d->segments;
     int addedPaths = 0;
     if (erase) {
-        for (int index = 0; index < d->shapes.size(); ++index) {
+        // The selected id is authoritative; a stroke never modifies an
+        // overlapping or underlying face as an accidental second target.
+        const int index = selectedFill;
+        {
             const auto& source = d->shapes[index];
-            if (source.deleted || !source.visible || source.layer != Layer::Fill
-                || !source.geometry.controlPointRect().intersects(QRectF(roi))
-                || !source.geometry.intersects(sweptRegion)) continue;
+            if (!source.geometry.controlPointRect().intersects(QRectF(roi))
+                || !source.geometry.intersects(sweptRegion)) return 0;
             const QRect pathRoi = roi.intersected(source.geometry.controlPointRect().adjusted(-2, -2, 2, 2).toAlignedRect());
             QPainterPath clip; clip.addRect(QRectF(pathRoi));
-            const QImage mask = geometryMask(source.geometry, sweptRegion, pathRoi);
-            if (mask.isNull()) { if (error) *error = QStringLiteral("塗り操作の画像領域を確保できません。"); return -1; }
-            auto inside = traceRasterMask(mask, pathRoi.topLeft(), &message);
-            if (!message.isEmpty()) { if (error) *error = message; return -1; }
             // Only touched paths enter this operation. Keep their area outside
             // the raster patch; Qt may flatten intersected boundary cubics.
             QPainterPath outside;
@@ -988,7 +1052,13 @@ int EditDocument::applyRasterFillBrush(const QPainterPath& sweptRegion, QColor c
                 if (!message.isEmpty()) { if (error) *error = message; return -1; }
                 outside = source.geometry;
                 outside.addPath(hole);
-            } else outside = source.geometry.subtracted(clip).united(inside);
+            } else {
+                const QImage mask = geometryMask(source.geometry, sweptRegion, pathRoi);
+                if (mask.isNull()) { if (error) *error = QStringLiteral("塗り操作の画像領域を確保できません。"); return -1; }
+                auto inside = traceRasterMask(mask, pathRoi.topLeft(), &message);
+                if (!message.isEmpty()) { if (error) *error = message; return -1; }
+                outside = source.geometry.subtracted(clip).united(inside);
+            }
             outside.setFillRule(Qt::OddEvenFill);
             Shape result = source;
             result.subpaths.clear();
@@ -1038,6 +1108,7 @@ int EditDocument::applyRasterFillBrush(const QPainterPath& sweptRegion, QColor c
     // leaves every layer, path and undo history exactly as it was.
     const bool automatic = !d->editing;
     if (automatic) beginEdit();
+    d->changed();
     for (auto& candidate : candidates) {
         if (candidate.first < -1) {
             const int sourceIndex = -candidate.first - 2;
@@ -1082,35 +1153,40 @@ int EditDocument::applyRasterFillBrush(const QPainterPath& sweptRegion, QColor c
         }
     }
     d->segments = int(totalSegments);
-    d->changed();
     if (automatic) commitEdit();
     return candidates.size();
 }
 QImage EditDocument::rasterBrushPreview(const QPainterPath& sweptRegion, QColor color, bool erase,
-                                       QRectF* bounds, QString* error, double outputScale) const {
+                                       QRectF* bounds, QString* error, double outputScale, int selectedFill) const {
     if (error) error->clear();
     if (bounds) *bounds = {};
+    if (erase && !d->editableFill(selectedFill)) {
+        if (error) *error = QStringLiteral("消しゴムで消去する色面を選択してください。"); return {};
+    }
     if (!color.isValid() || !std::isfinite(outputScale) || outputScale <= 0) {
         if (error) *error = QStringLiteral("ブラシプレビューの色・倍率が不正です。"); return {};
     }
     QString message;
-    const QRect roi = brushRoi(sweptRegion, d->size, &message, false);
+    QRect roi = brushRoi(sweptRegion, d->size, &message, false);
     if (!message.isEmpty()) { if (error) *error = message; return {}; }
+    if (erase) roi = roi.intersected(d->shapes[selectedFill].geometry.controlPointRect().adjusted(-2, -2, 2, 2).toAlignedRect());
     if (roi.isEmpty()) return {};
     const double scale = qMin(outputScale, qMin(1., std::sqrt((2. * 1024 * 1024) / (double(roi.width()) * roi.height()))));
     const QSize pixels(qMax(1, int(std::floor(roi.width() * scale))), qMax(1, int(std::floor(roi.height() * scale))));
     auto makeImage = [&] { QImage image(pixels, QImage::Format_ARGB32_Premultiplied); image.fill(Qt::transparent); return image; };
     QImage result = makeImage(), fill = makeImage(), lines = makeImage();
-    if (result.isNull() || fill.isNull() || lines.isNull()) {
+    QImage selected = erase ? makeImage() : QImage();
+    if (result.isNull() || fill.isNull() || lines.isNull() || (erase && selected.isNull())) {
         if (error) *error = QStringLiteral("ブラシプレビューの画像領域を確保できません。"); return {};
     }
     const auto transform = roiTransform(roi, pixels);
+    const auto& nearby = d->nearbyShapes(QRectF(roi), scale);
     auto paintLayer = [&](QImage& destination, Layer layer) {
         if (!layerVisible(layer)) return;
         QPainter painter(&destination);
         painter.setRenderHint(QPainter::Antialiasing);
         painter.setTransform(transform);
-        for (int index : d->paintOrder) {
+        for (int index : nearby) {
             const auto& shape = d->shapes[index];
             if (shape.deleted || !shape.visible || shape.layer != layer
                 || !shape.geometry.controlPointRect().adjusted(-shape.strokeWidth, -shape.strokeWidth,
@@ -1126,16 +1202,29 @@ QImage EditDocument::rasterBrushPreview(const QPainterPath& sweptRegion, QColor 
                 pen.setCapStyle(Qt::RoundCap); pen.setJoinStyle(Qt::RoundJoin);
                 painter.setPen(pen); painter.setBrush(Qt::NoBrush);
             }
-            painter.drawPath(shape.geometry);
+            if (erase && layer == Layer::Fill && index == selectedFill) {
+                // Clear the brush from this one face before source-over
+                // compositing it at its original position in the layer stack.
+                QPainter selectedPainter(&selected);
+                selectedPainter.setRenderHint(QPainter::Antialiasing);
+                selectedPainter.setTransform(transform);
+                selectedPainter.setPen(Qt::NoPen);
+                selectedPainter.setBrush(painter.brush());
+                selectedPainter.drawPath(shape.geometry);
+                selectedPainter.setCompositionMode(QPainter::CompositionMode_Clear);
+                selectedPainter.drawPath(sweptRegion);
+                selectedPainter.end();
+                painter.save(); painter.resetTransform();
+                painter.drawImage(QPoint(), selected); painter.restore();
+            } else painter.drawPath(shape.geometry);
         }
     };
     paintLayer(fill, Layer::Fill);
-    if (layerVisible(Layer::Fill)) {
+    if (layerVisible(Layer::Fill) && !erase) {
         QPainter painter(&fill);
         painter.setRenderHint(QPainter::Antialiasing);
         painter.setTransform(transform);
         painter.setPen(Qt::NoPen); painter.setBrush(color);
-        if (erase) painter.setCompositionMode(QPainter::CompositionMode_Clear);
         painter.drawPath(sweptRegion);
     }
     paintLayer(lines, Layer::Lines);
@@ -1160,22 +1249,26 @@ bool EditDocument::remove(int index) {
     if (!d->valid(index)) return false;
     const bool automatic = !d->editing;
     if (automatic) beginEdit();
+    d->changed(false);
     auto& shape = d->shapes[index];
     shape.element.parentNode().removeChild(shape.element);
     shape.deleted = true;
-    d->changed();
     if (automatic) commitEdit();
     return true;
 }
 bool EditDocument::setColor(int index, QColor color) {
     if (!d->valid(index) || !color.isValid()) return false;
-    const bool automatic = !d->editing;
-    if (automatic) beginEdit();
     auto& shape = d->shapes[index];
     const QString attribute = shape.layer == Layer::Lines ? QStringLiteral("stroke") : QStringLiteral("fill");
+    const QString opacity = attribute + QStringLiteral("-opacity");
+    if (shape.element.attribute(attribute) == color.name(QColor::HexRgb)
+        && shape.element.hasAttribute(opacity)
+        && std::abs(shape.element.attribute(opacity).toDouble() - color.alphaF()) < 1.e-10) return false;
+    const bool automatic = !d->editing;
+    if (automatic) beginEdit();
+    d->changed(false);
     shape.element.setAttribute(attribute, color.name(QColor::HexRgb));
     shape.element.setAttribute(attribute + QStringLiteral("-opacity"), number(color.alphaF()));
-    d->changed();
     if (automatic) commitEdit();
     return true;
 }
@@ -1299,10 +1392,11 @@ bool EditDocument::deformFill(int index, QPointF center, QPointF delta, double r
     if (!changed) return false;
     const bool automatic = !d->editing;
     if (automatic) beginEdit();
+    d->changed();
     d->shapes[index] = std::move(candidate);
+    d->touchedShapes.insert(index);
     serialize(d->shapes[index]);
     d->segments += added;
-    d->changed();
     if (automatic) commitEdit();
     return true;
 }

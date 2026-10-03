@@ -297,18 +297,22 @@ void Controller::setFullscreen(bool fullscreen) {
 void Controller::setExternalPreview(const QImage& image) {
     setExternalVectorPreview(image, {});
 }
-void Controller::setExternalVectorPreview(const QImage& image, const QByteArray& svg, double transferScale) {
+void Controller::setExternalVectorPreview(const QImage& image, const QByteArray& svg, double transferScale,
+                                          std::shared_ptr<Vector::GeneratedSvgRenderer> renderer) {
     if (image.isNull() || isBusy() || !sourceReady_ || hasAnimation() ||
         view_->getImageCore().isAnimationFrozenForSr() || view_->getCurrentFileDetails().isMovieLoaded ||
         view_->getCurrentFileDetails().isModelDocument) return;
     animationTimer_.stop(); animationPlaying_=false;
     if (svg != externalPreviewSvg_ || transferScale != externalVectorTransferScale_)
         externalVectorExport_ = {};
+    if (svg.isEmpty()) externalVectorRenderer_.reset();
+    else if (svg != externalPreviewSvg_ || !externalVectorRenderer_)
+        externalVectorRenderer_ = std::move(renderer);
     externalPreview_=image; externalPreviewSvg_=svg; externalVectorTransferScale_=transferScale; showingSr_=false;
     display(); updateActions();
 }
 void Controller::clearExternalPreview() {
-    externalPreview_={}; externalPreviewSvg_.clear(); externalVectorExport_={}; showingSr_=false;
+    externalPreview_={}; externalPreviewSvg_.clear(); externalVectorRenderer_.reset(); externalVectorExport_={}; showingSr_=false;
     view_->setVectorPreview({}, {});
     emit externalPreviewCleared();
     display(); updateActions();
@@ -328,7 +332,7 @@ void Controller::invalidate() {
     animationTimer_.stop(); animationPlaying_=false; animationIndex_=0; animationLoopsDone_=0; animationEnded_=false;
     originalAnimation_.reset(); resultAnimation_.reset(); originalDisplayFrames_.clear(); resultDisplayFrames_.clear(); animationDisplayProfile_.clear();
     ++generation_; sourceReady_=false; result_={}; showingSr_=false; resultSummary_.clear();
-    externalPreview_={}; externalPreviewSvg_.clear(); externalVectorExport_={}; view_->setVectorPreview({}, {}); emit externalPreviewCleared();
+    externalPreview_={}; externalPreviewSvg_.clear(); externalVectorRenderer_.reset(); externalVectorExport_={}; view_->setVectorPreview({}, {}); emit externalPreviewCleared();
     resultScale_=1.0; resultSteps_.clear();
     cancel(); updateActions();
 }
@@ -389,7 +393,8 @@ void Controller::display(bool updateStatus) {
     } else image=convert(source,profile,destination,&error);
     if(image.isNull()) { animationTimer_.stop(); animationPlaying_=false; setStatus(readFailure(error)); return; }
     view_->setDisplayImagePreservingView(image);
-    view_->setVectorPreview(externalPreview_.isNull() ? QByteArray() : externalPreviewSvg_, destination);
+    view_->setVectorPreview(externalPreview_.isNull() ? QByteArray() : externalPreviewSvg_, destination,
+                            externalVectorRenderer_);
     if(updateStatus && !isBusy()) {
         QString summary=!externalPreview_.isNull()?(externalPreviewSvg_.isEmpty()
             ?QStringLiteral("ベクター調整結果 · %1×%2").arg(externalPreview_.width()).arg(externalPreview_.height())
@@ -414,7 +419,7 @@ void Controller::startJob(bool fromResult) {
         emit failed(status_->text()); return;
     }
     // Also cancel a pending vector render: it must not overwrite a later SR result.
-    externalPreview_={}; externalPreviewSvg_.clear(); externalVectorExport_={}; view_->setVectorPreview({}, {}); emit externalPreviewCleared();
+    externalPreview_={}; externalPreviewSvg_.clear(); externalVectorRenderer_.reset(); externalVectorExport_={}; view_->setVectorPreview({}, {}); emit externalPreviewCleared();
     const auto path=view_->getCurrentFileDetails().fileInfo.absoluteFilePath();
     const bool animated=hasAnimation() || (view_->getCurrentFileDetails().isMovieLoaded && QImageReader::imageFormat(path)=="gif");
     if(!animated) {

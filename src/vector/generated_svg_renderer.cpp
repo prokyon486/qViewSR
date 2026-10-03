@@ -7,6 +7,7 @@
 #include <QPainter>
 #include <QRegularExpression>
 #include <QSvgRenderer>
+#include <QThread>
 #include <QXmlStreamReader>
 #include <cmath>
 #include <limits>
@@ -238,15 +239,23 @@ struct GeneratedSvgRenderer::Private {
     struct Layer {
         std::unique_ptr<QSvgRenderer> qt;
         void* native = nullptr;
-        ~Layer() { if (native) nativeApi().unref(native); }
+        ~Layer() {
+            // A discarded QFuture may release the final shared reference in a
+            // worker after the Qt objects have already been handed to the UI.
+            if (qt && qt->thread() != QThread::currentThread()) qt.release()->deleteLater();
+            if (native) nativeApi().unref(native);
+        }
     };
     std::vector<std::unique_ptr<Layer>> layers;
     QRectF box;
     QString error;
+    QByteArray source;
+    QThread* ownerThread = QThread::currentThread();
 };
 
 GeneratedSvgRenderer::GeneratedSvgRenderer(const QByteArray& svg, bool allowExtendedPaths)
     : d(std::make_unique<Private>()) {
+    d->source = svg;
     d->error = svgMemoryError(quint64(svg.size()));
     if (!d->error.isEmpty()) return;
     const auto metadata = inspect(svg);
@@ -300,9 +309,27 @@ bool GeneratedSvgRenderer::usesExtendedRenderer() const {
     for (const auto& layer : d->layers) if (layer->native) return true;
     return false;
 }
+QThread* GeneratedSvgRenderer::thread() const { return d->ownerThread; }
+bool GeneratedSvgRenderer::matchesSource(const QByteArray& svg) const { return d->source == svg; }
+bool GeneratedSvgRenderer::moveToThread(QThread* target, QString* error) {
+    if (error) error->clear();
+    const auto fail = [&](const QString& message) { if (error) *error = message; return false; };
+    if (!target) return fail(QStringLiteral("SVG描画先のスレッドがありません。"));
+    if (d->ownerThread != QThread::currentThread())
+        return fail(QStringLiteral("SVG描画のスレッド移管は現在の所有スレッドで行ってください。"));
+    for (const auto& layer : d->layers)
+        if (layer->qt && (layer->qt->thread() != d->ownerThread || layer->qt->parent()))
+            return fail(QStringLiteral("SVG描画オブジェクトのスレッドを移管できません。"));
+    for (const auto& layer : d->layers)
+        if (layer->qt) layer->qt->moveToThread(target);
+    d->ownerThread = target;
+    return true;
+}
 
 bool GeneratedSvgRenderer::render(QImage& image, const QTransform& sourceToDevice, QString* error) {
     const auto fail = [&](const QString& message) { if (error) *error = message; return false; };
+    if (d->ownerThread != QThread::currentThread())
+        return fail(QStringLiteral("SVG描画は所有スレッドで行ってください。"));
     if (!isValid()) return fail(d->error);
     if (image.isNull() || image.format() != QImage::Format_ARGB32_Premultiplied)
         return fail(QStringLiteral("SVGの描画先画像が不正です。"));

@@ -37,6 +37,7 @@
 #include <QToolButton>
 #include <QContextMenuEvent>
 #include <QMenu>
+#include <QtConcurrent/QtConcurrentRun>
 #include <cmath>
 #include <limits>
 
@@ -262,6 +263,58 @@ private slots:
         QString error;
         QVERIFY2(renderer.render(image, QTransform::fromScale(4, 4), &error), qPrintable(error));
         QCOMPARE(image, rasterizedSvg(svg, image.size()));
+    }
+
+    void preparedRendererMovesFromWorkerAndPreservesPixels_data() {
+        QTest::addColumn<bool>("extended");
+        QTest::newRow("qt") << false;
+        QTest::newRow("long-path") << true;
+    }
+
+    void preparedRendererMovesFromWorkerAndPreservesPixels() {
+        QFETCH(bool,extended);
+        const auto svg=extended ? longCurveSvg() : curvedSvg();
+        struct Prepared { std::shared_ptr<Vector::GeneratedSvgRenderer> renderer; QImage image; QString error; };
+        auto* guiThread=QThread::currentThread();
+        auto future=QtConcurrent::run([svg,guiThread] {
+            Prepared result; result.renderer=std::make_shared<Vector::GeneratedSvgRenderer>(svg);
+            if(!result.renderer->isValid()){result.error=result.renderer->errorString();return result;}
+            result.image=QImage(256,192,QImage::Format_ARGB32_Premultiplied); result.image.fill(Qt::transparent);
+            const auto box=result.renderer->viewBoxF();
+            const auto transform=QTransform::fromTranslate(-box.left(),-box.top())*QTransform::fromScale(256/box.width(),192/box.height());
+            if(!result.renderer->render(result.image,transform,&result.error))return result;
+            result.renderer->moveToThread(guiThread,&result.error);return result;
+        });
+        // waitForFinished may execute a queued QtConcurrent task in the caller.
+        // Poll completion to exercise a real worker-to-GUI handoff.
+        QTRY_VERIFY_WITH_TIMEOUT(future.isFinished(),10000); auto prepared=future.result();
+        if(extended && prepared.error.contains("librsvg")) QSKIP("Optional librsvg/Cairo runtime unavailable.");
+        QVERIFY2(prepared.error.isEmpty(),qPrintable(prepared.error));
+        QCOMPARE(prepared.renderer->thread(),guiThread); QVERIFY(prepared.renderer->matchesSource(svg));
+        QImage image(prepared.image.size(),prepared.image.format()); image.fill(Qt::transparent);
+        const auto box=prepared.renderer->viewBoxF();
+        const auto transform=QTransform::fromTranslate(-box.left(),-box.top())*QTransform::fromScale(256/box.width(),192/box.height());
+        QVERIFY2(prepared.renderer->render(image,transform,&prepared.error),qPrintable(prepared.error));
+        QCOMPARE(image,prepared.image);
+        auto wrongThread=QtConcurrent::run([renderer=prepared.renderer] {
+            QImage image(16,16,QImage::Format_ARGB32_Premultiplied); image.fill(Qt::transparent); QString error;
+            return !renderer->render(image,QTransform(),&error) && !error.isEmpty();
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(wrongThread.isFinished(),10000); QVERIFY(wrongThread.result());
+    }
+
+    void preparedRendererAccompaniesGeneratedAndEditedPreview() {
+        std::shared_ptr<Vector::GeneratedSvgRenderer> prepared; QByteArray displayed;
+        const auto connection=connect(controller,&Vector::Controller::previewReady,this,[&](const QImage&,const QByteArray& svg,double,
+                std::shared_ptr<Vector::GeneratedSvgRenderer> renderer){displayed=svg;prepared=std::move(renderer);});
+        const auto disconnectPreview=qScopeGuard([&]{disconnect(connection);});
+        QVERIFY2(generate(),qPrintable(failure));
+        QVERIFY(prepared); QVERIFY(prepared->matchesSource(displayed)); QCOMPARE(prepared->thread(),QThread::currentThread());
+        controller->setEditing(true); QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(),10000); QVERIFY(waitIdle());
+        auto* editor=view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        editor->setAddLine(true); dragAt(editorPoint({8,3}),editorPoint({55,3})); QVERIFY(waitIdle());
+        QVERIFY(prepared); QVERIFY(prepared->matchesSource(editor->svg())); QCOMPARE(displayed,editor->svg());
+        QCOMPARE(prepared->thread(),QThread::currentThread());
     }
 
     void generatedSvgLongCurvesKeepHolesAndTransforms() {
@@ -1626,13 +1679,17 @@ private slots:
         QCOMPARE(painted.pixelColor(30,36),QColor("#2080c0"));
         QCOMPARE(painted.pixelColor(30,12),QColor(Qt::black));
         const auto paintedSvg = editor->svg();
+        QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolSelect"), Qt::LeftButton);
+        QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, editorPoint({30,36}));
+        QCOMPARE(editor->selectedPath(), 0); // Erase only the underlying blue face.
         QTest::mouseClick(panel->findChild<QPushButton*>("vectorToolEraser"), Qt::LeftButton);
+        QCOMPARE(editor->selectedPath(), 0);
         dragAt(editorPoint({32,1}), editorPoint({32,47})); QVERIFY(waitIdle());
         const auto erasedSvg = editor->svg(); QVERIFY(erasedSvg != paintedSvg);
         const auto pngPath = files.filePath("raster-edited.png");
         QVERIFY2(controller->savePng(pngPath,1,&error),qPrintable(error));
         const QImage erased(pngPath);
-        QCOMPARE(erased.pixelColor(32,24).alpha(),0);
+        QCOMPARE(erased.pixelColor(32,24),QColor(Qt::red)); // Overlapping red paint is untouched.
         QCOMPARE(erased.pixelColor(32,36).alpha(),0);
         QCOMPARE(erased.pixelColor(32,12),QColor(Qt::black)); // Fill eraser preserves lines.
         QCOMPARE(erased.pixelColor(15,24),QColor(Qt::red)); QCOMPARE(erased.pixelColor(48,36),QColor("#2080c0"));
@@ -1645,6 +1702,74 @@ private slots:
         editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(),baseline);
         editor->redo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(),paintedSvg);
         editor->redo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(),erasedSvg);
+        QCOMPARE(digest(sourcePath),sourceDigest);
+    }
+
+    void editFillEraserRequiresSelectionAndRevealsUnderlyingFace() {
+        QVERIFY2(generate(), qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(), 10000); QVERIFY(waitIdle());
+        auto* editor = view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='48' viewBox='0 0 64 48'>"
+            "<g id='fill'><path fill='#2080c0' d='M4 4 L60 4 L60 44 L4 44 Z'/>"
+            "<path fill='red' d='M8 8 L56 8 L56 40 L8 40 Z'/></g><g id='lines'/></svg>";
+        QString error; QVERIFY2(editor->begin(svg,&error),qPrintable(error));
+        editor->setLayerVisible(Vector::Layer::Lines,false); QVERIFY(waitIdle());
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(),svg);
+        QVERIFY(select("vectorEditLayer","fill"));
+        editor->setBrushRadius(3); editor->setTool(Vector::Editor::Tool::Eraser);
+        QSignalSpy message(editor,&Vector::Editor::message);
+        dragAt(editorPoint({32,1}),editorPoint({32,47}));
+        QCOMPARE(editor->svg(),svg); QCOMPARE(editor->selectedPath(),-1); QVERIFY(!message.isEmpty());
+        editor->setTool(Vector::Editor::Tool::Select);
+        QTest::mouseClick(view->viewport(),Qt::LeftButton,Qt::NoModifier,editorPoint({20,20}));
+        QCOMPARE(editor->selectedPath(),1); QCOMPARE(editor->svg(),svg);
+        editor->setTool(Vector::Editor::Tool::Eraser); QCOMPARE(editor->selectedPath(),1);
+        const auto from=editorPoint({32,1}),to=editorPoint({32,47});
+        QTest::mousePress(view->viewport(),Qt::LeftButton,Qt::NoModifier,from);
+        QMouseEvent move(QEvent::MouseMove,to,view->viewport()->mapToGlobal(to),Qt::NoButton,Qt::LeftButton,Qt::NoModifier);
+        QApplication::sendEvent(view->viewport(),&move); QTest::qWait(100);
+        QCOMPARE(editor->svg(),svg);
+        const auto live=view->viewport()->grab().toImage();
+        const auto color=live.pixelColor(editorPoint({32,24}));
+        QVERIFY(qAbs(color.red()-32)<5 && qAbs(color.green()-128)<5 && qAbs(color.blue()-192)<5);
+        const auto artifacts=qEnvironmentVariable("ARTIFACTS");
+        if(!artifacts.isEmpty()) QVERIFY(window->grab().save(artifacts+"/selected-fill-erase.png"));
+        QTest::mouseRelease(view->viewport(),Qt::LeftButton,Qt::NoModifier,to); QVERIFY(waitIdle());
+        QCOMPARE(editor->selectedPath(),1);
+        const auto first=editor->svg(); QVERIFY(first!=svg);
+        auto image=Vector::rasterizeSvg(first,QSize(64,48),&error);
+        QCOMPARE(image.pixelColor(32,24),QColor("#2080c0"));
+        QCOMPARE(image.pixelColor(16,24),QColor(Qt::red)); QCOMPARE(image.pixelColor(48,24),QColor(Qt::red));
+        const auto selected=editor->document().path(1).boundingRect().center();
+        QTest::mouseClick(view->viewport(),Qt::LeftButton,Qt::NoModifier,editorPoint(selected)); QVERIFY(waitIdle());
+        const auto second=editor->svg(); QVERIFY(second!=first); QCOMPARE(editor->selectedPath(),1);
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(),first);
+        editor->undo(); QVERIFY(waitIdle()); QCOMPARE(editor->svg(),svg);
+        QCOMPARE(digest(sourcePath),sourceDigest);
+    }
+
+    void largeFillDeletePublishesAsynchronouslyAndCancelsOnSourceChange() {
+        QVERIFY2(generate(),qPrintable(failure)); controller->setEditing(true);
+        QTRY_VERIFY_WITH_TIMEOUT(controller->isEditing(),10000); QVERIFY(waitIdle());
+        auto* editor=view->findChild<Vector::Editor*>(); QVERIFY(editor);
+        QByteArray padded="<svg xmlns='http://www.w3.org/2000/svg' width='64' height='48' viewBox='0 0 64 48'>"
+            "<g id='fill'><path fill='red' d='M4 4 L60 4 L60 44 L4 44 Z'/></g><g id='lines'/>";
+        padded+=QByteArray("<!--")+QByteArray(9*1024*1024,'x')+"--></svg>";
+        QString error; QVERIFY2(editor->begin(padded,&error),qPrintable(error));
+        editor->setLayer(Vector::Layer::Fill); editor->setTool(Vector::Editor::Tool::Select);
+        QTest::mouseClick(view->viewport(),Qt::LeftButton,Qt::NoModifier,editorPoint({20,20}));
+        QCOMPARE(editor->selectedPath(),0); QCOMPARE(editor->svg(),padded); QVERIFY(!editor->isBusy());
+        editor->deleteSelection(); QVERIFY(editor->isBusy()); QVERIFY(controller->isBusy());
+        QVERIFY(!panel->findChild<QPushButton*>("vectorSaveSvg")->isEnabled());
+        bool responsive=false; QTimer::singleShot(0,[&]{responsive=true;}); QTRY_VERIFY(responsive);
+        QVERIFY(waitIdle(30000)); QVERIFY(editor->svg()!=padded);
+        editor->undo(); QVERIFY(waitIdle(30000)); QCOMPARE(editor->svg(),padded);
+        QTest::mouseClick(view->viewport(),Qt::LeftButton,Qt::NoModifier,editorPoint({20,20}));
+        editor->deleteSelection(); QVERIFY(editor->isBusy());
+        const auto other=files.filePath("fill-delete-cancel.png"); QVERIFY(fixture().save(other)); window->openFile(other);
+        QTRY_COMPARE(view->getCurrentFileDetails().fileInfo.absoluteFilePath(),other);
+        QThreadPool::globalInstance()->waitForDone(); QCoreApplication::processEvents();
+        QVERIFY(!editor->active()); QVERIFY(!editor->isBusy()); QVERIFY(!controller->hasResult());
         QCOMPARE(digest(sourcePath),sourceDigest);
     }
 

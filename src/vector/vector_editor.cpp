@@ -38,6 +38,11 @@ struct PickedColor {
     QString error;
 };
 
+struct SerializedDocument {
+    QByteArray svg;
+    QString error;
+};
+
 PickedColor sampleSvgColor(const QByteArray& svg, const QPointF& point)
 {
     PickedColor result;
@@ -122,6 +127,7 @@ bool Editor::beginPrepared(const QByteArray& svg, std::shared_ptr<EditDocument> 
     }
     if (active_) end();
     active_ = true;
+    publishedSvg_ = svg;
     selected_ = -1;
     spaceDown_ = false;
     savedDragMode_ = view_->dragMode();
@@ -164,6 +170,7 @@ void Editor::reset()
 {
     end();
     document_ = EditDocument();
+    publishedSvg_.clear();
     selected_ = -1;
     emit stateChanged();
 }
@@ -192,9 +199,12 @@ void Editor::setTool(Tool tool)
     if (historyBusy_ || (tool_ == tool && !addLine_)) return;
     cancelGesture();
     cancelPen(true);
+    const bool retainFill = layer_ == EditDocument::Layer::Fill && validSelectedFill()
+        && (tool_ == Tool::Select || tool_ == Tool::Eraser)
+        && (tool == Tool::Select || tool == Tool::Eraser);
     tool_ = tool;
     addLine_ = false;
-    selected_ = -1;
+    if (!retainFill) selected_ = -1;
     updateCursor();
     if (view_) view_->viewport()->update();
     emit stateChanged();
@@ -393,6 +403,18 @@ void Editor::changeHistory(bool redo)
     }));
 }
 
+bool Editor::validSelectedFill() const
+{
+    return selected_ >= 0 && document_.layerVisible(EditDocument::Layer::Fill)
+        && document_.layer(selected_) == EditDocument::Layer::Fill && !document_.path(selected_).isEmpty();
+}
+
+void Editor::restoreStrokeSelection(int selectedFill)
+{
+    selected_ = selectedFill;
+    if (!validSelectedFill()) selected_ = -1;
+}
+
 QPainterPath Editor::brushRegion() const
 {
     QPainterPathStroker stroker;
@@ -415,7 +437,7 @@ void Editor::updateBrushPreview()
     // Source resolution is sufficient when zoomed in. Zoomed-out previews need
     // only viewport resolution; the model additionally caps this at two MP.
     const double scale = qMin(1., 1. / sourceTolerance(1.));
-    QImage preview = document_.rasterBrushPreview(brushRegion(), strokeColor_, strokeErase_, &bounds, &error, scale);
+    QImage preview = document_.rasterBrushPreview(brushRegion(), strokeColor_, strokeErase_, &bounds, &error, scale, strokeSelectedFill_);
     if (!preview.isNull() && !brushDisplayIcc_.isEmpty() && brushDisplayIcc_ != Sr::srgbProfile())
         preview = Sr::convert(preview, Sr::Profile{Sr::srgbProfile(), QStringLiteral("sRGB"), {}, false}, brushDisplayIcc_, &error);
     if (!preview.isNull()) {
@@ -436,11 +458,12 @@ void Editor::finishBrushStroke()
     const auto layer = strokeLayer_;
     const auto color = strokeColor_;
     const bool erase = strokeErase_;
+    const int selectedFill = strokeSelectedFill_;
     gesture_ = Gesture::None;
     eraserTrace_ = {};
     brushPreview_ = {};
     brushPreviewBounds_ = {};
-    selected_ = -1;
+    if (selectedFill < 0) selected_ = -1;
     const auto currentSvg = document_.svg();
     const auto memoryError = EditDocument::memoryError(quint64(currentSvg.size()), availableMemoryBytes());
     if (!memoryError.isEmpty()) {
@@ -448,12 +471,12 @@ void Editor::finishBrushStroke()
         if (view_) view_->viewport()->update();
         return;
     }
-    const auto apply = [region, layer, color, erase](EditDocument& model) {
+    const auto apply = [region, layer, color, erase, selectedFill](EditDocument& model) {
         HistoryResult result;
         model.beginEdit();
         const int changes = layer == EditDocument::Layer::Lines
             ? model.eraseLineSegments(region, &result.error)
-            : model.applyRasterFillBrush(region, color, erase, &result.error);
+            : model.applyRasterFillBrush(region, color, erase, &result.error, selectedFill);
         if (changes < 0) model.cancelEdit();
         else {
             model.commitEdit();
@@ -470,6 +493,7 @@ void Editor::finishBrushStroke()
             try { document_.cancelEdit(); } catch (...) {}
             result.error = QStringLiteral("ブラシ処理中にエラーが発生しました。直前の編集結果を保持しています。");
         }
+        restoreStrokeSelection(selectedFill);
         updateCursor();
         if (result.changed) notifyChanged();
         else { if (view_) view_->viewport()->update(); emit stateChanged(); }
@@ -490,11 +514,12 @@ void Editor::finishBrushStroke()
     emit message(layer == EditDocument::Layer::Lines ? QStringLiteral("主線の消しゴム処理を確定しています…")
                                                     : QStringLiteral("色面の境界をベクターへ戻しています…"));
     auto* watcher = new QFutureWatcher<HistoryResult>(this);
-    connect(watcher, &QFutureWatcher<HistoryResult>::finished, this, [this, watcher, model, revision] {
+    connect(watcher, &QFutureWatcher<HistoryResult>::finished, this, [this, watcher, model, revision, selectedFill] {
         const auto result = watcher->result(); watcher->deleteLater();
         if (revision != historyRevision_ || !historyBusy_) return;
         document_ = std::move(*model); *model = EditDocument();
         historyBusy_ = false; historySvg_.clear();
+        restoreStrokeSelection(selectedFill);
         updateCursor();
         if (view_) view_->viewport()->update();
         if (result.changed) notifyChanged(); else emit stateChanged();
@@ -703,7 +728,15 @@ bool Editor::mousePress(QMouseEvent* event)
         penAnchors_.append({lastDocument_, lastDocument_, lastDocument_});
         gesture_ = Gesture::PenAnchor;
     } else if (tool_ == Tool::Eraser || (tool_ == Tool::Pen && layer_ == EditDocument::Layer::Fill)) {
-        selected_ = -1;
+        const bool selectedFillErase = tool_ == Tool::Eraser && layer_ == EditDocument::Layer::Fill;
+        if (selectedFillErase && !validSelectedFill()) {
+            selected_ = -1;
+            emit message(QStringLiteral("「選択」ツールで消したい色面を先に選択してください。"));
+            updateCursor(); emit stateChanged();
+            return true;
+        }
+        strokeSelectedFill_ = selectedFillErase ? selected_ : -1;
+        if (!selectedFillErase) selected_ = -1;
         gesture_ = Gesture::Brush;
         eraserTrace_ = QPainterPath(lastDocument_);
         strokeLayer_ = layer_; strokeErase_ = tool_ == Tool::Eraser;
@@ -867,9 +900,58 @@ void Editor::finishGesture()
 
 void Editor::notifyChanged()
 {
+    const bool large = publishedSvg_.size() > AsyncHistoryThreshold || document_.pathCount() > 50000
+        || document_.segmentCount() > 100000;
+    if (large) {
+        // commitEdit keeps its before-snapshot but defers writing the whole
+        // SVG. Serialization of a large document must not pause the GUI after
+        // a local fill deformation, path deletion or color adjustment.
+        const int selection = selected_;
+        historyLinesVisible_ = document_.layerVisible(EditDocument::Layer::Lines);
+        historyFillVisible_ = document_.layerVisible(EditDocument::Layer::Fill);
+        auto model = std::make_shared<EditDocument>(std::move(document_));
+        document_ = EditDocument();
+        historySvg_ = publishedSvg_;
+        historyBusy_ = true;
+        const auto revision = ++historyRevision_;
+        updateCursor();
+        if (view_) view_->viewport()->update();
+        emit stateChanged();
+        emit message(QStringLiteral("編集結果のSVGを更新しています…"));
+        auto* watcher = new QFutureWatcher<SerializedDocument>(this);
+        connect(watcher, &QFutureWatcher<SerializedDocument>::finished, this, [this, watcher, model, revision, selection] {
+            const auto result = watcher->result(); watcher->deleteLater();
+            if (revision != historyRevision_ || !historyBusy_) return;
+            document_ = std::move(*model); *model = EditDocument();
+            historyBusy_ = false; historySvg_.clear();
+            selected_ = selection;
+            if (selected_ >= 0 && document_.path(selected_).isEmpty()) selected_ = -1;
+            updateCursor();
+            if (view_) view_->viewport()->update();
+            if (result.error.isEmpty()) {
+                publishedSvg_ = result.svg;
+                emit changed(publishedSvg_);
+            } else {
+                if (document_.size().isEmpty()) end();
+                emit message(result.error);
+            }
+            emit stateChanged();
+        });
+        watcher->setFuture(QtConcurrent::run([model, previous = publishedSvg_] {
+            try { return SerializedDocument{model->svg(), {}}; }
+            catch (...) {
+                // Free the failed DOM before recovery; never leave unpublished
+                // geometry as the starting point of the next edit operation.
+                try { *model = EditDocument(); model->load(previous); } catch (...) {}
+                return SerializedDocument{{}, QStringLiteral("SVGの更新中にエラーが発生しました。表示と保存には直前の結果を保持しています。")};
+            }
+        }));
+        return;
+    }
+    publishedSvg_ = document_.svg();
     updateCursor();
     if (view_) view_->viewport()->update();
-    emit changed(document_.svg());
+    emit changed(publishedSvg_);
     emit stateChanged();
 }
 
@@ -881,6 +963,7 @@ void Editor::updateCursor()
         : spaceDown_ ? Qt::OpenHandCursor
         : tool_ == Tool::Eyedropper ? Qt::CrossCursor
         : !document_.layerVisible(layer_) ? Qt::ForbiddenCursor
+        : tool_ == Tool::Eraser && layer_ == EditDocument::Layer::Fill && !validSelectedFill() ? Qt::ForbiddenCursor
         : addLine_ || tool_ != Tool::Select || layer_ == EditDocument::Layer::Fill ? Qt::CrossCursor : Qt::ArrowCursor);
 }
 
@@ -1000,7 +1083,7 @@ void Editor::paint(QPainter* painter)
         painter->drawImage(brushPreviewBounds_, brushPreview_);
         painter->restore();
     }
-    if (selected_ >= 0 && document_.layerVisible(layer_)) {
+    if (selected_ >= 0 && gesture_ != Gesture::Brush && document_.layerVisible(layer_)) {
         painter->setPen(QPen(highlight, 1.5));
         painter->setBrush(layer_ == EditDocument::Layer::Fill ? QColor(0, 140, 255, 45) : Qt::transparent);
         painter->drawPath(transform.map(document_.path(selected_)));

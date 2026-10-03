@@ -18,6 +18,7 @@ class QProgressBar;
 class QToolBar;
 class QProcess;
 class QDoubleSpinBox;
+namespace Vector { class GeneratedSvgRenderer; }
 
 namespace Sr {
 struct AnimationFrames;
@@ -74,7 +75,8 @@ public slots:
     void showSettings();
     void setFullscreen(bool fullscreen);
     void setExternalPreview(const QImage& image);
-    void setExternalVectorPreview(const QImage& image, const QByteArray& svg, double transferScale = 1.0);
+    void setExternalVectorPreview(const QImage& image, const QByteArray& svg, double transferScale = 1.0,
+                                 std::shared_ptr<Vector::GeneratedSvgRenderer> renderer = {});
     void clearExternalPreview();
 signals:
     void stateChanged();
@@ -119,6 +121,7 @@ private:
     QImage result_;
     QImage externalPreview_;
     QByteArray externalPreviewSvg_;
+    std::shared_ptr<Vector::GeneratedSvgRenderer> externalVectorRenderer_;
     QImage externalVectorExport_;
     double externalVectorTransferScale_ = 1.0;
     std::shared_ptr<std::atomic_bool> exportCancelled_;

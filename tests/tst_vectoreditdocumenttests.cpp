@@ -49,9 +49,13 @@ private slots:
     void partialLineEraserPreservesCurves();
     void rasterFillBrushSplitsAndPreservesPaintOrder();
     void rasterFillBrushPreviewAndBudget();
+    void rasterFillEraseRequiresVisibleSelection();
+    void rasterFillErasePreservesOtherAreasAndMatchesPreview();
     void rasterFillErasePreservesWindingCoverage();
     void rasterFillEraseKeepsCurvedHoleWithExteriorControls();
     void rasterFillEraseKeepsEvenOddOverlaps();
+    void cachedQueriesFollowDocumentChanges();
+    void noOpTransactionsPreserveHistory();
     void realGeneratedSvg();
 };
 void VectorEditDocumentTests::loadAndHitTest() {
@@ -421,7 +425,7 @@ void VectorEditDocumentTests::rasterFillBrushSplitsAndPreservesPaintOrder() {
     QVERIFY(document.load(source));
     QPainterPath brush; brush.addRect(QRectF(45,0,10,100));
     QString error;
-    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error)>0,qPrintable(error));
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error,0)>0,qPrintable(error));
     QCOMPARE(document.pathCount(),4); // split red has independently selectable halves
     const auto pixels = render(document.svg());
     QCOMPARE(pixels.pixelColor(20,30),QColor(Qt::red));
@@ -466,20 +470,122 @@ void VectorEditDocumentTests::rasterFillBrushPreviewAndBudget() {
     QVERIFY(qint64(reduced.width())*reduced.height()<=2*1024*1024);
     QVERIFY(bounds.width()>10000);
 }
+void VectorEditDocumentTests::rasterFillEraseRequiresVisibleSelection() {
+    const QByteArray source = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"><path id="red" fill="red" d="M10 10L80 10L80 80L10 80Z"/><path id="hidden" display="none" fill="blue" d="M20 20L70 20L70 70L20 70Z"/></g><g id="lines" stroke="black" stroke-width="2" fill="none"><path d="M0 50L100 50"/></g></svg>)";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    QPainterPath brush; brush.addRect(QRectF(25,25,40,40));
+    QString error;
+    QRectF bounds;
+    QCOMPARE(document.applyRasterFillBrush(brush,Qt::black,true,&error),-1);
+    QVERIFY(!error.isEmpty());
+    QVERIFY(document.rasterBrushPreview(brush,Qt::black,true,&bounds,&error).isNull());
+    QVERIFY(!error.isEmpty());
+    QVERIFY(bounds.isEmpty());
+    for (int selected : {-2,1,2,100}) {
+        document.beginEdit();
+        QCOMPARE(document.applyRasterFillBrush(brush,Qt::black,true,&error,selected),-1);
+        QVERIFY(!error.isEmpty());
+        document.cancelEdit();
+        QVERIFY(document.rasterBrushPreview(brush,Qt::black,true,&bounds,&error,1.,selected).isNull());
+        QVERIFY(!error.isEmpty());
+        QVERIFY(bounds.isEmpty());
+        QCOMPARE(document.svg(),source);
+        QVERIFY(!document.canUndo());
+        QVERIFY(!document.canRedo());
+    }
+    QPainterPath outside; outside.addRect(QRectF(90,90,5,5));
+    document.beginEdit();
+    QCOMPARE(document.applyRasterFillBrush(outside,Qt::black,true,&error,0),0);
+    QVERIFY2(error.isEmpty(),qPrintable(error));
+    document.commitEdit();
+    QCOMPARE(document.svg(),source);
+    QVERIFY(!document.canUndo());
+
+    QVERIFY(document.setLayerVisible(Layer::Fill,false));
+    const auto hidden = document.svg();
+    QCOMPARE(document.applyRasterFillBrush(brush,Qt::black,true,&error,0),-1);
+    QVERIFY(!error.isEmpty());
+    QVERIFY(document.rasterBrushPreview(brush,Qt::black,true,&bounds,&error,1.,0).isNull());
+    QVERIFY(!error.isEmpty());
+    QCOMPARE(document.svg(),hidden);
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+    QVERIFY(!document.canUndo());
+}
+void VectorEditDocumentTests::rasterFillErasePreservesOtherAreasAndMatchesPreview() {
+    const QByteArray source = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect id="background" width="100" height="100" fill="white"/><g id="fill"><path id="base" fill="#008000" d="M0 0L100 0L100 100L0 100Z"/><path id="selected" fill="red" data-custom="keep" d="M10 10L90 10L90 90L10 90Z"/><path id="upper" fill="blue" d="M35 35L65 35L65 65L35 65Z"/></g><g id="lines" stroke="black" stroke-width="2" fill="none"><path id="ink" d="M0 50L100 50"/></g></svg>)";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    QPainterPath brush; brush.addRect(QRectF(25,25,50,50));
+    QString error; QRectF bounds;
+    const auto preview = document.rasterBrushPreview(brush,Qt::black,true,&bounds,&error,1.,1);
+    QVERIFY2(!preview.isNull(),qPrintable(error));
+    QCOMPARE(preview.size(),bounds.size().toSize());
+    QCOMPARE(document.svg(),source);
+    QVERIFY(!document.canUndo());
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error,1)>0,qPrintable(error));
+    const auto edited = document.svg();
+    const auto pixels = render(edited);
+    QCOMPARE(pixels.pixelColor(30,30),QColor("#008000")); // selected red reveals lower green
+    QCOMPARE(pixels.pixelColor(40,40),QColor(Qt::blue)); // upper fill survives the same eraser
+    QCOMPARE(pixels.pixelColor(50,50),QColor(Qt::black));
+    QCOMPARE(pixels.pixelColor(15,30),QColor(Qt::red));
+    QCOMPARE(byId(edited,"selected").attribute("data-custom"),QString("keep"));
+    for (const QString& id : {QString("base"),QString("upper"),QString("ink")}) {
+        QCOMPARE(byId(edited,id).attribute("d"),byId(source,id).attribute("d"));
+        QCOMPARE(byId(edited,id).attribute("fill"),byId(source,id).attribute("fill"));
+    }
+    // Reconstruction deliberately rounds raster corners by less than half a
+    // source pixel. Compare the full preview interior outside that edge band.
+    for (int y=0; y<preview.height(); ++y) for (int x=0; x<preview.width(); ++x) {
+        const int sx=x+qRound(bounds.left()), sy=y+qRound(bounds.top());
+        if (qAbs(sx-25)<=2 || qAbs(sx-75)<=2 || qAbs(sy-25)<=2 || qAbs(sy-75)<=2) continue;
+        QCOMPARE(preview.pixelColor(x,y),pixels.pixelColor(sx,sy));
+    }
+    QVERIFY(!edited.contains("<image"));
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+    QVERIFY(!document.canUndo());
+    QVERIFY(document.redo());
+    QCOMPARE(document.svg(),edited);
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+
+    // Erasing an entire selected upper fill reveals red; the previous eraser
+    // implementation also removed both lower fills within this rectangle.
+    const auto upperPreview = document.rasterBrushPreview(brush,Qt::black,true,&bounds,&error,1.,2);
+    QVERIFY2(!upperPreview.isNull(),qPrintable(error));
+    QCOMPARE(upperPreview.pixelColor(40-qRound(bounds.left()),40-qRound(bounds.top())),QColor(Qt::red));
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error,2)>0,qPrintable(error));
+    QVERIFY(document.path(2).isEmpty());
+    QVERIFY(byId(document.svg(),"upper").isNull());
+    QCOMPARE(render(document.svg()).pixelColor(40,40),QColor(Qt::red));
+    QCOMPARE(render(document.svg()).pixelColor(50,50),QColor(Qt::black));
+    QCOMPARE(byId(document.svg(),"selected").attribute("d"),byId(source,"selected").attribute("d"));
+    QCOMPARE(byId(document.svg(),"base").attribute("d"),byId(source,"base").attribute("d"));
+    const auto removed = document.svg();
+    QCOMPARE(document.applyRasterFillBrush(brush,Qt::black,true,&error,2),-1);
+    QVERIFY(!error.isEmpty());
+    QCOMPARE(document.svg(),removed);
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),source);
+    QVERIFY(!document.canUndo());
+}
 void VectorEditDocumentTests::rasterFillErasePreservesWindingCoverage() {
     const QByteArray source = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"><path id="overlap" fill="red" d="M0 0L70 0L70 100L0 100Z M30 0L100 0L100 100L30 100Z"/></g></svg>)";
     EditDocument document;
     QVERIFY(document.load(source));
     QPainterPath brush; brush.addEllipse(QPointF(10,50),4,4);
     QString error;
-    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error)>0,qPrintable(error));
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error,0)>0,qPrintable(error));
     const auto pixels = render(document.svg());
     QCOMPARE(pixels.pixelColor(10,50).alpha(),0);
     QCOMPARE(pixels.pixelColor(50,50),QColor(Qt::red));
     QCOMPARE(pixels.pixelColor(90,50),QColor(Qt::red));
     const QByteArray hole = R"(<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><g id="fill"><path fill="red" d="M0 0L100 0L100 100L0 100Z M30 30L30 70L70 70L70 30Z"/></g></svg>)";
     QVERIFY(document.load(hole));
-    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error)>0,qPrintable(error));
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error,0)>0,qPrintable(error));
     QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
     QCOMPARE(render(document.svg()).pixelColor(90,50),QColor(Qt::red));
 }
@@ -490,7 +596,7 @@ void VectorEditDocumentTests::rasterFillEraseKeepsCurvedHoleWithExteriorControls
     QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
     QPainterPath brush; brush.addEllipse(QPointF(10,80),2,2);
     QString error;
-    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error)>0,qPrintable(error));
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error,0)>0,qPrintable(error));
     QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
     QCOMPARE(render(document.svg()).pixelColor(10,80).alpha(),0);
     QCOMPARE(render(document.svg()).pixelColor(90,80),QColor(Qt::red));
@@ -505,7 +611,7 @@ void VectorEditDocumentTests::rasterFillEraseKeepsEvenOddOverlaps() {
     QCOMPARE(render(document.svg()).pixelColor(50,50).alpha(),0);
     QPainterPath brush; brush.addEllipse(QPointF(10,50),2,2);
     QString error;
-    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error)>0,qPrintable(error));
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::black,true,&error,0)>0,qPrintable(error));
     const auto pixels = render(document.svg());
     QCOMPARE(pixels.pixelColor(50,50).alpha(),0);
     QCOMPARE(pixels.pixelColor(10,50).alpha(),0);
@@ -514,6 +620,93 @@ void VectorEditDocumentTests::rasterFillEraseKeepsEvenOddOverlaps() {
     QCOMPARE(document.pathCount(),1);
     QVERIFY(document.undo());
     QCOMPARE(document.svg(),source);
+}
+void VectorEditDocumentTests::cachedQueriesFollowDocumentChanges() {
+    const QByteArray source = R"(<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="300"><g id="fill"><path id="base" fill="green" d="M20 20L60 20L60 60L20 60Z"/><path id="moving" fill="red" d="M400 20L440 20L440 60L400 60Z"/></g></svg>)";
+    EditDocument document;
+    QVERIFY(document.load(source));
+    const QPoint sample(35,35);
+    const auto previewColor = [&] {
+        QPainterPath probe; probe.addRect(QRectF(sample-QPoint(5,5),QSizeF(10,10)));
+        QRectF bounds; QString error;
+        const auto preview = document.rasterBrushPreview(probe,Qt::transparent,false,&bounds,&error);
+        if (preview.isNull()) return QColor();
+        return preview.pixelColor(sample-QPoint(qRound(bounds.left()),qRound(bounds.top())));
+    };
+    // Repeated local queries warm the candidate set; the distant red shape
+    // must become selectable and visible after moving into that same area.
+    QCOMPARE(document.hitTest(sample,0,Layer::Fill),0);
+    QCOMPARE(previewColor(),QColor("green"));
+    document.beginEdit();
+    QVERIFY(document.moveHandle(1,{0,0,Handle::Anchor,{}},{20,20}));
+    QVERIFY(document.moveHandle(1,{0,1,Handle::Anchor,{}},{60,20}));
+    QVERIFY(document.moveHandle(1,{0,2,Handle::Anchor,{}},{60,60}));
+    QVERIFY(document.moveHandle(1,{0,3,Handle::Anchor,{}},{20,60}));
+    document.commitEdit();
+    QCOMPARE(document.hitTest(sample,0,Layer::Fill),1);
+    QCOMPARE(previewColor(),QColor(Qt::red));
+    QCOMPARE(document.hitTest({410,30},0,Layer::Fill),-1);
+    QCOMPARE(document.hitTest(sample,0,Layer::Fill),1);
+    QCOMPARE(previewColor(),QColor(Qt::red));
+
+    QPainterPath brush; brush.addRect(QRectF(30,30,20,20));
+    QString error;
+    QVERIFY2(document.applyRasterFillBrush(brush,Qt::blue,false,&error)>0,qPrintable(error));
+    QCOMPARE(document.hitTest(sample,0,Layer::Fill),2);
+    QCOMPARE(previewColor(),QColor(Qt::blue));
+    QVERIFY(document.remove(2));
+    QCOMPARE(document.hitTest(sample,0,Layer::Fill),1);
+    QCOMPARE(previewColor(),QColor(Qt::red));
+    QVERIFY(document.setColor(1,Qt::yellow));
+    QCOMPARE(document.hitTest(sample,0,Layer::Fill),1);
+    QCOMPARE(previewColor(),QColor(Qt::yellow));
+
+    QVERIFY(document.setLayerVisible(Layer::Fill,false));
+    QCOMPARE(document.hitTest(sample,0,Layer::Fill),-1);
+    QCOMPARE(previewColor().alpha(),0);
+    QVERIFY(document.setLayerVisible(Layer::Fill,true));
+    QCOMPARE(document.hitTest(sample,0,Layer::Fill),1);
+    QCOMPARE(previewColor(),QColor(Qt::yellow));
+    QVERIFY(document.undo());
+    QCOMPARE(document.hitTest(sample,0,Layer::Fill),-1);
+    QCOMPARE(previewColor().alpha(),0);
+    QVERIFY(document.redo());
+    QCOMPARE(document.hitTest(sample,0,Layer::Fill),1);
+    QCOMPARE(previewColor(),QColor(Qt::yellow));
+}
+void VectorEditDocumentTests::noOpTransactionsPreserveHistory() {
+    EditDocument document;
+    QVERIFY(document.load(Example));
+    QVERIFY(document.setColor(0,Qt::red));
+    const auto red = document.svg();
+    QVERIFY(document.setColor(0,Qt::blue));
+    const auto blue = document.svg();
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),red);
+    QVERIFY(document.canUndo());
+    QVERIFY(document.canRedo());
+
+    document.beginEdit();
+    QCOMPARE(document.hitTest({20,40},0,Layer::Fill),0);
+    QVERIFY(!document.setColor(0,Qt::red));
+    document.commitEdit();
+    QCOMPARE(document.svg(),red);
+    QVERIFY(document.canUndo());
+    QVERIFY(document.canRedo());
+    document.beginEdit();
+    QCOMPARE(document.hitTest({20,40},0,Layer::Fill),0);
+    document.cancelEdit();
+    QCOMPARE(document.svg(),red);
+    QVERIFY(document.canUndo());
+    QVERIFY(document.canRedo());
+
+    QVERIFY(document.redo());
+    QCOMPARE(document.svg(),blue);
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),red);
+    QVERIFY(document.undo());
+    QCOMPARE(document.svg(),Example);
+    QVERIFY(!document.canUndo()); // neither no-op inserted an extra history entry
 }
 QTEST_MAIN(VectorEditDocumentTests)
 #include "tst_vectoreditdocumenttests.moc"

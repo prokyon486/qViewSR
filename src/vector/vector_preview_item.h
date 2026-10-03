@@ -22,7 +22,8 @@ public:
     ~PreviewItem() override;
 
     // Empty SVG clears the preview. Invalid SVG clears it and returns false.
-    bool setVectorPreview(const QByteArray& svg, const QByteArray& displayIcc);
+    bool setVectorPreview(const QByteArray& svg, const QByteArray& displayIcc,
+                          std::shared_ptr<GeneratedSvgRenderer> renderer = {});
     bool hasVectorPreview() const;
     QSizeF vectorSourceSize() const;
 
@@ -33,7 +34,7 @@ private:
     void clearCache();
 
     QVGraphicsView* view_;
-    std::unique_ptr<GeneratedSvgRenderer> renderer_;
+    std::shared_ptr<GeneratedSvgRenderer> renderer_;
     QByteArray svg_;
     QByteArray displayIcc_;
     QImage cachedImage_;

@@ -9,11 +9,12 @@
 #include <QTimer>
 #include <QFileInfo>
 #include <functional>
+#include <memory>
 #include <optional>
 
 class QDrag;
 class QPainter;
-namespace Vector { class PreviewItem; }
+namespace Vector { class PreviewItem; class GeneratedSvgRenderer; }
 
 class QVGraphicsView : public QGraphicsView
 {
@@ -67,7 +68,8 @@ public:
     const QMovie &getLoadedMovie() const { return imageCore.getLoadedMovie(); }
     QVImageCore &getImageCore() { return imageCore; }
     void setDisplayImagePreservingView(const QImage &image);
-    bool setVectorPreview(const QByteArray &svg, const QByteArray &displayIcc);
+    bool setVectorPreview(const QByteArray &svg, const QByteArray &displayIcc,
+                          std::shared_ptr<Vector::GeneratedSvgRenderer> renderer = {});
     bool hasVectorPreview() const;
     // Logical SVG coordinates to logical viewport pixels, including the
     // current raster proxy size, rotation, mirroring and scroll position.

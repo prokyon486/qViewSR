@@ -7,6 +7,7 @@
 #include <QColorSpace>
 #include <QPainter>
 #include <QStyleOptionGraphicsItem>
+#include <QThread>
 #include <QWidget>
 #include <cmath>
 #include <limits>
@@ -46,7 +47,8 @@ void PreviewItem::clearCache()
     renderFailed_ = false;
 }
 
-bool PreviewItem::setVectorPreview(const QByteArray& svg, const QByteArray& displayIcc)
+bool PreviewItem::setVectorPreview(const QByteArray& svg, const QByteArray& displayIcc,
+                                 std::shared_ptr<GeneratedSvgRenderer> renderer)
 {
     if (svg.isEmpty()) {
         renderer_.reset();
@@ -60,14 +62,18 @@ bool PreviewItem::setVectorPreview(const QByteArray& svg, const QByteArray& disp
         return true;
 
     if (!renderer_ || svg != svg_) {
-        auto renderer = std::make_unique<GeneratedSvgRenderer>(svg);
+        if (!renderer) renderer = std::make_shared<GeneratedSvgRenderer>(svg);
         const QRectF box = renderer->viewBoxF();
-        if (!renderer->isValid() || box.isEmpty() || !finiteRect(box)
+        const bool validOwner = renderer->thread() == QThread::currentThread();
+        const bool validSource = renderer->matchesSource(svg);
+        if (!renderer->isValid() || !validOwner || !validSource || box.isEmpty() || !finiteRect(box)
             || box.width() > std::numeric_limits<int>::max() || box.height() > std::numeric_limits<int>::max()) {
             setVectorPreview({}, {});
             if (view_) QMetaObject::invokeMethod(view_, "vectorRenderingFailed", Qt::QueuedConnection,
-                Q_ARG(QString, renderer->errorString().isEmpty()
-                    ? QStringLiteral("生成SVGの描画範囲が不正です。") : renderer->errorString()));
+                Q_ARG(QString, !validOwner ? QStringLiteral("SVG描画スレッドの準備が完了していません。")
+                    : !validSource ? QStringLiteral("SVG描画の準備結果が現在の画像と一致しません。")
+                    : renderer->errorString().isEmpty() ? QStringLiteral("生成SVGの描画範囲が不正です。")
+                    : renderer->errorString()));
             return false;
         }
         renderer_ = std::move(renderer);

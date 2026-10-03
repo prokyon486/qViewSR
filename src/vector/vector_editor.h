@@ -87,6 +87,8 @@ private:
     void finishGesture();
     void notifyChanged();
     void changeHistory(bool redo);
+    bool validSelectedFill() const;
+    void restoreStrokeSelection(int selectedFill);
     QPainterPath brushRegion() const;
     void updateBrushPreview();
     void finishBrushStroke();
@@ -110,6 +112,7 @@ private:
     QByteArray brushDisplayIcc_;
     QColor strokeColor_;
     EditDocument::Layer strokeLayer_ = EditDocument::Layer::Lines;
+    int strokeSelectedFill_ = -1;
     double strokeRadius_ = 24.;
     bool strokeErase_ = false, previewErrorShown_ = false;
     EditDocument::Handle handle_;
@@ -117,6 +120,7 @@ private:
     bool historyBusy_ = false;
     quint64 historyRevision_ = 0;
     QByteArray historySvg_;
+    QByteArray publishedSvg_;
     bool historyLinesVisible_ = true, historyFillVisible_ = true;
     bool addLine_ = false;
     bool spaceDown_ = false;

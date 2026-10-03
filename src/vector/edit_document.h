@@ -44,6 +44,7 @@ public:
     QSize size() const;
     QRectF viewBox() const;
     int pathCount() const;
+    int segmentCount() const;
     Layer layer(int index) const;
     bool layerVisible(Layer layer) const;
     bool setLayerVisible(Layer layer, bool visible);
@@ -57,9 +58,12 @@ public:
     // Deletes complete paths intersected by the swept circular brush.
     int erasePaths(QPointF from, QPointF to, double radius, Layer layer);
     int eraseLineSegments(const QPainterPath& sweptRegion, QString* error = nullptr);
-    int applyRasterFillBrush(const QPainterPath& sweptRegion, QColor color, bool erase, QString* error = nullptr);
+    // Erasing requires a valid visible Fill index; -1 never means all shapes.
+    int applyRasterFillBrush(const QPainterPath& sweptRegion, QColor color, bool erase,
+                             QString* error = nullptr, int selectedFill = -1);
     QImage rasterBrushPreview(const QPainterPath& sweptRegion, QColor color, bool erase,
-                             QRectF* bounds, QString* error = nullptr, double outputScale = 1.) const;
+                             QRectF* bounds, QString* error = nullptr, double outputScale = 1.,
+                             int selectedFill = -1) const;
     bool remove(int index);
     bool setColor(int index, QColor color);
     bool deformFill(int index, QPointF center, QPointF delta, double radius, bool smooth);

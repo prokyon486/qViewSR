@@ -10,6 +10,7 @@ class QVGraphicsView;
 namespace Sr { class Controller; }
 
 namespace Vector {
+class GeneratedSvgRenderer;
 bool rasterSize(QSize source, double scale, QSize* size, QString* error = nullptr);
 QImage rasterizeSvg(const QByteArray& svg, QSize size, QString* error = nullptr);
 QByteArray readSvgAsset(const QString& requestedPath, const QString& cacheDirectory, QString* error = nullptr);
@@ -39,7 +40,8 @@ public slots:
     void discardEdits();
 
 signals:
-    void previewReady(const QImage& sRGBImage, const QByteArray& svg, double transferScale);
+    void previewReady(const QImage& sRGBImage, const QByteArray& svg, double transferScale,
+                      std::shared_ptr<GeneratedSvgRenderer> renderer = {});
     void originalRequested();
     void stateChanged();
     void failed(const QString& message);
