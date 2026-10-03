@@ -6,6 +6,7 @@
 #include "mainwindow.h"
 #include "qvgraphicsview.h"
 #include "sr/color_pipeline.h"
+#include "sr/sr_controller.h"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -256,27 +257,30 @@ struct Controller::Private {
     Controller* owner;
     MainWindow* window;
     QVGraphicsView* view;
+    Sr::Controller* sr;
     QPointer<QDialog> panel;
-    QComboBox *strength, *detail, *color, *background, *lineMode, *maskGap;
+    QComboBox *strength, *detail, *color, *background, *lineMode, *maskGap, *inputSource;
     QDoubleSpinBox *width, *scale, *previewScale, *minLineLength, *joinDistance, *shapeTolerance;
     QSlider *opacity, *suppression, *branchStrength;
     QCheckBox *showFill, *grayFill, *showResult, *correctLines, *cleanLines;
     QPushButton *run, *stop, *svgSave, *pngSave;
-    QLabel* status;
+    QLabel *status, *inputStatus;
     QTimer debounce, watchdog;
     QPointer<QProcess> process;
     QByteArray stdoutBytes, stderrBytes, fillSvg, linesSvg, composedSvg;
     QSize sourceSize;
     QImage image;
-    QString correctionSummary;
+    QString correctionSummary, resultInputDescription;
+    qint64 inputCacheKey = 0;
+    QByteArray inputProfileIcc;
     std::shared_ptr<QTemporaryDir> workspace;
     std::shared_ptr<std::atomic_bool> preparationCancelled;
     quint64 epoch = 0, shapeRevision = 0, renderRevision = 0;
     bool preparing = false, rendering = false, rerun = false, renderPending = false;
     bool generated = false, showing = false, fullscreen = false, restorePanel = false, externalBusy = false, saving = false, loading = false;
 
-    Private(Controller* controller, MainWindow* parent, QVGraphicsView* graphics)
-        : owner(controller), window(parent), view(graphics) {
+    Private(Controller* controller, MainWindow* parent, QVGraphicsView* graphics, Sr::Controller* superResolution)
+        : owner(controller), window(parent), view(graphics), sr(superResolution) {
         panel = new QDialog(parent, Qt::Tool);
         panel->setObjectName(QStringLiteral("vectorPanel"));
         panel->setWindowTitle(QStringLiteral("ベクター変換"));
@@ -284,9 +288,11 @@ struct Controller::Private {
         panel->setAttribute(Qt::WA_DeleteOnClose, false);
         panel->installEventFilter(owner);
         auto* layout = new QVBoxLayout(panel);
-        auto* explanation = new QLabel(QStringLiteral("塗りと主線を別々にベクター化します。静止画の元画像が入力です。"), panel);
+        auto* explanation = new QLabel(QStringLiteral("塗りと主線を別々にベクター化します。入力を下で選びます。既定はノイズ低減を含む超解像結果です。"), panel);
         explanation->setWordWrap(true);
         layout->addWidget(explanation);
+        inputStatus = new QLabel(panel); inputStatus->setObjectName("vectorInputStatus");
+        inputStatus->setWordWrap(true); layout->addWidget(inputStatus);
         auto* scroll = new QScrollArea(panel);
         scroll->setObjectName("vectorParameters");
         scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame);
@@ -303,6 +309,10 @@ struct Controller::Private {
             form->addRow(text, control);
             return control;
         };
+        inputSource = combo("vectorInputSource", QStringLiteral("変換元の画像"),
+                            {{QStringLiteral("超解像結果を優先（なければ元画像）"), "auto"},
+                             {QStringLiteral("加工前の元画像"), "original"}});
+        inputSource->setToolTip(QStringLiteral("最新の超解像結果を実寸で使います。元画像との表示切替や画面の拡大率には影響されません。ノイズ低減はSR設定で指定して超解像を実行してください。"));
         lineMode = combo("vectorLineMode", QStringLiteral("主線の抽出方式"),
                          {{QStringLiteral("暗い主線（線画・イラスト）"), "dark"},
                           {QStringLiteral("色の境界（ロゴ・色面の輪郭）"), "color"}});
@@ -325,13 +335,13 @@ struct Controller::Private {
             spin->setSuffix(QStringLiteral(" px")); form->addRow(label, spin); return spin;
         };
         shapeTolerance = pixels("vectorShapeTolerance", QStringLiteral("円・楕円の許容誤差"), .25, 100, .5);
-        shapeTolerance->setToolTip(QStringLiteral("元画像のピクセル単位。値を上げると揺らいだ閉輪郭も円・楕円に近似しやすくなります。大きすぎる値は形状を変えるため、表示を比較してください。直線・曲線の補正誤差とは独立しています。"));
+        shapeTolerance->setToolTip(QStringLiteral("入力画像のピクセル単位。値を上げると揺らいだ閉輪郭も円・楕円に近似しやすくなります。大きすぎる値は形状を変えるため、表示を比較してください。直線・曲線の補正誤差とは独立しています。"));
         cleanLines = new QCheckBox(QStringLiteral("主線を整理（短いノイズ除去・途切れ接続）"), panel);
         cleanLines->setObjectName("vectorCleanLines");
         cleanLines->setToolTip(QStringLiteral("短い孤立線や、滑らかな長い主線に直交する短い横枝を除き、方向の揃った近い端点を接続します。小さな文字や意図した線も消える場合があるため、ON/OFFで比較してください。"));
         form->addRow(cleanLines);
         minLineLength = pixels("vectorMinLineLength", QStringLiteral("短い線の基準長"), 0, 1000, 1);
-        minLineLength->setToolTip(QStringLiteral("元画像のピクセル単位。孤立線はこの長さ未満を除去し、横枝の長さ判定にも使用します。0で短線の除去を無効にし、途切れの接続だけを行います。"));
+        minLineLength->setToolTip(QStringLiteral("入力画像のピクセル単位。孤立線はこの長さ未満を除去し、横枝の長さ判定にも使用します。0で短線の除去を無効にし、途切れの接続だけを行います。"));
         joinDistance = pixels("vectorJoinDistance", QStringLiteral("途切れの接続距離"), 0, 200, 1);
         joinDistance->setToolTip(QStringLiteral("この距離以内で、接線方向が揃い、接続先が一つに定まる端点だけをつなぎます。0で接続を無効にします。"));
         auto percentageSlider = [this, form](const QString& name, const QString& text, int step) {
@@ -359,13 +369,13 @@ struct Controller::Private {
         };
         branchStrength = percentageSlider("vectorBranchStrength", QStringLiteral("短い横枝の除去"), 1);
         branchStrength->setToolTip(QStringLiteral("長い主線にほぼ直交する短い枝を除去する強さ。0で無効にします。長い枝、角、閉じた輪郭は保持します。"));
-        width = pixels("vectorWidth", QStringLiteral("線幅（元画像基準）"), .3, 3.0, .1);
+        width = pixels("vectorWidth", QStringLiteral("線幅（入力画像基準）"), .3, 3.0, .1);
         width->setDecimals(1);
         opacity = percentageSlider("vectorOpacity", QStringLiteral("主線の濃さ"), 1);
         suppression = percentageSlider("vectorSuppression", QStringLiteral("塗り側の元線を弱める量"), 5);
         color = combo("vectorColor", QStringLiteral("主線の色"),
                       {{QStringLiteral("透明（主線を非表示）"), "transparent"}, {QStringLiteral("白"), "white"},
-                       {QStringLiteral("黒"), "black"}, {QStringLiteral("元画像から推定"), "source"}});
+                       {QStringLiteral("黒"), "black"}, {QStringLiteral("入力画像から推定"), "source"}});
         background = combo("vectorBackground", QStringLiteral("背景の色"),
                            {{QStringLiteral("透明"), "transparent"}, {QStringLiteral("白"), "white"}, {QStringLiteral("黒"), "black"}});
         showFill = new QCheckBox(QStringLiteral("塗りを表示"), panel); showFill->setObjectName("vectorShowFill");
@@ -402,7 +412,7 @@ struct Controller::Private {
         QObject::connect(&watchdog, &QTimer::timeout, owner, [this] {
             owner->cancel(); report(QStringLiteral("ベクター変換が制限時間を超えたため中止しました。"));
         });
-        for (auto* control : {strength, detail, lineMode, maskGap})
+        for (auto* control : {strength, detail, lineMode, maskGap, inputSource})
             QObject::connect(control, &QComboBox::currentIndexChanged, owner, [this] { shapeChanged(); });
         QObject::connect(suppression, &QSlider::valueChanged, owner, [this] { shapeChanged(); });
         QObject::connect(correctLines, &QCheckBox::toggled, owner, [this] { shapeChanged(); });
@@ -431,6 +441,7 @@ struct Controller::Private {
         QObject::connect(&view->getImageCore(), &QVImageCore::sourceChanging, owner, [this] { loading = true; invalidate(); });
         QObject::connect(view, &QVGraphicsView::fileChanged, owner, [this] { loading = false; updateControls(); });
         QObject::connect(view, &QVGraphicsView::vectorRenderingFailed, owner, [this](const QString& error) { report(error); });
+        QObject::connect(sr, &Sr::Controller::stateChanged, owner, [this] { updateInputStatus(); });
         updateControls();
     }
 
@@ -454,6 +465,7 @@ struct Controller::Private {
             control->setCurrentIndex(index);
         };
         selected(strength, "strength", "strong"); selected(detail, "detail", "balanced");
+        selected(inputSource, "inputSource", "auto");
         selected(lineMode, "lineMode", "dark");
         selected(maskGap, "maskGap", "0");
         selected(color, "color", "source"); selected(background, "background", "white");
@@ -484,6 +496,7 @@ struct Controller::Private {
         settings.setValue("vector/grayFill", grayFill->isChecked()); settings.setValue("vector/exportScale", scale->value());
         settings.setValue("vector/previewScale", previewScale->value());
         settings.setValue("vector/correctLines", correctLines->isChecked());
+        settings.setValue("vector/inputSource", inputSource->currentData());
         settings.setValue("vector/lineMode", lineMode->currentData());
         settings.setValue("vector/maskGap", maskGap->currentData());
         settings.setValue("vector/cleanLines", cleanLines->isChecked());
@@ -491,6 +504,25 @@ struct Controller::Private {
         settings.setValue("vector/joinDistance", joinDistance->value());
         settings.setValue("vector/branchStrength", branchStrength->value());
         settings.setValue("vector/shapeTolerance", shapeTolerance->value());
+    }
+
+    struct Input {
+        QImage image;
+        Sr::Profile profile;
+        QString description;
+    };
+
+    Input selectedInput() const {
+        if (inputSource->currentData().toString() == "auto" && sr->hasResult() && !sr->hasAnimation())
+            return {sr->resultImage(), {Sr::srgbProfile(), QStringLiteral("sRGB"), {}, false},
+                    QStringLiteral("超解像結果（%1回・元画像比%2倍）").arg(sr->resultPasses()).arg(sr->resultScale(), 0, 'g', 6)};
+        return {view->getImageCore().getSourceImage(), view->getImageCore().getSourceProfile(), QStringLiteral("加工前の元画像")};
+    }
+
+    void updateInputStatus() {
+        const auto input = selectedInput();
+        inputStatus->setText(input.image.isNull() ? QStringLiteral("入力: 静止画を開いてください。")
+            : QStringLiteral("次の変換入力: %1 · %2×%3px").arg(input.description).arg(input.image.width()).arg(input.image.height()));
     }
 
     QString eligibilityError() const {
@@ -561,7 +593,7 @@ struct Controller::Private {
         showResult->setEnabled(!image.isNull() && !externalBusy);
         svgSave->setEnabled(!composedSvg.isEmpty() && !busy());
         pngSave->setEnabled(!composedSvg.isEmpty() && !busy());
-        for (auto* control : {strength, detail, color, background, lineMode}) control->setEnabled(!externalBusy);
+        for (auto* control : {strength, detail, color, background, lineMode, inputSource}) control->setEnabled(!externalBusy);
         maskGap->setEnabled(!externalBusy && lineMode->currentData().toString() == "dark");
         showFill->setEnabled(!externalBusy); previewScale->setEnabled(!externalBusy); scale->setEnabled(!externalBusy);
         correctLines->setEnabled(!externalBusy);
@@ -575,6 +607,7 @@ struct Controller::Private {
         width->setEnabled(!externalBusy && linesVisible); opacity->parentWidget()->setEnabled(!externalBusy && linesVisible);
         if (updateMessage && !unavailable.isEmpty()) setStatus(unavailable);
         else if (updateMessage && image.isNull() && !busy()) setStatus(QStringLiteral("「生成・更新」で変換を開始します。設定の変更は生成後に自動反映します。"));
+        updateInputStatus();
         emit owner->stateChanged();
     }
 
@@ -595,7 +628,8 @@ struct Controller::Private {
         owner->cancel();
         fillSvg.clear(); linesSvg.clear(); composedSvg.clear(); image = {}; sourceSize = {};
         workspace.reset(); generated = false; showing = false;
-        correctionSummary.clear();
+        inputCacheKey = 0; inputProfileIcc.clear();
+        correctionSummary.clear(); resultInputDescription.clear();
         { QSignalBlocker block(showResult); showResult->setChecked(false); }
         updateControls();
     }
@@ -612,19 +646,20 @@ struct Controller::Private {
         const auto renderEpoch = epoch, revision = renderRevision;
         const auto fill = fillSvg, lines = linesSvg;
         const auto size = sourceSize;
+        const auto inputDescription = resultInputDescription;
         const auto look = appearance();
         const double requestedScale = previewScale->value();
         rendering = true;
         auto* watcher = new QFutureWatcher<Rendered>(owner);
-        QObject::connect(watcher, &QFutureWatcher<Rendered>::finished, owner, [this, watcher, renderEpoch, revision] {
+        QObject::connect(watcher, &QFutureWatcher<Rendered>::finished, owner, [this, watcher, renderEpoch, revision, inputDescription] {
             auto result = watcher->result(); watcher->deleteLater(); rendering = false;
             if (renderEpoch == epoch && revision == renderRevision && !externalBusy) {
                 if (!result.error.isEmpty()) report(result.error);
                 else {
                     image = result.image; composedSvg = result.svg;
                     if (showResult->isChecked()) { showing = true; emit owner->previewReady(image, composedSvg, previewScale->value()); }
-                    setStatus(QStringLiteral("SVG: %1×%2px。拡大時もベクターから描画します。\n%3")
-                              .arg(sourceSize.width()).arg(sourceSize.height()).arg(correctionSummary));
+                    setStatus(QStringLiteral("SVG: %1×%2px。拡大時もベクターから描画します。\n変換に使った画像: %3\n%4")
+                              .arg(sourceSize.width()).arg(sourceSize.height()).arg(inputDescription, correctionSummary));
                     emit owner->resultReady();
                 }
             }
@@ -639,7 +674,13 @@ struct Controller::Private {
         const QString unavailable = eligibilityError();
         if (!unavailable.isEmpty()) { report(unavailable); return; }
         if (workerBusy()) { rerun = true; return; }
-        const auto memoryError = preparationMemoryError(view->getImageCore().getSourceImage().size());
+        // Use full-resolution sRGB SR pixels, never the monitor-converted view
+        // or our own rasterized vector preview. QImage copies retain this input
+        // while asynchronous preparation is running.
+        const auto input = selectedInput();
+        const auto source = input.image;
+        const auto profile = input.profile;
+        const auto memoryError = preparationMemoryError(source.size());
         if (!memoryError.isEmpty()) { report(memoryError); return; }
         const QString root = repositoryRoot();
         const QString python = qEnvironmentVariable("QVIEWSR_VECTOR_PYTHON", root + "/.local/vector-probe-venv/bin/python");
@@ -647,17 +688,24 @@ struct Controller::Private {
         if (!QFileInfo(python).isExecutable() || !QFileInfo(script).isFile()) {
             report(QStringLiteral("ベクター変換の実行環境が見つかりません。セットアップ手順を確認してください。")); return;
         }
+        const bool changedInput = inputCacheKey != source.cacheKey() || inputProfileIcc != profile.icc;
+        if (changedInput) {
+            // A new SR pass can have the same dimensions. Never reuse its
+            // predecessor's input.png, and do not publish an older render.
+            ++epoch; ++renderRevision; renderPending = false;
+            workspace.reset();
+            inputCacheKey = source.cacheKey(); inputProfileIcc = profile.icc;
+        }
         if (!workspace) workspace = std::make_shared<QTemporaryDir>(QDir::tempPath() + "/qviewsr-vector-XXXXXX");
         if (!workspace->isValid()) { report(QStringLiteral("作業用フォルダーを作成できません。")); return; }
         generated = true; rerun = false; preparing = true;
         const auto cancelled = std::make_shared<std::atomic_bool>(false);
         preparationCancelled = cancelled;
-        if (image.isNull()) { QSignalBlocker block(showResult); showResult->setChecked(true); }
+        if (image.isNull() || changedInput) { QSignalBlocker block(showResult); showResult->setChecked(true); }
         const auto jobEpoch = epoch, revision = shapeRevision;
         const auto folder = workspace;
-        const auto source = view->getImageCore().getSourceImage();
-        const auto profile = view->getImageCore().getSourceProfile();
         const QSize size = source.size();
+        const QString inputDescription = input.description;
         const QString selectedStrength = strength->currentData().toString();
         const QString selectedDetail = detail->currentData().toString();
         const int selectedSuppression = suppression->value() * 5;
@@ -673,13 +721,13 @@ struct Controller::Private {
         updateControls(false);
         auto* watcher = new QFutureWatcher<QString>(owner);
         QObject::connect(watcher, &QFutureWatcher<QString>::finished, owner,
-                         [this, watcher, folder, cancelled, jobEpoch, revision, size, python, script, selectedStrength, selectedDetail, selectedSuppression, selectedCorrection, selectedLineOptions] {
+                         [this, watcher, folder, cancelled, jobEpoch, revision, size, inputDescription, python, script, selectedStrength, selectedDetail, selectedSuppression, selectedCorrection, selectedLineOptions] {
             const QString error = watcher->result(); watcher->deleteLater(); preparing = false;
             if (preparationCancelled == cancelled) preparationCancelled.reset();
             if (jobEpoch != epoch || externalBusy) { continuePending(); return; }
             if (!error.isEmpty()) { report(error); continuePending(); return; }
             if (revision != shapeRevision) { rerun = true; continuePending(); return; }
-            launch(folder, jobEpoch, revision, size, python, script, selectedStrength, selectedDetail, selectedSuppression, selectedCorrection, selectedLineOptions);
+            launch(folder, jobEpoch, revision, size, inputDescription, python, script, selectedStrength, selectedDetail, selectedSuppression, selectedCorrection, selectedLineOptions);
         });
         watcher->setFuture(QtConcurrent::run([source, profile, folder, cancelled] {
             const auto stopped = [&] { return cancelled->load(std::memory_order_relaxed); };
@@ -704,7 +752,7 @@ struct Controller::Private {
         if (rerun && !externalBusy) { rerun = false; QTimer::singleShot(0, owner, &Controller::generate); }
     }
 
-    void launch(const std::shared_ptr<QTemporaryDir>& folder, quint64 jobEpoch, quint64 revision, QSize size,
+    void launch(const std::shared_ptr<QTemporaryDir>& folder, quint64 jobEpoch, quint64 revision, QSize size, const QString& inputDescription,
                 const QString& python, const QString& script, const QString& selectedStrength,
                 const QString& selectedDetail, int selectedSuppression, bool selectedCorrection, const QStringList& selectedLineOptions) {
         auto* child = new QProcess(owner); process = child;
@@ -732,7 +780,7 @@ struct Controller::Private {
             continuePending();
         });
         QObject::connect(child, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), owner,
-                         [this, child, folder, jobEpoch, revision, size, selectedCorrection](int code, QProcess::ExitStatus exitStatus) {
+                         [this, child, folder, jobEpoch, revision, size, inputDescription, selectedCorrection](int code, QProcess::ExitStatus exitStatus) {
             if (process != child) { child->deleteLater(); return; }
             stdoutBytes += child->readAllStandardOutput(); stderrBytes += child->readAllStandardError();
             process = nullptr; watchdog.stop(); child->deleteLater();
@@ -755,7 +803,7 @@ struct Controller::Private {
             if (fill.isEmpty()) { report(error); continuePending(); return; }
             const auto lines = readSvgAsset(result.value("lines_svg").toString(), folder->filePath("cache"), &error);
             if (fill.isEmpty() || lines.isEmpty()) { report(error); continuePending(); return; }
-            fillSvg = fill; linesSvg = lines; sourceSize = size;
+            fillSvg = fill; linesSvg = lines; sourceSize = size; resultInputDescription = inputDescription;
             const auto stats = result.value("correction_stats").toObject();
             correctionSummary = selectedCorrection
                 ? QStringLiteral("主線補正ON: 直線 %1、円 %2、楕円 %3、曲線の簡略化 %4。")
@@ -807,9 +855,9 @@ struct Controller::Private {
     }
 };
 
-Controller::Controller(MainWindow* window, QVGraphicsView* view) : QObject(window) {
+Controller::Controller(MainWindow* window, QVGraphicsView* view, Sr::Controller* sr) : QObject(window) {
     setObjectName(QStringLiteral("vectorController"));
-    d = std::make_unique<Private>(this, window, view);
+    d = std::make_unique<Private>(this, window, view, sr);
 }
 Controller::~Controller() = default;
 bool Controller::hasResult() const { return !d->image.isNull(); }

@@ -103,6 +103,37 @@ class VectorTests : public QObject {
         return waitIdle();
     }
 
+    bool configureFakeSr(Sr::Controller* sr, const QString& mode, double scale = 2) {
+        auto configuration = sr->configuration();
+        configuration.workerPath = QStringLiteral(SR_SOURCE_DIR)+"/tests/fake_worker.py";
+        configuration.runtimeRoot = files.filePath("vector-sr-runtime");
+        configuration.modelPath = files.filePath("vector-sr-model.xml");
+        configuration.devices = mode; configuration.scale = scale; configuration.denoise = 5;
+        if (!QDir().mkpath(configuration.runtimeRoot+"/deployment_tools/inference_engine/lib/intel64")) return false;
+        for (const auto& path : {configuration.modelPath,
+                 configuration.runtimeRoot+"/deployment_tools/inference_engine/lib/intel64/libmyriadPlugin.so"}) {
+            QFile file(path);
+            if (!file.open(QIODevice::WriteOnly) || file.write("test") != 4) return false;
+        }
+        sr->setConfiguration(configuration);
+        return true;
+    }
+
+    static QImage opaqueFixture() {
+        // Preserve a non-sRGB source so accidentally applying its profile to
+        // already-sRGB SR pixels produces a detectable color difference.
+        QImage image(64, 48, QImage::Format_RGB32); image.fill(Qt::white);
+        { QPainter painter(&image); painter.drawImage(0, 0, fixture()); }
+        image.setColorSpace(QColorSpace::AdobeRgb);
+        return image;
+    }
+
+    static QString preparedInput(const QTemporaryDir& temporary) {
+        const auto folders = QDir(temporary.path()).entryList({"qviewsr-vector-*"}, QDir::Dirs | QDir::NoDotAndDotDot);
+        if (folders.size() != 1) return {};
+        return QDir(temporary.path()).filePath(folders.first()+"/input.png");
+    }
+
     QDomDocument savedSvg(const QString& name = "result.svg") {
         QDomDocument document;
         QString error;
@@ -991,6 +1022,166 @@ private slots:
         QCOMPARE(sr->resultImage().size(), QSize(128, 96));
         QCOMPARE(digest(sourcePath), sourceDigest);
         sr->setConfiguration(previous);
+    }
+
+    void vectorInputUsesLatestSrPixelsAcrossPreviewAndSourceSelection() {
+        QTemporaryDir temporary(files.filePath("sr-input-XXXXXX")); QVERIFY(temporary.isValid());
+        const auto oldTemporary = qgetenv("TMPDIR");
+        const bool hadTemporary = qEnvironmentVariableIsSet("TMPDIR");
+        qputenv("TMPDIR", temporary.path().toUtf8());
+        const auto restoreTemporary = qScopeGuard([&] {
+            if (hadTemporary) qputenv("TMPDIR", oldTemporary); else qunsetenv("TMPDIR");
+        });
+        sourcePath = files.filePath("opaque-sr-source.png");
+        QVERIFY(opaqueFixture().save(sourcePath)); sourceDigest = digest(sourcePath);
+        window->openFile(sourcePath);
+        QTRY_COMPARE(view->getCurrentFileDetails().fileInfo.absoluteFilePath(), sourcePath);
+        QTRY_VERIFY(view->getCurrentFileDetails().isPixmapLoaded);
+        auto* inputChoice = panel->findChild<QComboBox*>("vectorInputSource"); QVERIFY(inputChoice);
+        auto* inputStatus = panel->findChild<QLabel*>("vectorInputStatus"); QVERIFY(inputStatus);
+        QCOMPARE(inputChoice->currentData().toString(), QStringLiteral("auto"));
+        QVERIFY(inputStatus->text().contains(QStringLiteral("元画像")));
+        QVERIFY2(generate(), qPrintable(failure));
+        const auto originalInput = QImage(preparedInput(temporary));
+        QCOMPARE(originalInput.size(), QSize(64, 48));
+        QCOMPARE(QSvgRenderer(savedSvg().toByteArray()).defaultSize(), QSize(64, 48));
+
+        auto* sr = window->findChild<Sr::Controller*>(); QVERIFY(sr);
+        const auto previous = sr->configuration();
+        const auto restoreSr = qScopeGuard([&] { sr->setConfiguration(previous); });
+        QVERIFY(configureFakeSr(sr, "normal"));
+        QTRY_VERIFY_WITH_TIMEOUT(sr->backendReady(), 5000);
+        QSignalSpy srReady(sr, &Sr::Controller::resultReady);
+        sr->start();
+        QTRY_COMPARE_WITH_TIMEOUT(srReady.count(), 1, 8000);
+        const auto processed = sr->resultImage();
+        QCOMPARE(processed.size(), QSize(128, 96));
+        QCOMPARE(processed.pixelColor(30, 30), QColor(80, 160, 208));
+        QVERIFY(inputStatus->text().contains(QStringLiteral("超解像")));
+        QVERIFY(inputStatus->text().contains(QStringLiteral("128")));
+        QVERIFY2(generate(), qPrintable(failure));
+        const auto srInputPath = preparedInput(temporary); QVERIFY(!srInputPath.isEmpty());
+        const auto srInput = QImage(srInputPath);
+        QCOMPARE(srInput.size(), processed.size());
+        QCOMPARE(srInput.colorSpace(), QColorSpace(QColorSpace::SRgb));
+        QVERIFY2(imageError(srInput, processed) < .1, "Vector input must contain SR pixels without applying the original Adobe RGB profile again");
+        QCOMPARE(QSvgRenderer(savedSvg().toByteArray()).defaultSize(), QSize(128, 96));
+        QVERIFY(controller->showingResult()); QVERIFY(!sr->showingSr());
+        QVERIFY(view->hasVectorPreview());
+
+        // Regenerating from the vector preview must keep the processed input,
+        // even though the SR display flag is no longer set.
+        QVERIFY(select("vectorDetail", "fine"));
+        QCOMPARE(preparedInput(temporary), srInputPath);
+        QVERIFY(imageError(QImage(preparedInput(temporary)), processed) < .1);
+        QCOMPARE(QSvgRenderer(savedSvg().toByteArray()).defaultSize(), QSize(128, 96));
+
+        controller->setShowingResult(false);
+        QVERIFY(!sr->showingSr());
+        QCOMPARE(view->getLoadedPixmap().size(), QSize(64, 48));
+        QVERIFY2(generate(), qPrintable(failure));
+        QVERIFY(imageError(QImage(preparedInput(temporary)), processed) < .1);
+        QCOMPARE(QSvgRenderer(savedSvg().toByteArray()).defaultSize(), QSize(128, 96));
+
+        // Explicit original mode restores the original pixels and ICC path.
+        QVERIFY(select("vectorInputSource", "original"));
+        QVERIFY(inputStatus->text().contains(QStringLiteral("元画像")));
+        QCOMPARE(QImage(preparedInput(temporary)).size(), QSize(64, 48));
+        QVERIFY(imageError(QImage(preparedInput(temporary)), originalInput) < .1);
+        QCOMPARE(QSvgRenderer(savedSvg().toByteArray()).defaultSize(), QSize(64, 48));
+        QVERIFY(select("vectorInputSource", "auto"));
+        QVERIFY(imageError(QImage(preparedInput(temporary)), processed) < .1);
+        QCOMPARE(QSvgRenderer(savedSvg().toByteArray()).defaultSize(), QSize(128, 96));
+        QCOMPARE(digest(sourcePath), sourceDigest);
+    }
+
+    void refreshedSrInputInvalidatesCacheAndSurvivesFailedJobs() {
+        QTemporaryDir temporary(files.filePath("sr-refresh-XXXXXX")); QVERIFY(temporary.isValid());
+        const auto oldTemporary = qgetenv("TMPDIR");
+        const bool hadTemporary = qEnvironmentVariableIsSet("TMPDIR");
+        qputenv("TMPDIR", temporary.path().toUtf8());
+        const auto restoreTemporary = qScopeGuard([&] {
+            if (hadTemporary) qputenv("TMPDIR", oldTemporary); else qunsetenv("TMPDIR");
+        });
+        sourcePath = files.filePath("opaque-refresh-source.png");
+        QVERIFY(opaqueFixture().save(sourcePath)); sourceDigest = digest(sourcePath);
+        window->openFile(sourcePath);
+        QTRY_COMPARE(view->getCurrentFileDetails().fileInfo.absoluteFilePath(), sourcePath);
+        QTRY_VERIFY(view->getCurrentFileDetails().isPixmapLoaded);
+        auto* sr = window->findChild<Sr::Controller*>(); QVERIFY(sr);
+        const auto previous = sr->configuration();
+        const auto restoreSr = qScopeGuard([&] { sr->setConfiguration(previous); });
+        QVERIFY(configureFakeSr(sr, "normal"));
+        QTRY_VERIFY_WITH_TIMEOUT(sr->backendReady(), 5000);
+        QSignalSpy srReady(sr, &Sr::Controller::resultReady);
+        sr->start();
+        QTRY_COMPARE_WITH_TIMEOUT(srReady.count(), 1, 8000);
+        QVERIFY2(generate(), qPrintable(failure));
+        const auto firstInput = QImage(preparedInput(temporary));
+        QCOMPARE(firstInput.size(), QSize(128, 96));
+
+        // The fake worker's animation-* mode changes its output color based on
+        // the input hash; the loaded document remains a still image.
+        QVERIFY(configureFakeSr(sr, "animation-input-color"));
+        QTRY_VERIFY_WITH_TIMEOUT(sr->backendReady(), 5000);
+        sr->start();
+        QTRY_COMPARE_WITH_TIMEOUT(srReady.count(), 2, 8000);
+        QVERIFY(!sr->hasAnimation());
+        const auto replaced = sr->resultImage();
+        QCOMPARE(replaced.size(), firstInput.size());
+        QVERIFY(imageError(replaced, firstInput) > 1);
+        QVERIFY2(generate(), qPrintable(failure));
+        QVERIFY2(imageError(QImage(preparedInput(temporary)), replaced) < .1,
+                 "A same-sized new SR result must replace the prepared PNG cache");
+
+        sr->startAgain();
+        QTRY_COMPARE_WITH_TIMEOUT(srReady.count(), 3, 8000);
+        const auto repeated = sr->resultImage();
+        QCOMPARE(repeated.size(), QSize(256, 192));
+        QVERIFY2(generate(), qPrintable(failure));
+        QVERIFY(imageError(QImage(preparedInput(temporary)), repeated) < .1);
+        QCOMPARE(QSvgRenderer(savedSvg().toByteArray()).defaultSize(), QSize(256, 192));
+        const auto stableInputPath = preparedInput(temporary);
+        const auto stableInputDigest = digest(stableInputPath);
+
+        QVERIFY(configureFakeSr(sr, "long-error"));
+        QTRY_VERIFY_WITH_TIMEOUT(sr->backendReady(), 5000);
+        QSignalSpy failed(sr, &Sr::Controller::failed);
+        sr->start();
+        QVERIFY(!panel->findChild<QPushButton*>("vectorGenerate")->isEnabled());
+        QTRY_VERIFY_WITH_TIMEOUT(failed.count() > 0, 8000);
+        QTRY_VERIFY(!sr->isBusy());
+        QCOMPARE(sr->resultImage(), repeated);
+        QVERIFY2(generate(), qPrintable(failure));
+        QCOMPARE(preparedInput(temporary), stableInputPath);
+        QCOMPARE(digest(preparedInput(temporary)), stableInputDigest);
+
+        QVERIFY(configureFakeSr(sr, "delay"));
+        QTRY_VERIFY_WITH_TIMEOUT(sr->backendReady(), 5000);
+        sr->start(); QVERIFY(sr->isBusy());
+        sr->cancel();
+        QTRY_VERIFY_WITH_TIMEOUT(!sr->isBusy(), 8000);
+        QCOMPARE(sr->resultImage(), repeated);
+        QVERIFY2(generate(), qPrintable(failure));
+        QCOMPARE(preparedInput(temporary), stableInputPath);
+        QCOMPARE(digest(preparedInput(temporary)), stableInputDigest);
+
+        const auto other = files.filePath("after-sr-other.png");
+        QImage different(31, 25, QImage::Format_RGB32); different.fill(Qt::green); QVERIFY(different.save(other));
+        const auto otherDigest = digest(other);
+        QSignalSpy vectorReady(controller, &Vector::Controller::resultReady);
+        controller->generate(); QVERIFY(controller->isBusy());
+        window->openFile(other);
+        QTRY_COMPARE(view->getImageCore().getSourceImage().size(), QSize(31, 25));
+        QVERIFY(waitIdle(5000));
+        QCOMPARE(vectorReady.count(), 0);
+        QVERIFY(!sr->hasResult()); QVERIFY(!controller->hasResult());
+        QVERIFY(!controller->showingResult()); QVERIFY(!view->hasVectorPreview());
+        QVERIFY2(generate(), qPrintable(failure));
+        QCOMPARE(QImage(preparedInput(temporary)).size(), QSize(31, 25));
+        QCOMPARE(QSvgRenderer(savedSvg().toByteArray()).defaultSize(), QSize(31, 25));
+        QVERIFY(panel->findChild<QLabel*>("vectorInputStatus")->text().contains(QStringLiteral("元画像")));
+        QCOMPARE(digest(sourcePath), sourceDigest); QCOMPARE(digest(other), otherDigest);
     }
 
     void realUserImage() {

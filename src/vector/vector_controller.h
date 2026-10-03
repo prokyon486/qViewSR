@@ -7,6 +7,7 @@
 
 class MainWindow;
 class QVGraphicsView;
+namespace Sr { class Controller; }
 
 namespace Vector {
 bool rasterSize(QSize source, double scale, QSize* size, QString* error = nullptr);
@@ -15,7 +16,7 @@ QByteArray readSvgAsset(const QString& requestedPath, const QString& cacheDirect
 class Controller : public QObject {
     Q_OBJECT
 public:
-    Controller(MainWindow* window, QVGraphicsView* view);
+    Controller(MainWindow* window, QVGraphicsView* view, Sr::Controller* sr);
     ~Controller() override;
     bool hasResult() const;
     bool showingResult() const;
